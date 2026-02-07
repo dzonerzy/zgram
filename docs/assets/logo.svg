@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background gradient -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+
+    <!-- Zig orange accent gradient -->
+    <linearGradient id="zig" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f7a41d"/>
+      <stop offset="100%" stop-color="#f97316"/>
+    </linearGradient>
+
+    <!-- Python blue accent gradient -->
+    <linearGradient id="py" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+
+    <!-- Parse tree green -->
+    <linearGradient id="tree" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+
+    <!-- Glow filter -->
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Subtle outer glow -->
+    <filter id="outerGlow">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="blur" in2="SourceGraphic" operator="out" result="glowOut"/>
+      <feMerge>
+        <feMergeNode in="glowOut"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+
+  <!-- Subtle grid pattern suggesting grammar rules -->
+  <g opacity="0.04" stroke="#ffffff" stroke-width="1">
+    <line x1="0" y1="128" x2="512" y2="128"/>
+    <line x1="0" y1="256" x2="512" y2="256"/>
+    <line x1="0" y1="384" x2="512" y2="384"/>
+    <line x1="128" y1="0" x2="128" y2="512"/>
+    <line x1="256" y1="0" x2="256" y2="512"/>
+    <line x1="384" y1="0" x2="384" y2="512"/>
+  </g>
+
+  <!-- SIMD vector lanes - decorative bars at top -->
+  <g opacity="0.15">
+    <rect x="48" y="36" width="96" height="4" rx="2" fill="url(#zig)"/>
+    <rect x="152" y="36" width="96" height="4" rx="2" fill="url(#zig)"/>
+    <rect x="256" y="36" width="96" height="4" rx="2" fill="url(#zig)"/>
+    <rect x="360" y="36" width="96" height="4" rx="2" fill="url(#zig)"/>
+  </g>
+
+  <!-- Parse tree structure (behind the Z) -->
+  <g filter="url(#glow)" opacity="0.6">
+    <!-- Root node -->
+    <circle cx="256" cy="115" r="8" fill="url(#tree)"/>
+
+    <!-- Branches -->
+    <line x1="256" y1="123" x2="176" y2="170" stroke="url(#tree)" stroke-width="2" opacity="0.5"/>
+    <line x1="256" y1="123" x2="256" y2="170" stroke="url(#tree)" stroke-width="2" opacity="0.5"/>
+    <line x1="256" y1="123" x2="336" y2="170" stroke="url(#tree)" stroke-width="2" opacity="0.5"/>
+
+    <!-- Level 2 nodes -->
+    <circle cx="176" cy="174" r="5" fill="url(#tree)" opacity="0.7"/>
+    <circle cx="256" cy="174" r="5" fill="url(#tree)" opacity="0.7"/>
+    <circle cx="336" cy="174" r="5" fill="url(#tree)" opacity="0.7"/>
+
+    <!-- Level 3 branches -->
+    <line x1="176" y1="179" x2="148" y2="210" stroke="url(#tree)" stroke-width="1.5" opacity="0.3"/>
+    <line x1="176" y1="179" x2="204" y2="210" stroke="url(#tree)" stroke-width="1.5" opacity="0.3"/>
+    <line x1="336" y1="179" x2="308" y2="210" stroke="url(#tree)" stroke-width="1.5" opacity="0.3"/>
+    <line x1="336" y1="179" x2="364" y2="210" stroke="url(#tree)" stroke-width="1.5" opacity="0.3"/>
+
+    <!-- Level 3 leaf nodes -->
+    <circle cx="148" cy="213" r="3.5" fill="url(#tree)" opacity="0.4"/>
+    <circle cx="204" cy="213" r="3.5" fill="url(#tree)" opacity="0.4"/>
+    <circle cx="308" cy="213" r="3.5" fill="url(#tree)" opacity="0.4"/>
+    <circle cx="364" cy="213" r="3.5" fill="url(#tree)" opacity="0.4"/>
+  </g>
+
+  <!-- Main "Z" letterform - bold, geometric, Zig-inspired -->
+  <g filter="url(#outerGlow)">
+    <path d="
+      M 138 160
+      L 374 160
+      L 374 192
+      L 216 330
+      L 374 330
+      L 374 362
+      L 138 362
+      L 138 330
+      L 296 192
+      L 138 192
+      Z
+    " fill="url(#zig)"/>
+  </g>
+
+  <!-- "gram" text -->
+  <text x="256" y="420" text-anchor="middle"
+        font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace"
+        font-size="64" font-weight="700" letter-spacing="8"
+        fill="url(#py)">gram</text>
+
+  <!-- Decorative angle brackets suggesting PEG syntax -->
+  <g opacity="0.25" fill="none" stroke-width="2.5" stroke-linecap="round">
+    <polyline points="72,261 52,281 72,301" stroke="url(#py)"/>
+    <polyline points="440,261 460,281 440,301" stroke="url(#py)"/>
+  </g>
+
+  <!-- Small grammar snippet watermark -->
+  <text x="256" y="472" text-anchor="middle"
+        font-family="'SF Mono', 'Fira Code', monospace"
+        font-size="11" fill="#ffffff" opacity="0.12"
+        letter-spacing="1">value = ws ( object | array | string ) ws</text>
+
+  <!-- Speed lines / acceleration marks -->
+  <g opacity="0.1" stroke="url(#zig)" stroke-width="1.5" stroke-linecap="round">
+    <line x1="80" y1="255" x2="110" y2="255"/>
+    <line x1="70" y1="270" x2="105" y2="270"/>
+    <line x1="80" y1="285" x2="110" y2="285"/>
+  </g>
+</svg>

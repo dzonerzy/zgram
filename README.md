@@ -1,8 +1,23 @@
+<div align="center">
+
+<img src="docs/assets/logo.svg" alt="zgram Logo" width="150">
+
 # zgram
 
-A comptime-optimized PEG parser generator for Python. Compiles grammars to native shared libraries via Zig, callable from Python with zero-copy text access and a rich Pythonic API.
+**Comptime-optimized PEG parser generator for Python.**
 
-Built with [PyOZ](https://github.com/pyozig/PyOZ).
+Compiles grammars to SIMD-accelerated native shared libraries via Zig, callable from Python with zero-copy text access and a rich Pythonic API.
+
+[![GitHub Stars](https://img.shields.io/github/stars/dzonerzy/zgram?style=flat)](https://github.com/dzonerzy/zgram)
+[![Python](https://img.shields.io/badge/python-3.8+-blue)](https://www.python.org/)
+[![Zig](https://img.shields.io/badge/zig-0.15+-orange)](https://ziglang.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+Built with [PyOZ](https://github.com/pyozig/PyOZ)
+
+</div>
+
+---
 
 ## Performance
 
