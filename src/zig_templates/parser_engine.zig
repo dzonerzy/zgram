@@ -35,7 +35,7 @@ const CharLookup = struct {
     }
 
     fn fromRanges(comptime ranges: []const types.CharRange, comptime negated: bool) CharLookup {
-        @setEvalBranchQuota(100000);
+        @setEvalBranchQuota(std.math.maxInt(u32));
         comptime {
             var bits = [_]u8{0} ** 32;
             for (ranges) |r| {
@@ -243,37 +243,104 @@ const ParseState = struct {
 pub fn Parser(comptime grammar: Grammar) type {
     const rule_count = grammar.rules.len;
 
-    // Detect silent rules at comptime using fixed-point iteration.
+    // Detect silent rules at comptime using adjacency-based propagation.
     // A rule is silent if it only serves as a character-level helper —
-    // i.e. its expression tree (recursively through references) only
-    // reaches terminals (literals, char_class, any_char) and other silent rules.
+    // i.e. it is never structurally referenced by a non-silent rule.
     //
-    // Algorithm:
-    // 1. Start by marking ALL rules as silent candidates.
-    // 2. The start rule (index 0) is NEVER silent.
-    // 3. Iterate: for each non-silent rule, check what it references.
-    //    Referenced rules that appear as DIRECT children (not through
-    //    repetition) are structurally important — mark them non-silent.
-    // 4. Repeat until stable (fixed-point).
-    const silent_flags = comptime blk: {
-        var flags: [rule_count]bool = undefined;
+    // "Structural" references are those in sequences, alternatives, and
+    // optional (?) repetitions. References inside */+ repetitions and
+    // predicates are NOT structural (they're character-level loops or
+    // lookahead that don't produce meaningful tree nodes).
+    //
+    // Algorithm (no recursion — flat loops only):
+    // 1. Build adjacency: for each rule, collect which rule indices it
+    //    structurally references (using an explicit expression stack).
+    // 2. Propagate non-silence from the start rule (index 0) through
+    //    the adjacency edges until stable.
+    const MAX_EXPR_STACK = 512;
+    const MAX_EDGES_PER_RULE = 64;
 
-        for (0..rule_count) |i| {
-            flags[i] = true; // optimistic: assume all are silent
+    const silent_flags = comptime blk: {
+        @setEvalBranchQuota(std.math.maxInt(u32));
+        // Step 1: Build adjacency table — edges[i] = rule indices structurally
+        // referenced by rule i.
+        var edge_counts: [rule_count]usize = [_]usize{0} ** rule_count;
+        var edges: [rule_count][MAX_EDGES_PER_RULE]usize = undefined;
+
+        for (grammar.rules, 0..) |rule, ri| {
+            // Explicit stack to walk the expression tree without recursion.
+            // Each entry is {expr_ptr, in_star_plus} where in_star_plus
+            // tracks whether we're inside a */+ repetition.
+            var stack: [MAX_EXPR_STACK]struct { expr: *const Expr, blocked: bool } = undefined;
+            var sp: usize = 1;
+            stack[0] = .{ .expr = &rule.expr, .blocked = false };
+
+            while (sp > 0) {
+                sp -= 1;
+                const item = stack[sp];
+                const expr = item.expr;
+                const blocked = item.blocked;
+
+                switch (expr.tag) {
+                    .reference => {
+                        if (!blocked) {
+                            // Record this structural edge (deduplicate)
+                            const idx = expr.ref_index;
+                            var found = false;
+                            for (edges[ri][0..edge_counts[ri]]) |existing| {
+                                if (existing == idx) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found and edge_counts[ri] < MAX_EDGES_PER_RULE) {
+                                edges[ri][edge_counts[ri]] = idx;
+                                edge_counts[ri] += 1;
+                            }
+                        }
+                    },
+                    .sequence, .alternative => {
+                        for (expr.children) |*child| {
+                            if (sp < MAX_EXPR_STACK) {
+                                stack[sp] = .{ .expr = child, .blocked = blocked };
+                                sp += 1;
+                            }
+                        }
+                    },
+                    .repetition => {
+                        if (expr.rep_expr) |sub| {
+                            if (sp < MAX_EXPR_STACK) {
+                                // ? (optional) is structural; * and + are not
+                                const rep_blocked = blocked or (expr.rep_kind != '?');
+                                stack[sp] = .{ .expr = sub, .blocked = rep_blocked };
+                                sp += 1;
+                            }
+                        }
+                    },
+                    .not_predicate, .and_predicate => {
+                        // Predicates don't produce output — block their refs
+                    },
+                    .literal, .char_class, .any_char => {},
+                }
+            }
         }
+
+        // Step 2: Propagate non-silence from start rule through edges.
+        var flags: [rule_count]bool = [_]bool{true} ** rule_count;
         flags[0] = false; // start rule is never silent
 
-        // Fixed-point iteration: propagate non-silence.
-        // References inside repetitions stay silent (they're character-level loops).
         var changed = true;
         var iterations: usize = 0;
         while (changed and iterations < rule_count + 1) {
             changed = false;
             iterations += 1;
-            for (grammar.rules, 0..) |rule, i| {
-                if (!flags[i]) {
-                    if (markStructuralRefs(&flags, &rule.expr)) {
-                        changed = true;
+            for (0..rule_count) |ri| {
+                if (!flags[ri]) {
+                    for (edges[ri][0..edge_counts[ri]]) |target| {
+                        if (flags[target]) {
+                            flags[target] = false;
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -521,37 +588,4 @@ pub fn Parser(comptime grammar: Grammar) type {
             }
         }
     };
-}
-
-/// Mark structurally-important referenced rules as non-silent.
-/// A reference is "structural" if it appears as a direct child of a
-/// sequence or alternative in a non-silent rule — NOT inside a repetition.
-/// Repetitions are character-level loops (like `char*`) where individual
-/// match nodes add no structural value.
-/// Returns true if any flag was changed.
-fn markStructuralRefs(flags: []bool, expr: *const Expr) bool {
-    var changed = false;
-    switch (expr.tag) {
-        .reference => {
-            if (flags[expr.ref_index]) {
-                flags[expr.ref_index] = false;
-                changed = true;
-            }
-        },
-        .sequence, .alternative => {
-            for (expr.children) |*child| {
-                if (markStructuralRefs(flags, child)) changed = true;
-            }
-        },
-        .repetition => {
-            // Do NOT propagate into repetitions — rules referenced inside
-            // repetitions (like `char` in `chars = char*`) stay silent.
-            // The repetition's parent rule already captures the full text span.
-        },
-        .not_predicate, .and_predicate => {
-            // Predicates don't produce output — don't un-silence their refs
-        },
-        .literal, .char_class, .any_char => {},
-    }
-    return changed;
 }
