@@ -119,9 +119,9 @@ def build_pyparsing_parser():
     true_lit = Keyword("true")
     false_lit = Keyword("false")
     null_lit = Keyword("null")
-    array = Group(LBRACK + Optional(value + (COMMA + value)[...]) + RBRACK)
+    array = Group(LBRACK + Optional(value + (COMMA + value)[...]) + RBRACK)  # type: ignore[index]
     pair = Group(string + COLON + value)
-    obj = Group(LBRACE + Optional(pair + (COMMA + pair)[...]) + RBRACE)
+    obj = Group(LBRACE + Optional(pair + (COMMA + pair)[...]) + RBRACE)  # type: ignore[index]
     value <<= obj | array | string | number | true_lit | false_lit | null_lit
     return value
 

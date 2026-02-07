@@ -26,14 +26,14 @@ class PyOZBuildExt(build_ext):
         wheel_path = pyoz_build(True, True)
 
         with zipfile.ZipFile(wheel_path, "r") as whl:
+            os.makedirs(self.build_lib, exist_ok=True)
             for name in whl.namelist():
-                if name.endswith((".so", ".pyd")) and "/" not in name:
+                if "/" not in name and name.endswith((".so", ".pyd", ".pyi")):
                     target = os.path.join(self.build_lib, name)
-                    os.makedirs(self.build_lib, exist_ok=True)
                     with whl.open(name) as src, open(target, "wb") as dst:
                         dst.write(src.read())
-                    os.chmod(target, 0o755)
-                    break
+                    if name.endswith((".so", ".pyd")):
+                        os.chmod(target, 0o755)
 
 
 class BinaryDistribution(Distribution):
