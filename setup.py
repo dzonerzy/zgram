@@ -4,7 +4,6 @@ Delegates compilation to pyoz.build(), then lets setuptools handle installation.
 Prefer: pip install .
 """
 
-import glob
 import os
 import zipfile
 

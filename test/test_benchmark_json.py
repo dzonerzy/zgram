@@ -14,37 +14,30 @@ Run with:  pytest test/test_benchmark_json.py -v -s
 
 import json
 import time
+from typing import Any
 
 import pytest
 import zgram
 
 try:
-    import pe
-
-    HAS_PE = True
+    import pe as _pe
 except ImportError:
-    HAS_PE = False
+    _pe = None
 
 try:
-    import parsimonious
-
-    HAS_PARSIMONIOUS = True
+    import parsimonious as _parsimonious
 except ImportError:
-    HAS_PARSIMONIOUS = False
+    _parsimonious = None
 
 try:
-    import lark
-
-    HAS_LARK = True
+    import lark as _lark
 except ImportError:
-    HAS_LARK = False
+    _lark = None
 
 try:
-    from pyparsing import Forward, Group, Keyword, Optional, Regex, Suppress
-
-    HAS_PYPARSING = True
+    import pyparsing as _pyparsing
 except ImportError:
-    HAS_PYPARSING = False
+    _pyparsing = None
 
 from test.conftest import (
     JSON_GRAMMAR,
@@ -112,16 +105,21 @@ LARK_JSON_GRAMMAR = r"""
 
 
 def _build_pyparsing_parser():
-    LBRACE, RBRACE, LBRACK, RBRACK, COLON, COMMA = map(Suppress, "{}[]:,")
-    value = Forward()
-    string = Regex(r'"(?:[^"\\]|\\.)*"')
-    number = Regex(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
-    true_lit = Keyword("true")
-    false_lit = Keyword("false")
-    null_lit = Keyword("null")
-    array = Group(LBRACK + Optional(value + (COMMA + value)[...]) + RBRACK)
-    pair = Group(string + COLON + value)
-    obj = Group(LBRACE + Optional(pair + (COMMA + pair)[...]) + RBRACE)
+    assert _pyparsing is not None
+    LBRACE, RBRACE, LBRACK, RBRACK, COLON, COMMA = map(_pyparsing.Suppress, "{}[]:,")
+    value = _pyparsing.Forward()
+    string = _pyparsing.Regex(r'"(?:[^"\\]|\\.)*"')
+    number = _pyparsing.Regex(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+    true_lit = _pyparsing.Keyword("true")
+    false_lit = _pyparsing.Keyword("false")
+    null_lit = _pyparsing.Keyword("null")
+    array = _pyparsing.Group(
+        LBRACK + _pyparsing.Optional(value + (COMMA + value)[...]) + RBRACK
+    )
+    pair = _pyparsing.Group(string + COLON + value)
+    obj = _pyparsing.Group(
+        LBRACE + _pyparsing.Optional(pair + (COMMA + pair)[...]) + RBRACE
+    )
     value <<= obj | array | string | number | true_lit | false_lit | null_lit
     return value
 
@@ -163,14 +161,14 @@ class TestBenchmarkJsonParsers:
     @pytest.fixture(scope="class", autouse=True)
     def parsers(self):
         """Compile all parsers once."""
-        p = {"zgram": zgram.compile(JSON_GRAMMAR)}
-        if HAS_PE:
-            p["pe"] = pe.compile(PE_JSON_GRAMMAR)
-        if HAS_PARSIMONIOUS:
-            p["parsimonious"] = parsimonious.Grammar(PARSIMONIOUS_JSON_GRAMMAR)
-        if HAS_LARK:
-            p["lark"] = lark.Lark(LARK_JSON_GRAMMAR, start="value", parser="earley")
-        if HAS_PYPARSING:
+        p: dict[str, Any] = {"zgram": zgram.compile(JSON_GRAMMAR)}
+        if _pe is not None:
+            p["pe"] = _pe.compile(PE_JSON_GRAMMAR)
+        if _parsimonious is not None:
+            p["parsimonious"] = _parsimonious.Grammar(PARSIMONIOUS_JSON_GRAMMAR)
+        if _lark is not None:
+            p["lark"] = _lark.Lark(LARK_JSON_GRAMMAR, start="value", parser="earley")
+        if _pyparsing is not None:
             p["pyparsing"] = _build_pyparsing_parser()
         return p
 
@@ -199,11 +197,11 @@ class TestBenchmarkJsonParsers:
         parser_configs = [
             ("zgram", "zgram", lambda d: parsers["zgram"].parse(d)),
         ]
-        if HAS_PE:
+        if _pe is not None:
             parser_configs.append(
                 ("pe (C ext)", "pe", lambda d: parsers["pe"].match(d))
             )
-        if HAS_PARSIMONIOUS:
+        if _parsimonious is not None:
             parser_configs.append(
                 (
                     "parsimonious",
@@ -211,11 +209,11 @@ class TestBenchmarkJsonParsers:
                     lambda d: parsers["parsimonious"].parse(d),
                 )
             )
-        if HAS_LARK:
+        if _lark is not None:
             parser_configs.append(
                 ("lark (Earley)", "lark", lambda d: parsers["lark"].parse(d))
             )
-        if HAS_PYPARSING:
+        if _pyparsing is not None:
             parser_configs.append(
                 (
                     "pyparsing",
