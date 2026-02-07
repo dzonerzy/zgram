@@ -2,7 +2,7 @@
 
 A comptime-optimized PEG parser generator for Python. Compiles grammars to native shared libraries via Zig, callable from Python with zero-copy text access and a rich Pythonic API.
 
-Built with [PyOZ](https://github.com/dzonerzy/PyOZ).
+Built with [PyOZ](https://github.com/pyozig/PyOZ).
 
 ## Performance
 
@@ -55,7 +55,7 @@ Even the most complex queries (nested booleans with OR) convert in under 35us (2
 
 ### From source
 
-Requires [Zig](https://ziglang.org/) (0.14+) and [PyOZ](https://github.com/dzonerzy/PyOZ).
+Requires [Zig](https://ziglang.org/) (0.15+) and [PyOZ](https://github.com/pyozig/PyOZ).
 
 ```bash
 pyoz build --release
