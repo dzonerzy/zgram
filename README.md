@@ -62,6 +62,12 @@ pyoz build --release
 pip install dist/zgram-0.1.0-cp310-cp310-linux_x86_64.whl
 ```
 
+or from inside the zgram directory
+
+```bash
+pip install .
+```
+
 ## Quick Start
 
 ```python
