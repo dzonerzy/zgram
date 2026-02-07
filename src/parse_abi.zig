@@ -65,6 +65,12 @@ pub const ParseOutput = extern struct {
     error_message_len: u32 = 0,
 };
 
+// Compile-time ABI assertions
+comptime {
+    if (@sizeOf(FlatNode) != 16) @compileError("FlatNode must be exactly 16 bytes");
+    if (@alignOf(FlatNode) != 4) @compileError("FlatNode must be 4-byte aligned");
+}
+
 /// Function signature that grammar .so files export
 pub const ParseFn = *const fn (
     input_ptr: [*]const u8,

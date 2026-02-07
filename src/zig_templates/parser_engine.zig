@@ -149,8 +149,12 @@ const ParseState = struct {
 
     const MAX_DEPTH = 256;
 
+    /// Maximum node capacity to prevent unbounded growth (256 MB worth of nodes)
+    const MAX_NODE_CAPACITY: u32 = 16 * 1024 * 1024;
+
     fn ensureCapacity(self: *ParseState, needed: u32) bool {
         if (needed <= self.output.node_capacity) return true;
+        if (needed > MAX_NODE_CAPACITY) return false;
 
         var new_cap = if (self.output.node_capacity == 0)
             abi.INITIAL_NODE_CAPACITY
@@ -158,10 +162,21 @@ const ParseState = struct {
             self.output.node_capacity;
 
         while (new_cap < needed) {
-            new_cap *|= 2;
+            const doubled = @as(u64, new_cap) * 2;
+            new_cap = if (doubled > MAX_NODE_CAPACITY)
+                MAX_NODE_CAPACITY
+            else
+                @intCast(doubled);
         }
 
         if (self.output.nodes_ptr) |old_ptr| {
+            if (self.output.node_capacity == 0) {
+                // Pointer set but capacity 0 is invalid — treat as fresh allocation
+                const new_slice = std.heap.c_allocator.alloc(abi.FlatNode, new_cap) catch return false;
+                self.output.nodes_ptr = new_slice.ptr;
+                self.output.node_capacity = new_cap;
+                return true;
+            }
             const old_slice = old_ptr[0..self.output.node_capacity];
             if (std.heap.c_allocator.resize(old_slice, new_cap)) {
                 self.output.node_capacity = new_cap;
@@ -181,6 +196,7 @@ const ParseState = struct {
     }
 
     inline fn reserveNode(self: *ParseState) ?u32 {
+        if (self.output.node_count >= MAX_NODE_CAPACITY) return null;
         if (!self.ensureCapacity(self.output.node_count + 1)) return null;
         const idx = self.output.node_count;
         self.output.node_count += 1;

@@ -1,7 +1,7 @@
 //! Compiler orchestrator: scaffolds a temp Zig project and builds a grammar .so.
 //!
 //! Build directory layout:
-//!     /tmp/zgram_build_<hash16>/
+//!     <tmpdir>/zgram_build_<hash16>/
 //!         src/
 //!             grammar_data.zig   (codegen output)
 //!             grammar_lib.zig    (template)
@@ -14,28 +14,38 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const templates = @import("templates.zig");
+const builtin = @import("builtin");
 
 const LIB_NAME_PLACEHOLDER = "LIB_NAME_PLACEHOLDER";
+
+/// Get the system temporary directory path, cross-platform.
+fn getTmpDir() []const u8 {
+    if (builtin.os.tag == .windows) {
+        return std.posix.getenv("TEMP") orelse std.posix.getenv("TMP") orelse "C:\\Temp";
+    }
+    return std.posix.getenv("TMPDIR") orelse "/tmp";
+}
 
 /// Compile a grammar_data.zig source into a .so file.
 /// Returns the path to the compiled .so (caller must free).
 pub fn compileGrammar(allocator: Allocator, grammar_data_zig: []const u8, hash: []const u8) ![]const u8 {
     const hash16 = hash[0..@min(hash.len, 16)];
+    const tmp_dir = getTmpDir();
 
-    // Build the temp directory path: /tmp/zgram_build_<hash16>
-    var build_dir_buf: [256]u8 = undefined;
-    const build_dir_path = try std.fmt.bufPrint(&build_dir_buf, "/tmp/zgram_build_{s}", .{hash16});
+    // Build the temp directory path
+    var build_dir_buf: [512]u8 = undefined;
+    const build_dir_path = try std.fmt.bufPrint(&build_dir_buf, "{s}/zgram_build_{s}", .{ tmp_dir, hash16 });
 
     // Build the lib name: zgram_<hash16>
     var lib_name_buf: [128]u8 = undefined;
     const lib_name = try std.fmt.bufPrint(&lib_name_buf, "zgram_{s}", .{hash16});
 
     // Create build directory and src subdirectory
-    std.fs.cwd().makePath(build_dir_path) catch {};
+    try std.fs.cwd().makePath(build_dir_path);
 
     var src_dir_buf: [256]u8 = undefined;
     const src_dir_path = try std.fmt.bufPrint(&src_dir_buf, "{s}/src", .{build_dir_path});
-    std.fs.cwd().makePath(src_dir_path) catch {};
+    try std.fs.cwd().makePath(src_dir_path);
 
     // Write grammar_data.zig
     try writeFile(build_dir_path, "src/grammar_data.zig", grammar_data_zig);
@@ -91,6 +101,15 @@ pub fn compileGrammar(allocator: Allocator, grammar_data_zig: []const u8, hash: 
     };
 
     return so_path;
+}
+
+/// Clean up a temp build directory. Call after the .so has been cached.
+pub fn cleanupBuildDir(hash: []const u8) void {
+    const hash16 = hash[0..@min(hash.len, 16)];
+    const tmp_dir = getTmpDir();
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/zgram_build_{s}", .{ tmp_dir, hash16 }) catch return;
+    std.fs.cwd().deleteTree(path) catch {};
 }
 
 fn writeFile(dir_path: []const u8, name: []const u8, content: []const u8) !void {

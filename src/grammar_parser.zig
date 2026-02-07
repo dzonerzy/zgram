@@ -112,6 +112,8 @@ fn freeExpr(allocator: Allocator, expr: *Expr) void {
 // Parser implementation
 // ============================================================================
 
+const abi = @import("parse_abi.zig");
+
 const ParseErr = error{
     EmptyGrammar,
     InvalidExpr,
@@ -125,13 +127,22 @@ const ParseErr = error{
     UnterminatedString,
     UnterminatedCharClass,
     OutOfMemory,
+    DuplicateRule,
+    InvalidCharRange,
+    NestingTooDeep,
+    RuleNameTooLong,
+    EmptyLiteral,
+    TooManyRules,
 };
+
+const MAX_NESTING_DEPTH = 128;
 
 const GrammarParserImpl = struct {
     text: []const u8,
     pos: usize,
     line: usize,
     col: usize,
+    depth: usize,
     allocator: Allocator,
 
     fn init(allocator: Allocator, text: []const u8) GrammarParserImpl {
@@ -140,6 +151,7 @@ const GrammarParserImpl = struct {
             .pos = 0,
             .line = 1,
             .col = 1,
+            .depth = 0,
             .allocator = allocator,
         };
     }
@@ -151,6 +163,12 @@ const GrammarParserImpl = struct {
         self.skipWs();
         while (self.pos < self.text.len) {
             if (try self.parseRule()) |rule| {
+                // Check for duplicate rule names
+                for (rules_list.items) |existing| {
+                    if (std.mem.eql(u8, existing.name, rule.name)) {
+                        return error.DuplicateRule;
+                    }
+                }
                 try rules_list.append(self.allocator, rule);
             }
             self.skipWs();
@@ -158,6 +176,10 @@ const GrammarParserImpl = struct {
 
         if (rules_list.items.len == 0) {
             return error.EmptyGrammar;
+        }
+
+        if (rules_list.items.len > abi.MAX_RULES) {
+            return error.TooManyRules;
         }
 
         // Validate references
@@ -214,16 +236,18 @@ const GrammarParserImpl = struct {
 
         // Parse rule name
         const name = self.parseIdentifier() orelse return error.ExpectedRuleName;
+        if (name.len > abi.MAX_RULE_NAME) return error.RuleNameTooLong;
         const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
 
         self.skipWs();
         if (!self.match('=')) {
-            self.allocator.free(owned_name);
             return error.ExpectedEquals;
         }
 
         // Parse expression
         const expr = try self.parseExpression();
+        errdefer freeExpr(self.allocator, expr);
 
         // Optional semantic action
         var action: ?[]const u8 = null;
@@ -332,6 +356,7 @@ const GrammarParserImpl = struct {
         self.skipWs();
         if (self.match('!')) {
             const sub = try self.parseSuffix() orelse return error.ExpectedExprAfterPredicate;
+            errdefer freeExpr(self.allocator, sub);
             const expr = try self.allocator.create(Expr);
             expr.* = .{
                 .tag = .not_predicate,
@@ -341,6 +366,7 @@ const GrammarParserImpl = struct {
         }
         if (self.match('&')) {
             const sub = try self.parseSuffix() orelse return error.ExpectedExprAfterPredicate;
+            errdefer freeExpr(self.allocator, sub);
             const expr = try self.allocator.create(Expr);
             expr.* = .{
                 .tag = .and_predicate,
@@ -353,6 +379,7 @@ const GrammarParserImpl = struct {
 
     fn parseSuffix(self: *GrammarParserImpl) ParseErr!?*Expr {
         const primary = try self.parsePrimary() orelse return null;
+        errdefer freeExpr(self.allocator, primary);
         self.skipWsInline();
 
         if (self.match('*')) {
@@ -381,6 +408,9 @@ const GrammarParserImpl = struct {
 
         // Grouped expression
         if (c == '(') {
+            if (self.depth >= MAX_NESTING_DEPTH) return error.NestingTooDeep;
+            self.depth += 1;
+            defer self.depth -= 1;
             self.advance();
             const inner = try self.parseExpression();
             self.skipWs();
@@ -435,6 +465,7 @@ const GrammarParserImpl = struct {
         if (self.pos >= self.text.len) return error.UnterminatedString;
 
         const raw = self.text[start..self.pos];
+        if (raw.len == 0) return error.EmptyLiteral;
         const unescaped = try self.unescape(raw);
         self.advance(); // skip closing quote
 
@@ -463,6 +494,7 @@ const GrammarParserImpl = struct {
                 self.advance(); // skip '-'
                 if (self.pos < self.text.len and self.peek() != ']') {
                     const c2 = try self.readClassChar();
+                    if (c1 > c2) return error.InvalidCharRange;
                     try ranges.append(self.allocator, .{ .start = c1, .end = c2 });
                 } else {
                     try ranges.append(self.allocator, .{ .start = c1, .end = c1 });

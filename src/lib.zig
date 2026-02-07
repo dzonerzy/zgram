@@ -133,7 +133,9 @@ const Node = struct {
         var i: usize = 0;
         while (i < @as(usize, @intCast(index))) : (i += 1) {
             if (child_idx >= self._nodes_count) return null;
-            child_idx += nodes[child_idx].subtree_size + 1;
+            const skip = @as(usize, nodes[child_idx].subtree_size) + 1;
+            child_idx, const overflow = @addWithOverflow(child_idx, skip);
+            if (overflow != 0) return null;
         }
         if (child_idx >= self._nodes_count) return null;
 
@@ -211,31 +213,27 @@ const Node = struct {
     // ── Tree navigation ──
 
     /// Return all children as a list.
-    pub fn children(self: *const Node) ?*pyoz.PyObject {
+    pub fn children(self: *const Node) []Node {
         const cc = self.child_count();
-        const list = pyoz.py.PyList_New(@intCast(cc)) orelse return null;
+        if (cc == 0) return &.{};
+        const buf = std.heap.c_allocator.alloc(Node, @intCast(cc)) catch return &.{};
         var i: i64 = 0;
+        var count: usize = 0;
         while (i < cc) : (i += 1) {
             if (self.child(i)) |c| {
-                const obj = Module.toPy(Node, c) orelse {
-                    pyoz.py.Py_DecRef(list);
-                    return null;
-                };
-                // PyList_SetItem steals a reference
-                _ = pyoz.py.PyList_SetItem(list, @intCast(i), obj);
-            } else {
-                _ = pyoz.py.PyList_SetItem(list, @intCast(i), pyoz.py.Py_None());
+                buf[count] = c;
+                count += 1;
             }
         }
-        return list;
+        return buf[0..count];
     }
 
     /// Search descendants depth-first for nodes matching a rule name.
-    pub fn find(self: *const Node, rule_name: []const u8) ?*pyoz.PyObject {
-        const nodes = self._nodes_ptr orelse return pyoz.py.PyList_New(0);
-        const list = pyoz.py.PyList_New(0) orelse return null;
-        findRecursive(nodes, self._nodes_count, self._input_ptr, self._input_len, self._rule_names_ptr, @intCast(self._node_index), rule_name, list);
-        return list;
+    pub fn find(self: *const Node, rule_name: []const u8) []Node {
+        const nodes = self._nodes_ptr orelse return &.{};
+        var result: std.ArrayList(Node) = .empty;
+        findRecursive(nodes, self._nodes_count, self._input_ptr, self._input_len, self._rule_names_ptr, @intCast(self._node_index), rule_name, &result);
+        return result.items;
     }
 
     // ── Docstrings ──
@@ -246,10 +244,8 @@ const Node = struct {
     pub const child__doc__: [*:0]const u8 = "Get child node at index, or None if out of bounds.";
     pub const child__params__ = "index";
     pub const children__doc__: [*:0]const u8 = "Return all children as a list of Node.";
-    pub const children__returns__ = "list[Node]";
     pub const find__doc__: [*:0]const u8 = "Search descendants for nodes matching a rule name. Returns a list.";
     pub const find__params__ = "rule_name";
-    pub const find__returns__ = "list[Node]";
     pub const child_count__doc__: [*:0]const u8 = "Return the number of child nodes.";
 
     // ── Freelist for fast allocation ──
@@ -346,7 +342,7 @@ fn findRecursive(
     rule_names: ?*const [abi.MAX_RULES]abi.RuleNameEntry,
     node_idx: usize,
     target_rule: []const u8,
-    list: *pyoz.PyObject,
+    result: *std.ArrayList(Node),
 ) void {
     if (node_idx >= count) return;
     const flat = nodes[node_idx];
@@ -359,10 +355,7 @@ fn findRecursive(
             const name = entry.name[0..entry.name_len];
             if (std.mem.eql(u8, name, target_rule)) {
                 const node = nodeFromFlat(nodes, node_idx, count, input_ptr, input_len, rule_names);
-                if (Module.toPy(Node, node)) |obj| {
-                    _ = pyoz.py.PyList_Append(list, obj);
-                    pyoz.py.Py_DecRef(obj);
-                }
+                result.append(std.heap.c_allocator, node) catch return;
             }
         }
     }
@@ -374,8 +367,11 @@ fn findRecursive(
         var i: usize = 0;
         while (i < cc) : (i += 1) {
             if (child_idx >= count) break;
-            findRecursive(nodes, count, input_ptr, input_len, rule_names, child_idx, target_rule, list);
-            child_idx += nodes[child_idx].subtree_size + 1;
+            findRecursive(nodes, count, input_ptr, input_len, rule_names, child_idx, target_rule, result);
+            if (child_idx >= count) break;
+            const skip = @as(usize, nodes[child_idx].subtree_size) + 1;
+            child_idx, const overflow = @addWithOverflow(child_idx, skip);
+            if (overflow != 0) break;
         }
     }
 }
@@ -407,24 +403,29 @@ const GrammarParser = struct {
 
     fn ensureInputBuf(self: *GrammarParser, needed: usize) !void {
         if (self._input_cap >= needed) return;
-        // Grow to next power of 2
-        var cap = if (self._input_cap == 0) @as(usize, 4096) else self._input_cap;
-        while (cap < needed) cap *|= 2;
+        // Grow to next power of 2, using u64 to prevent overflow
+        var cap: u64 = if (self._input_cap == 0) 4096 else self._input_cap;
+        while (cap < needed) {
+            cap *|= 2;
+            if (cap >= std.math.maxInt(usize) / 2) break;
+        }
+        const final_cap: usize = @intCast(@min(cap, std.math.maxInt(usize)));
 
         if (self._input_buf) |old| {
             const old_slice = old[0..self._input_cap];
-            if (allocator.resize(old_slice, cap)) {
-                self._input_cap = cap;
+            if (allocator.resize(old_slice, final_cap)) {
+                self._input_cap = final_cap;
                 return;
             }
-            const new_slice = try allocator.alloc(u8, cap);
+            // Allocate new BEFORE freeing old to prevent use-after-free on failure
+            const new_slice = try allocator.alloc(u8, final_cap);
             allocator.free(old_slice);
             self._input_buf = new_slice.ptr;
-            self._input_cap = cap;
+            self._input_cap = final_cap;
         } else {
-            const new_slice = try allocator.alloc(u8, cap);
+            const new_slice = try allocator.alloc(u8, final_cap);
             self._input_buf = new_slice.ptr;
-            self._input_cap = cap;
+            self._input_cap = final_cap;
         }
     }
 
@@ -451,6 +452,9 @@ const GrammarParser = struct {
     /// Raises ParseError (via get_error()) on failure.
     pub fn parse(self: *GrammarParser, input: []const u8) !?Node {
         const parse_fn = self._parse_fn orelse return error.ParserNotLoaded;
+
+        // FlatNode stores positions as u32 — reject inputs that would overflow
+        if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
         try self.ensureAllocated();
         const output = self._output orelse return error.AllocationFailed;
@@ -533,15 +537,22 @@ const GrammarParser = struct {
 /// Load a compiled grammar .so and return a GrammarParser
 fn load_parser(path: []const u8) !GrammarParser {
     var path_buf: [512:0]u8 = [_:0]u8{0} ** 512;
-    if (path.len >= 512) return error.PathTooLong;
+    if (path.len >= path_buf.len) return error.PathTooLong;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
 
     const handle = std.c.dlopen(&path_buf, .{ .LAZY = true }) orelse {
+        // Log dlerror for diagnostics
+        if (std.c.dlerror()) |err| {
+            std.log.err("dlopen failed: {s}", .{err});
+        }
         return error.LoadFailed;
     };
 
     const sym = std.c.dlsym(handle, "zgram_parse") orelse {
+        if (std.c.dlerror()) |err| {
+            std.log.err("dlsym failed: {s}", .{err});
+        }
         _ = std.c.dlclose(handle);
         return error.MissingSymbol;
     };
@@ -589,9 +600,10 @@ fn compile(grammar_text: []const u8) !GrammarParser {
     const so_path = try compiler.compileGrammar(alloc, zig_source, &hash_buf);
     defer alloc.free(so_path);
 
-    // 6. Cache
+    // 6. Cache, then clean up temp build directory
     var store_path_buf: [512]u8 = undefined;
     const final_path = try cache.storeCached(&hash_buf, so_path, &store_path_buf);
+    compiler.cleanupBuildDir(&hash_buf);
 
     // 7. Load and return
     return load_parser(final_path);
@@ -631,6 +643,24 @@ pub const Module = pyoz.module(.{
         pyoz.mapError("LoadFailed", .RuntimeError),
         pyoz.mapError("MissingSymbol", .RuntimeError),
         pyoz.mapError("IndexOutOfBounds", .IndexError),
+        pyoz.mapError("InputTooLarge", .ValueError),
+        pyoz.mapError("DuplicateRule", .ValueError),
+        pyoz.mapError("InvalidCharRange", .ValueError),
+        pyoz.mapError("NestingTooDeep", .ValueError),
+        pyoz.mapError("RuleNameTooLong", .ValueError),
+        pyoz.mapError("EmptyLiteral", .ValueError),
+        pyoz.mapError("TooManyRules", .ValueError),
+        pyoz.mapError("EmptyGrammar", .ValueError),
+        pyoz.mapError("UndefinedRule", .ValueError),
+        pyoz.mapError("ExpectedRuleName", .ValueError),
+        pyoz.mapError("ExpectedEquals", .ValueError),
+        pyoz.mapError("ExpectedExpression", .ValueError),
+        pyoz.mapError("ExpectedCloseParen", .ValueError),
+        pyoz.mapError("UnterminatedString", .ValueError),
+        pyoz.mapError("UnterminatedCharClass", .ValueError),
+        pyoz.mapError("CompilationFailed", .RuntimeError),
+        pyoz.mapError("OutputNotFound", .RuntimeError),
+        pyoz.mapError("HomeNotSet", .RuntimeError),
     },
 });
 
