@@ -1,6 +1,6 @@
 [build-system]
 requires = ["pyoz"]
-build-backend = "pyoz.build"
+build-backend = "pyoz.backend"
 
 [project]
 name = "zgram"
