@@ -1,0 +1,41 @@
+# Zig
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+build/
+develop/
+dist/
+*.egg-info/
+.eggs/
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# zgram cached grammar .so files
+~/.cache/zgram/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug/profiling scripts (keep test_grammars.py and test_api.py)
+debug_*.py
+profile*.py
+test*.py
