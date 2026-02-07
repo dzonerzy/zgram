@@ -10,19 +10,46 @@ zgram compiles PEG grammars into SIMD-accelerated native code. On a JSON parsing
 
 ```
 Small JSON (43 bytes):    0.3us  -  3x faster than json.loads
-Medium JSON (1.2KB):      5.1us  -  1.4x slower than json.loads
-Large JSON (15KB):       66.9us  -  1.1x faster than json.loads
+Medium JSON (1.2KB):      5.3us  -  1.4x slower than json.loads
+Large JSON (15KB):       72.4us  -  ~same as json.loads
 ```
 
 Compared to other Python parser generators:
 
-| Parser | Small | Medium | Large |
-|--------|-------|--------|-------|
-| **zgram** | **0.3us** | **5.1us** | **66.9us** |
-| pe (C ext) | 9.0us (36x) | 203us (40x) | 3,220us (48x) |
-| pyparsing | 70us (279x) | 1,315us (259x) | 20,406us (305x) |
-| parsimonious | 69us (273x) | 2,283us (449x) | 29,248us (437x) |
-| lark (Earley) | 506us (2,009x) | 12,287us (2,419x) | 276,704us (4,138x) |
+| Parser | Type | Small (43B) | Medium (1.2KB) | Large (15KB) |
+|--------|------|-------------|----------------|--------------|
+| **zgram** | **PEG, native .so** | **0.3us** | **5.3us** | **72.4us** |
+| json.loads | Hand-tuned C | 0.8us | 3.8us | 75.5us |
+| pe | PEG, C ext | 9.0us (34x) | 200us (38x) | 3,369us (47x) |
+| pyparsing | Combinator | 69.6us (263x) | 1,257us (238x) | 19,734us (273x) |
+| parsimonious | PEG, pure Python | 69.9us (264x) | 2,452us (464x) | 33,194us (459x) |
+| lark | Earley | 516.9us (1,952x) | 12,987us (2,459x) | 305,548us (4,221x) |
+
+> `json.loads` does **more** work (parses + builds Python dicts/lists). zgram returns a zero-copy parse tree.
+
+### SQL-to-MongoDB Converter
+
+The included [sql2mongo example](examples/sql2mongo/) demonstrates zgram as a real-time query translator.
+Parse latency is sub-microsecond; the Python tree-walking dominates total conversion time:
+
+```
+Query                    Parse (us)   Convert (us)   Overhead      Ops/sec
+---------------------- ------------ -------------- ---------- ------------
+Simple SELECT *               0.1us          7.8us      7.7us     128,260
+WHERE filter                  0.4us         13.5us     13.1us      73,974
+AND + comparisons             0.5us         17.9us     17.3us      55,937
+BETWEEN range                 0.3us         13.3us     13.0us      75,129
+IN list                       0.4us         13.5us     13.1us      74,234
+LIKE pattern                  0.3us         11.8us     11.6us      84,500
+IS NOT NULL                   0.3us         11.1us     10.9us      89,714
+ORDER + LIMIT                 0.6us         17.9us     17.2us      56,015
+DISTINCT                      0.2us          2.0us      1.8us     507,398
+COUNT aggregate               0.5us         16.4us     16.0us      60,835
+Nested boolean                0.8us         34.8us     34.0us      28,741
+Pagination                    0.3us         14.6us     14.3us      68,532
+```
+
+Even the most complex queries (nested booleans with OR) convert in under 35us (28K ops/sec), making zgram suitable for real-time SQL-to-MongoDB translation.
 
 ## Installation
 
@@ -214,14 +241,20 @@ src/
   templates.zig            # @embedFile bridge for template files
   zig_templates/
     parser_engine.zig      # Comptime-specialized PEG engine (SIMD)
-    parse_abi.zig           # ABI copy for grammar .so builds
+    parse_abi.zig          # ABI copy for grammar .so builds
     grammar_types.zig      # Grammar IR types
     grammar_lib.zig        # Build scaffold for grammar .so
+test/
+  conftest.py              # Shared fixtures, cache cleanup
+  test_node_api.py         # Python API tests (Node, GrammarParser, ParseError)
+  test_grammar_correctness.py  # Grammar correctness across PEG patterns
+  test_json_parsing.py     # JSON parsing: values, complex structures, errors
+  test_benchmark_json.py   # Multi-parser comparative benchmark
+  test_benchmark_sql2mongo.py  # SQL-to-MongoDB latency benchmark
+examples/
+  sql2mongo/sql2mongo.py   # SQL SELECT -> MongoDB query converter
 build.zig                  # Zig build configuration
 pyproject.toml             # Python package configuration
-test_grammars.py           # Grammar correctness tests
-test_api.py                # Python API tests
-benchmark.py               # Multi-parser benchmark suite
 ```
 
 ## License

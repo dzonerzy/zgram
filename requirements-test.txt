@@ -1,0 +1,6 @@
+pytest>=8.0
+lark>=1.1
+parsimonious>=0.10
+pe>=0.6
+pyparsing>=2.4
+pyoz>=0.10.3

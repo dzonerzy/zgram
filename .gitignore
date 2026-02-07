@@ -35,7 +35,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# Debug/profiling scripts (keep test_grammars.py and test_api.py)
+# Debug/profiling scripts
 debug_*.py
 profile*.py
-test*.py
+
+# Ignore root-level ad-hoc test scripts (tests live in test/)
+/test_*.py
