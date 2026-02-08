@@ -30,19 +30,6 @@ JSON_GRAMMAR = (
 LIST_GRAMMAR = "list   = '[' item (',' item)* ']'\nitem   = [a-z]+\n"
 
 
-# ── Cache cleanup ──
-
-
-def pytest_sessionstart(session):
-    """Clear zgram .so cache before test session starts."""
-    zgram.clear_cache()
-
-
-def pytest_sessionfinish(session, exitstatus):
-    """Clear zgram .so cache after test session ends."""
-    zgram.clear_cache()
-
-
 # ── Parsers (session-scoped so grammars compile only once) ──
 
 

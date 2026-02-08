@@ -1,10 +1,14 @@
 const std = @import("std");
 const pyoz = @import("PyOZ");
 const abi = @import("parse_abi.zig");
-const cache = @import("cache.zig");
 const grammar_parser = @import("grammar_parser.zig");
-const codegen = @import("codegen.zig");
-const compiler = @import("compiler.zig");
+const jit_codegen = @import("jit_codegen.zig");
+const jit_compiler = @import("jit_compiler.zig");
+
+// Force-export JIT helpers so LLJIT can resolve them
+comptime {
+    _ = @import("jit_helpers.zig");
+}
 
 // ============================================================================
 // ParseError class — error info when parsing fails
@@ -377,13 +381,10 @@ fn findRecursive(
 }
 
 // ============================================================================
-// GrammarParser class — wraps a dlopen'd grammar .so
+// GrammarParser class — wraps a JIT-compiled grammar
 // ============================================================================
 
 const GrammarParser = struct {
-    _path: [512]u8 = [_]u8{0} ** 512,
-    _path_len: usize = 0,
-    _handle: ?*anyopaque = null,
     _parse_fn: ?abi.ParseFn = null,
     /// Heap-allocated parse output (persists so Node back-references remain valid)
     _output: ?*abi.ParseOutput = null,
@@ -430,11 +431,6 @@ const GrammarParser = struct {
     }
 
     pub fn __del__(self: *GrammarParser) void {
-        if (self._handle) |handle| {
-            _ = std.c.dlclose(handle);
-            self._handle = null;
-            self._parse_fn = null;
-        }
         if (self._output) |output| {
             if (output.nodes_ptr) |nodes| {
                 allocator.free(nodes[0..output.node_capacity]);
@@ -534,84 +530,51 @@ const GrammarParser = struct {
 // Module-level functions
 // ============================================================================
 
-/// Load a compiled grammar .so and return a GrammarParser
-fn load_parser(path: []const u8) !GrammarParser {
-    var path_buf: [512:0]u8 = [_:0]u8{0} ** 512;
-    if (path.len >= path_buf.len) return error.PathTooLong;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-
-    const handle = std.c.dlopen(&path_buf, .{ .LAZY = true }) orelse {
-        // Log dlerror for diagnostics
-        if (std.c.dlerror()) |err| {
-            std.log.err("dlopen failed: {s}", .{err});
-        }
-        return error.LoadFailed;
-    };
-
-    const sym = std.c.dlsym(handle, "zgram_parse") orelse {
-        if (std.c.dlerror()) |err| {
-            std.log.err("dlsym failed: {s}", .{err});
-        }
-        _ = std.c.dlclose(handle);
-        return error.MissingSymbol;
-    };
-
-    const parse_fn: abi.ParseFn = @ptrCast(sym);
-
-    var parser = GrammarParser{};
-    @memcpy(parser._path[0..path.len], path);
-    parser._path_len = path.len;
-    parser._handle = handle;
-    parser._parse_fn = parse_fn;
-
-    return parser;
-}
-
 /// Return zgram version
 fn version() []const u8 {
     return "0.1.0";
 }
 
-/// Compile a grammar string into a native parser.
-/// This is the main entry point exposed to Python.
+/// Compile a grammar string into a native parser via LLVM JIT.
 fn compile(grammar_text: []const u8) !GrammarParser {
     const alloc = std.heap.page_allocator;
 
-    // 1. Hash the grammar
-    var hash_buf: [64]u8 = undefined;
-    cache.grammarHash(grammar_text, &hash_buf);
-
-    // 2. Check cache
-    var cached_path_buf: [512]u8 = undefined;
-    if (cache.getCached(&hash_buf, &cached_path_buf)) |cached_path| {
-        return load_parser(cached_path);
-    }
-
-    // 3. Parse grammar -> IR
+    // 1. Parse grammar -> IR
     const grammar = try grammar_parser.parseGrammar(alloc, grammar_text);
     defer grammar.deinit(alloc);
 
-    // 4. Generate Zig source
-    const zig_source = try codegen.generateZigSource(alloc, grammar);
-    defer alloc.free(zig_source);
+    // 2. Generate LLVM module in memory
+    const result = jit_codegen.generateModule(alloc, grammar) catch return error.CompilationFailed;
 
-    // 5. Compile
-    const so_path = try compiler.compileGrammar(alloc, zig_source, &hash_buf);
-    defer alloc.free(so_path);
+    // 3. JIT compile to function pointer (takes ownership of module + context)
+    const parse_fn = jit_compiler.jitCompile(result.module, result.context) catch return error.CompilationFailed;
 
-    // 6. Cache, then clean up temp build directory
-    var store_path_buf: [512]u8 = undefined;
-    const final_path = try cache.storeCached(&hash_buf, so_path, &store_path_buf);
-    compiler.cleanupBuildDir(&hash_buf);
-
-    // 7. Load and return
-    return load_parser(final_path);
+    // 4. Return parser with JIT fn ptr (no dlopen handle)
+    var parser = GrammarParser{};
+    parser._parse_fn = parse_fn;
+    return parser;
 }
 
-/// Clear all cached grammar .so files
-fn clear_cache() !i64 {
-    return cache.clearCache();
+/// Dump the LLVM IR text for a grammar (useful for debugging/optimization).
+fn dump_ir(grammar_text: []const u8) ![]const u8 {
+    const alloc = std.heap.page_allocator;
+
+    const grammar = try grammar_parser.parseGrammar(alloc, grammar_text);
+    defer grammar.deinit(alloc);
+
+    const result = jit_codegen.generateModule(alloc, grammar) catch return error.CompilationFailed;
+
+    // Print module to string, then dispose the module/context
+    const LB = @import("llvm_builder.zig");
+    const ir = LB.llvm.LLVMPrintModuleToString(result.module) orelse return error.CompilationFailed;
+    const len = std.mem.len(ir);
+    const buf = alloc.alloc(u8, len) catch return error.CompilationFailed;
+    @memcpy(buf, ir[0..len]);
+    LB.llvm.LLVMDisposeMessage(ir);
+    LB.llvm.LLVMDisposeModule(result.module);
+    LB.llvm.LLVMContextDispose(result.context);
+
+    return buf;
 }
 
 // ============================================================================
@@ -620,12 +583,11 @@ fn clear_cache() !i64 {
 
 pub const Module = pyoz.module(.{
     .name = "zgram",
-    .doc = "zgram - Comptime-optimized PEG parser generator. Compiles grammars to native code via Zig.",
+    .doc = "zgram - PEG parser generator. Compiles grammars to native code via LLVM JIT.",
     .funcs = &.{
         pyoz.func("compile", compile, "Compile a grammar string into a native parser"),
-        pyoz.func("load_parser", load_parser, "Load a compiled grammar .so and return a GrammarParser"),
+        pyoz.func("dump_ir", dump_ir, "Dump LLVM IR text for a grammar"),
         pyoz.func("version", version, "Return zgram version string"),
-        pyoz.func("clear_cache", clear_cache, "Clear all cached grammar .so files"),
     },
     .classes = &.{
         pyoz.class("Node", Node),
@@ -639,9 +601,6 @@ pub const Module = pyoz.module(.{
         pyoz.mapError("ParserNotLoaded", .RuntimeError),
         pyoz.mapError("AllocationFailed", .RuntimeError),
         pyoz.mapError("ParseFailed", .RuntimeError),
-        pyoz.mapError("PathTooLong", .ValueError),
-        pyoz.mapError("LoadFailed", .RuntimeError),
-        pyoz.mapError("MissingSymbol", .RuntimeError),
         pyoz.mapError("IndexOutOfBounds", .IndexError),
         pyoz.mapError("InputTooLarge", .ValueError),
         pyoz.mapError("DuplicateRule", .ValueError),
@@ -659,8 +618,6 @@ pub const Module = pyoz.module(.{
         pyoz.mapError("UnterminatedString", .ValueError),
         pyoz.mapError("UnterminatedCharClass", .ValueError),
         pyoz.mapError("CompilationFailed", .RuntimeError),
-        pyoz.mapError("OutputNotFound", .RuntimeError),
-        pyoz.mapError("HomeNotSet", .RuntimeError),
     },
 });
 

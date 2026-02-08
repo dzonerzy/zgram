@@ -147,7 +147,7 @@ SMALL_JSON = make_small_json()
 MEDIUM_JSON = make_medium_json()
 LARGE_JSON = make_large_json()
 
-#                              zgram   pe   parsimonious  lark  pyparsing  json
+#                              zgram  pe  parsimonious lark pyparsing json
 TEST_CONFIGS = [
     ("Small JSON", SMALL_JSON, 10000, 5000, 1000, 2000, 1000, 10000),
     ("Medium JSON", MEDIUM_JSON, 2000, 500, 50, 100, 50, 2000),
@@ -161,7 +161,9 @@ class TestBenchmarkJsonParsers:
     @pytest.fixture(scope="class", autouse=True)
     def parsers(self):
         """Compile all parsers once."""
-        p: dict[str, Any] = {"zgram": zgram.compile(JSON_GRAMMAR)}
+        p: dict[str, Any] = {
+            "zgram": zgram.compile(JSON_GRAMMAR),
+        }
         if _pe is not None:
             p["pe"] = _pe.compile(PE_JSON_GRAMMAR)
         if _parsimonious is not None:
@@ -225,14 +227,30 @@ class TestBenchmarkJsonParsers:
             ("json.loads (parse+build)", "json.loads", lambda d: json.loads(d))
         )
 
-        iter_keys = ["zgram", "pe", "parsimonious", "lark", "pyparsing", "json.loads"]
+        iter_keys = [
+            "zgram",
+            "pe",
+            "parsimonious",
+            "lark",
+            "pyparsing",
+            "json.loads",
+        ]
 
         print()
         print("=" * 80)
         print(f"{'Benchmark':^80}")
         print("=" * 80)
 
-        for label, data, z_it, pe_it, pars_it, lark_it, pyp_it, j_it in TEST_CONFIGS:
+        for (
+            label,
+            data,
+            z_it,
+            pe_it,
+            pars_it,
+            lark_it,
+            pyp_it,
+            j_it,
+        ) in TEST_CONFIGS:
             iters_map = dict(
                 zip(iter_keys, [z_it, pe_it, pars_it, lark_it, pyp_it, j_it])
             )

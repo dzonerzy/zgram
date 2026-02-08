@@ -30,6 +30,76 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Select the correct LLVM dependency based on target
+    const target_os = target.result.os.tag;
+    const target_arch = target.result.cpu.arch;
+
+    const llvm_dep_name: []const u8 = switch (target_os) {
+        .windows => switch (target_arch) {
+            .x86_64 => "llvm_x86_64_windows",
+            .aarch64 => "llvm_aarch64_windows",
+            else => @panic("unsupported architecture for LLVM libs"),
+        },
+        .macos => "llvm_aarch64_macos",
+        .linux => switch (target_arch) {
+            .x86_64 => "llvm_x86_64_linux",
+            .aarch64 => "llvm_aarch64_linux",
+            else => @panic("unsupported architecture for LLVM libs"),
+        },
+        else => @panic("unsupported OS for LLVM libs"),
+    };
+
+    const llvm_dep = b.lazyDependency(llvm_dep_name, .{}) orelse return;
+    const llvm_lib_path = llvm_dep.path("lib");
+    const llvm_include_path = llvm_dep.path("include");
+
+    // LLVM C API headers
+    user_lib_mod.addIncludePath(llvm_include_path);
+
+    // LLVM static libs (63 total)
+    const llvm_libs = [_][]const u8{
+        // JIT
+        "LLVMOrcJIT",                "LLVMJITLink",                "LLVMExecutionEngine",
+        "LLVMRuntimeDyld",           "LLVMOrcTargetProcess",       "LLVMOrcShared",
+        // Passes / Optimization
+        "LLVMPasses",                "LLVMCoroutines",             "LLVMipo",
+        "LLVMInstrumentation",       "LLVMVectorize",              "LLVMLinker",
+        "LLVMScalarOpts",            "LLVMInstCombine",            "LLVMObjCARCOpts",
+        "LLVMAggressiveInstCombine", "LLVMTransformUtils",         "LLVMCFGuard",
+        // CodeGen
+        "LLVMCodeGen",               "LLVMCodeGenTypes",           "LLVMSelectionDAG",
+        "LLVMGlobalISel",            "LLVMAsmPrinter",             "LLVMCGData",
+        // X86 Backend
+        "LLVMX86CodeGen",            "LLVMX86Desc",                "LLVMX86Info",
+        "LLVMX86AsmParser",          "LLVMX86Disassembler",        "LLVMX86TargetMCA",
+        // Core / IR
+        "LLVMCore",                  "LLVMBitReader",              "LLVMBitWriter",
+        "LLVMIRReader",              "LLVMIRPrinter",              "LLVMAsmParser",
+        "LLVMBitstreamReader",
+        // Target / MC
+              "LLVMTarget",                 "LLVMTargetParser",
+        "LLVMMC",                    "LLVMMCParser",               "LLVMMCDisassembler",
+        "LLVMMCA",
+        // Analysis / Support
+                          "LLVMAnalysis",               "LLVMProfileData",
+        "LLVMObject",                "LLVMTextAPI",                "LLVMBinaryFormat",
+        "LLVMRemarks",               "LLVMSupport",                "LLVMDemangle",
+        // Debug Info
+        "LLVMDebugInfoDWARF",        "LLVMDebugInfoDWARFLowLevel", "LLVMDebugInfoPDB",
+        "LLVMDebugInfoMSF",          "LLVMDebugInfoBTF",           "LLVMDebugInfoCodeView",
+        "LLVMSymbolize",
+        // Frontend
+                    "LLVMFrontendOpenMP",         "LLVMFrontendOffloading",
+        "LLVMFrontendAtomic",
+        // Misc
+               "LLVMHipStdPar",              "LLVMWindowsDriver",
+        "LLVMOption",                "LLVMSandboxIR",              "LLVMObjectYAML",
+    };
+
+    for (llvm_libs) |lib_name| {
+        user_lib_mod.addObjectFile(llvm_lib_path.path(b, b.fmt("lib{s}.a", .{lib_name})));
+    }
+
     // Build the Python extension as a dynamic library
     const lib = b.addLibrary(.{
         .name = "zgram",
@@ -37,8 +107,33 @@ pub fn build(b: *std.Build) void {
         .root_module = user_lib_mod,
     });
 
+    // Export all symbols so LLJIT's dlsym() can find __register_frame etc.
+    lib.rdynamic = true;
+
     // Link libc (required for Python C API)
     lib.linkLibC();
+    lib.linkLibCpp();
+
+    // Platform-specific link dependencies
+    switch (target_os) {
+        .linux => {
+            user_lib_mod.linkSystemLibrary("rt", .{});
+            user_lib_mod.linkSystemLibrary("dl", .{});
+            user_lib_mod.linkSystemLibrary("m", .{});
+            user_lib_mod.linkSystemLibrary("pthread", .{});
+        },
+        .windows => {
+            user_lib_mod.linkSystemLibrary("psapi", .{});
+            user_lib_mod.linkSystemLibrary("ole32", .{});
+            user_lib_mod.linkSystemLibrary("oleaut32", .{});
+            user_lib_mod.linkSystemLibrary("advapi32", .{});
+            user_lib_mod.linkSystemLibrary("shell32", .{});
+            user_lib_mod.linkSystemLibrary("shlwapi", .{});
+            user_lib_mod.linkSystemLibrary("uuid", .{});
+            user_lib_mod.linkSystemLibrary("user32", .{});
+        },
+        else => {},
+    }
 
     // Determine extension based on target OS (.pyd for Windows, .so otherwise)
     const ext = if (builtin.os.tag == .windows) ".pyd" else ".so";

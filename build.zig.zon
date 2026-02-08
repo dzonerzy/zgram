@@ -6,6 +6,31 @@
         .PyOZ = .{
             .path = "../PyOZ",
         },
+        .llvm_x86_64_linux = .{
+            .url = "https://github.com/dzonerzy/zgram-llvm/releases/download/v21.1.8/llvm-21.1.8-x86_64-linux.tar.xz",
+            .hash = "N-V-__8AAP3xZAmjQSPMn9_Z3fKVGCJwbxS-xVyXCwDTHHQ0",
+            .lazy = true,
+        },
+        .llvm_aarch64_linux = .{
+            .url = "https://github.com/dzonerzy/zgram-llvm/releases/download/v21.1.8/llvm-21.1.8-aarch64-linux.tar.xz",
+            .hash = "N-V-__8AAD--FAmHA4isN_vXIrzA0rYbipfrxlmEiux1tLrv",
+            .lazy = true,
+        },
+        .llvm_x86_64_windows = .{
+            .url = "https://github.com/dzonerzy/zgram-llvm/releases/download/v21.1.8/llvm-21.1.8-x86_64-windows.tar.xz",
+            .hash = "N-V-__8AAMSoZQuE62nQplV_PBOf6NOJB9JEk_Hw60xaH5TF",
+            .lazy = true,
+        },
+        .llvm_aarch64_windows = .{
+            .url = "https://github.com/dzonerzy/zgram-llvm/releases/download/v21.1.8/llvm-21.1.8-aarch64-windows.tar.xz",
+            .hash = "N-V-__8AABOV9gnUUtkxqzKGoHGDtlYiOSeKzjnsyKA0aPz7",
+            .lazy = true,
+        },
+        .llvm_aarch64_macos = .{
+            .url = "https://github.com/dzonerzy/zgram-llvm/releases/download/v21.1.8/llvm-21.1.8-aarch64-macos.tar.xz",
+            .hash = "N-V-__8AAG-DbQb27qiBGc-g5tuhYLbi5doM13Q5HER2GFYr",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
