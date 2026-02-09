@@ -386,6 +386,8 @@ fn findRecursive(
 
 const GrammarParser = struct {
     _parse_fn: ?abi.ParseFn = null,
+    /// Resource tracker for freeing JIT code when this parser is garbage collected
+    _jit_resource: ?jit_compiler.ResourceHandle = null,
     /// Heap-allocated parse output (persists so Node back-references remain valid)
     _output: ?*abi.ParseOutput = null,
     /// Stores a copy of the input so Node text slicing works after parse returns
@@ -431,6 +433,12 @@ const GrammarParser = struct {
     }
 
     pub fn __del__(self: *GrammarParser) void {
+        // Release JIT-compiled code for this grammar
+        if (self._jit_resource) |resource| {
+            jit_compiler.releaseGrammar(resource);
+            self._jit_resource = null;
+            self._parse_fn = null;
+        }
         if (self._output) |output| {
             if (output.nodes_ptr) |nodes| {
                 allocator.free(nodes[0..output.node_capacity]);
@@ -457,9 +465,11 @@ const GrammarParser = struct {
 
         // We must copy input because Python may free/move it after parse returns,
         // but Nodes hold pointers into it for zero-copy text().
-        try self.ensureInputBuf(input.len);
-        const input_buf = self._input_buf orelse return error.AllocationFailed;
-        @memcpy(input_buf[0..input.len], input);
+        if (input.len > 0) {
+            try self.ensureInputBuf(input.len);
+            const input_buf = self._input_buf orelse return error.AllocationFailed;
+            @memcpy(input_buf[0..input.len], input);
+        }
         self._input_len = input.len;
 
         // Call the grammar's parse function
@@ -472,7 +482,7 @@ const GrammarParser = struct {
                 nodes,
                 0,
                 output.node_count,
-                input_buf,
+                self._input_buf,
                 self._input_len,
                 &output.rule_names,
             );
@@ -547,11 +557,12 @@ fn compile(grammar_text: []const u8) !GrammarParser {
     const result = jit_codegen.generateModule(alloc, grammar) catch return error.CompilationFailed;
 
     // 3. JIT compile to function pointer (takes ownership of module + context)
-    const parse_fn = jit_compiler.jitCompile(result.module, result.context) catch return error.CompilationFailed;
+    const jit_result = jit_compiler.jitCompile(result.module, result.context) catch return error.CompilationFailed;
 
-    // 4. Return parser with JIT fn ptr (no dlopen handle)
+    // 4. Return parser with JIT fn ptr and resource handle for cleanup
     var parser = GrammarParser{};
-    parser._parse_fn = parse_fn;
+    parser._parse_fn = jit_result.parse_fn;
+    parser._jit_resource = jit_result.resource;
     return parser;
 }
 
@@ -611,6 +622,7 @@ pub const Module = pyoz.module(.{
         pyoz.mapError("TooManyRules", .ValueError),
         pyoz.mapError("EmptyGrammar", .ValueError),
         pyoz.mapError("UndefinedRule", .ValueError),
+        pyoz.mapError("LeftRecursion", .ValueError),
         pyoz.mapError("ExpectedRuleName", .ValueError),
         pyoz.mapError("ExpectedEquals", .ValueError),
         pyoz.mapError("ExpectedExpression", .ValueError),

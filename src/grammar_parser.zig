@@ -62,6 +62,8 @@ pub const Rule = struct {
     name: []const u8,
     expr: *Expr,
     action: ?[]const u8 = null,
+    /// Explicit @silent annotation — forces rule to be silent (no parse tree node).
+    silent: bool = false,
 };
 
 pub const Grammar = struct {
@@ -133,6 +135,7 @@ const ParseErr = error{
     RuleNameTooLong,
     EmptyLiteral,
     TooManyRules,
+    LeftRecursion,
 };
 
 const MAX_NESTING_DEPTH = 128;
@@ -187,6 +190,9 @@ const GrammarParserImpl = struct {
             try self.validateRefs(rule.expr, rules_list.items);
         }
 
+        // Detect left recursion (rule can reach itself without consuming input)
+        try detectLeftRecursion(self.allocator, rules_list.items);
+
         const grammar = try self.allocator.create(Grammar);
         grammar.* = .{
             .rules = try self.allocator.dupe(*Rule, rules_list.items),
@@ -234,6 +240,30 @@ const GrammarParserImpl = struct {
             return self.parseRule();
         }
 
+        // Check for @silent annotation
+        var is_silent = false;
+        if (self.peek() == '@') {
+            const saved_pos = self.pos;
+            const saved_line = self.line;
+            const saved_col = self.col;
+            self.advance(); // skip '@'
+            if (self.parseIdentifier()) |annotation| {
+                if (std.mem.eql(u8, annotation, "silent")) {
+                    is_silent = true;
+                    self.skipWs();
+                } else {
+                    // Unknown annotation — restore position
+                    self.pos = saved_pos;
+                    self.line = saved_line;
+                    self.col = saved_col;
+                }
+            } else {
+                self.pos = saved_pos;
+                self.line = saved_line;
+                self.col = saved_col;
+            }
+        }
+
         // Parse rule name
         const name = self.parseIdentifier() orelse return error.ExpectedRuleName;
         if (name.len > abi.MAX_RULE_NAME) return error.RuleNameTooLong;
@@ -265,6 +295,7 @@ const GrammarParserImpl = struct {
             .name = owned_name,
             .expr = expr,
             .action = action,
+            .silent = is_silent,
         };
         return rule;
     }
@@ -355,7 +386,7 @@ const GrammarParserImpl = struct {
     fn parsePrefix(self: *GrammarParserImpl) ParseErr!?*Expr {
         self.skipWs();
         if (self.match('!')) {
-            const sub = try self.parseSuffix() orelse return error.ExpectedExprAfterPredicate;
+            const sub = try self.parsePrefix() orelse return error.ExpectedExprAfterPredicate;
             errdefer freeExpr(self.allocator, sub);
             const expr = try self.allocator.create(Expr);
             expr.* = .{
@@ -365,7 +396,7 @@ const GrammarParserImpl = struct {
             return expr;
         }
         if (self.match('&')) {
-            const sub = try self.parseSuffix() orelse return error.ExpectedExprAfterPredicate;
+            const sub = try self.parsePrefix() orelse return error.ExpectedExprAfterPredicate;
             errdefer freeExpr(self.allocator, sub);
             const expr = try self.allocator.create(Expr);
             expr.* = .{
@@ -650,6 +681,116 @@ const GrammarParserImpl = struct {
         }
     }
 };
+
+// ============================================================================
+// Left-recursion detection
+// ============================================================================
+
+/// Detect left recursion: a rule that can reach itself at the "first position"
+/// (i.e., without consuming any input first). This would cause infinite
+/// loops or stack overflow in PEG parsing.
+fn detectLeftRecursion(allocator: Allocator, rules: []const *Rule) ParseErr!void {
+    const n = rules.len;
+    if (n == 0) return;
+
+    // Build "can-start-with" adjacency: edges[i] contains rule indices
+    // that rule i can invoke at first position without consuming input.
+    const max_edges = 64;
+    const edges = allocator.alloc([max_edges]usize, n) catch return error.OutOfMemory;
+    defer allocator.free(edges);
+    const edge_counts = allocator.alloc(usize, n) catch return error.OutOfMemory;
+    defer allocator.free(edge_counts);
+    @memset(edge_counts, 0);
+
+    for (rules, 0..) |rule, i| {
+        collectFirstRefs(rule.expr, rules, &edges[i], &edge_counts[i]);
+    }
+
+    // DFS cycle detection: for each rule, check if it can reach itself
+    // through first-position references.
+    const state = allocator.alloc(Color, n) catch return error.OutOfMemory;
+    defer allocator.free(state);
+    @memset(state, .white);
+
+    for (0..n) |i| {
+        if (state[i] == .white) {
+            if (hasCycle(edges, edge_counts, state, i))
+                return error.LeftRecursion;
+        }
+    }
+}
+
+const Color = enum { white, gray, black };
+
+/// DFS cycle detection. Returns true if a cycle is found from node `u`.
+fn hasCycle(
+    edges: [][64]usize,
+    edge_counts: []const usize,
+    state: []Color,
+    u: usize,
+) bool {
+    state[u] = .gray;
+    for (edges[u][0..edge_counts[u]]) |v| {
+        if (state[v] == .gray) return true; // back edge → cycle
+        if (state[v] == .white and hasCycle(edges, edge_counts, state, v)) return true;
+    }
+    state[u] = .black;
+    return false;
+}
+
+/// Collect rule indices that `expr` can invoke at first position
+/// (before consuming any input).
+fn collectFirstRefs(expr: *const Expr, rules: []const *Rule, out: *[64]usize, count: *usize) void {
+    switch (expr.tag) {
+        .reference => {
+            const name = expr.ref_name orelse return;
+            for (rules, 0..) |rule, i| {
+                if (std.mem.eql(u8, rule.name, name)) {
+                    // Avoid duplicates
+                    for (out.*[0..count.*]) |existing| {
+                        if (existing == i) return;
+                    }
+                    if (count.* < 64) {
+                        out.*[count.*] = i;
+                        count.* += 1;
+                    }
+                    return;
+                }
+            }
+        },
+        .sequence => {
+            // First position of a sequence is the first child
+            if (expr.children) |children| {
+                if (children.len > 0) {
+                    collectFirstRefs(children[0], rules, out, count);
+                }
+            }
+        },
+        .alternative => {
+            // First position of an alternative is ANY of its branches
+            if (expr.children) |children| {
+                for (children) |child| {
+                    collectFirstRefs(child, rules, out, count);
+                }
+            }
+        },
+        .repetition => {
+            // For ?, *, + the sub-expression is at first position
+            if (expr.rep_expr) |sub| {
+                collectFirstRefs(sub, rules, out, count);
+            }
+        },
+        .not_predicate, .and_predicate => {
+            // Predicates don't consume input, so what follows them
+            // is also at first position. But predicates themselves
+            // don't "call" rules in a way that produces left recursion
+            // since they don't advance. Skip them.
+        },
+        .literal, .char_class, .any_char => {
+            // Terminal expressions — they consume input, no first-position refs
+        },
+    }
+}
 
 // ============================================================================
 // Public API

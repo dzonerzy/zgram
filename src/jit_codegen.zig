@@ -1151,79 +1151,13 @@ fn emitParseEntryPoint(
     _ = b.ret(b.constInt(b.i32, 0));
 }
 
-/// Compute silent rule flags using the same algorithm as parser_engine.zig.
+/// Compute silent rule flags from explicit @silent annotations.
+/// Rules marked @silent produce no parse tree nodes.
 fn computeSilentFlags(allocator: Allocator, grammar: *const gp.Grammar) CodegenError![]bool {
     const rule_count = grammar.rules.len;
     const flags = allocator.alloc(bool, rule_count) catch return CodegenError.OutOfMemory;
-    @memset(flags, true);
-    flags[0] = false;
-
-    const max_edges = 64;
-    const edges = allocator.alloc([max_edges]usize, rule_count) catch return CodegenError.OutOfMemory;
-    defer allocator.free(edges);
-    const edge_counts = allocator.alloc(usize, rule_count) catch return CodegenError.OutOfMemory;
-    defer allocator.free(edge_counts);
-    @memset(edge_counts, 0);
-
     for (grammar.rules, 0..) |rule, ri| {
-        collectStructuralRefs(rule.expr, grammar.rules, false, &edges[ri], &edge_counts[ri]);
+        flags[ri] = rule.silent;
     }
-
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (0..rule_count) |ri| {
-            if (!flags[ri]) {
-                for (edges[ri][0..edge_counts[ri]]) |target| {
-                    if (flags[target]) {
-                        flags[target] = false;
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-
     return flags;
-}
-
-fn collectStructuralRefs(expr: *const gp.Expr, rules: []const *gp.Rule, blocked: bool, edges: *[64]usize, count: *usize) void {
-    switch (expr.tag) {
-        .reference => {
-            if (!blocked) {
-                const name = expr.ref_name orelse return;
-                for (rules, 0..) |rule, i| {
-                    if (std.mem.eql(u8, rule.name, name)) {
-                        var found = false;
-                        for (edges.*[0..count.*]) |existing| {
-                            if (existing == i) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found and count.* < 64) {
-                            edges.*[count.*] = i;
-                            count.* += 1;
-                        }
-                        break;
-                    }
-                }
-            }
-        },
-        .sequence, .alternative => {
-            if (expr.children) |children| {
-                for (children) |child| {
-                    collectStructuralRefs(child, rules, blocked, edges, count);
-                }
-            }
-        },
-        .repetition => {
-            if (expr.rep_expr) |sub| {
-                const rep_blocked = blocked or (expr.rep_kind != '?');
-                collectStructuralRefs(sub, rules, rep_blocked, edges, count);
-            }
-        },
-        .not_predicate, .and_predicate => {},
-        .literal, .char_class, .any_char => {},
-    }
 }

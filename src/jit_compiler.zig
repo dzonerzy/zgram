@@ -126,11 +126,22 @@ fn optimizeModule(module: c.LLVMModuleRef) JitError!void {
     try handleError(c.LLVMRunPasses(module, "default<O3>", tm, opts));
 }
 
+/// Opaque handle for tracking JIT resources associated with a compiled grammar.
+/// Pass to `releaseGrammar()` to free JIT code when the grammar is no longer needed.
+pub const ResourceHandle = c.LLVMOrcResourceTrackerRef;
+
+/// Result of JIT compilation: a callable parse function + a resource handle for cleanup.
+pub const JitResult = struct {
+    parse_fn: abi.ParseFn,
+    resource: ResourceHandle,
+};
+
 /// JIT-compile an in-memory LLVM module into a callable parse function pointer.
 ///
 /// Takes ownership of both the module and context (they are consumed by LLJIT).
-/// Can be called multiple times — clears the previous compilation each time.
-pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!abi.ParseFn {
+/// Returns a JitResult with the function pointer and a ResourceHandle that must
+/// be passed to `releaseGrammar()` when the grammar is no longer needed.
+pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!JitResult {
     // Ensure JIT is initialized
     try initJit();
     const jit = global_jit orelse return JitError.JitNotInitialized;
@@ -139,7 +150,7 @@ pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!abi.P
     try optimizeModule(module);
 
     // Give the entry point a unique name so multiple compiled parsers
-    // can coexist in separate JITDylibs without symbol conflicts.
+    // can coexist without symbol conflicts.
     const id = dylib_counter;
     dylib_counter += 1;
 
@@ -155,8 +166,10 @@ pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!abi.P
         return JitError.SymbolNotFound;
     }
 
-    // Use the main JITDylib — unique function names prevent conflicts
+    // Use the main JITDylib with a ResourceTracker so we can free this
+    // grammar's JIT code independently when it's no longer needed.
     const dylib = c.LLVMOrcLLJITGetMainJITDylib(jit);
+    const rt = c.LLVMOrcJITDylibCreateResourceTracker(dylib);
 
     // Wrap context in ThreadSafeContext (takes ownership of ctx)
     const ts_ctx = c.LLVMOrcCreateNewThreadSafeContextFromLLVMContext(ctx);
@@ -164,16 +177,45 @@ pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!abi.P
     // Wrap module in ThreadSafeModule (takes ownership of module and ts_ctx)
     const ts_module = c.LLVMOrcCreateNewThreadSafeModule(module, ts_ctx);
 
-    // Add module to JIT
-    try handleError(c.LLVMOrcLLJITAddLLVMIRModule(jit, dylib, ts_module));
+    // Add module to JIT, tracked by the ResourceTracker
+    const add_err = c.LLVMOrcLLJITAddLLVMIRModuleWithRT(jit, rt, ts_module);
+    if (add_err) |e| {
+        c.LLVMOrcReleaseResourceTracker(rt);
+        const msg = c.LLVMGetErrorMessage(e);
+        defer c.LLVMDisposeErrorMessage(msg);
+        std.log.err("LLVM JIT error: {s}", .{msg});
+        return JitError.LLVMError;
+    }
 
     // Look up the uniquely-named function
     var fn_addr: c.LLVMOrcExecutorAddress = 0;
     try handleError(c.LLVMOrcLLJITLookup(jit, &fn_addr, fn_name_z));
 
-    if (fn_addr == 0) return JitError.SymbolNotFound;
+    if (fn_addr == 0) {
+        c.LLVMOrcReleaseResourceTracker(rt);
+        return JitError.SymbolNotFound;
+    }
 
-    return @ptrFromInt(fn_addr);
+    return .{
+        .parse_fn = @ptrFromInt(fn_addr),
+        .resource = rt,
+    };
+}
+
+/// Release all JIT-compiled code and resources associated with a grammar.
+/// After this call, the parse function pointer is invalid and must not be used.
+pub fn releaseGrammar(resource: ResourceHandle) void {
+    if (resource) |rt| {
+        // Remove all JIT code tracked by this ResourceTracker
+        const err = c.LLVMOrcResourceTrackerRemove(rt);
+        if (err) |e| {
+            const msg = c.LLVMGetErrorMessage(e);
+            defer c.LLVMDisposeErrorMessage(msg);
+            std.log.err("LLVM JIT cleanup error: {s}", .{msg});
+        }
+        // Release the tracker ref-count
+        c.LLVMOrcReleaseResourceTracker(rt);
+    }
 }
 
 /// Convert an LLVMErrorRef into a Zig error.
