@@ -63,6 +63,11 @@ pub const ParseOutput = extern struct {
     error_col: u32 = 0,
     error_message: [256]u8 = [_]u8{0} ** 256,
     error_message_len: u32 = 0,
+
+    /// High-water mark: furthest position reached during parsing
+    max_pos: u32 = 0,
+    /// Rule ID that was being attempted at the high-water mark position
+    max_pos_rule_id: u16 = 0,
 };
 
 // Compile-time ABI assertions

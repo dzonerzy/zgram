@@ -43,6 +43,7 @@ const Codegen = struct {
     helper_reserve_node: LB.Value,
     helper_fill_node: LB.Value,
     helper_set_error: LB.Value,
+    helper_set_error_at_hwm: LB.Value,
     helper_set_rule_name: LB.Value,
     helper_ensure_capacity: LB.Value,
 
@@ -50,6 +51,7 @@ const Codegen = struct {
     helper_reserve_node_type: LB.Type,
     helper_fill_node_type: LB.Type,
     helper_set_error_type: LB.Type,
+    helper_set_error_at_hwm_type: LB.Type,
     helper_set_rule_name_type: LB.Type,
     helper_ensure_capacity_type: LB.Type,
 
@@ -81,6 +83,10 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
     // void zgram_set_error(ptr output, ptr input, i64 input_len, i64 pos, ptr msg, i64 msg_len)
     const helper_set_error_type = b.fnType(b.void, &.{ b.ptr, b.ptr, b.i64, b.i64, b.ptr, b.i64 });
     const helper_set_error = b.addFunction("zgram_set_error", helper_set_error_type);
+
+    // void zgram_set_error_at_hwm(ptr output, ptr input, i64 input_len)
+    const helper_set_error_at_hwm_type = b.fnType(b.void, &.{ b.ptr, b.ptr, b.i64 });
+    const helper_set_error_at_hwm = b.addFunction("zgram_set_error_at_hwm", helper_set_error_at_hwm_type);
 
     // void zgram_set_rule_name(ptr output, i16 rule_id, ptr name, i8 name_len)
     const helper_set_rule_name_type = b.fnType(b.void, &.{ b.ptr, b.i16, b.ptr, b.i8 });
@@ -117,11 +123,13 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
             .helper_reserve_node = helper_reserve_node,
             .helper_fill_node = helper_fill_node,
             .helper_set_error = helper_set_error,
+            .helper_set_error_at_hwm = helper_set_error_at_hwm,
             .helper_set_rule_name = helper_set_rule_name,
             .helper_ensure_capacity = helper_ensure_capacity,
             .helper_reserve_node_type = helper_reserve_node_type,
             .helper_fill_node_type = helper_fill_node_type,
             .helper_set_error_type = helper_set_error_type,
+            .helper_set_error_at_hwm_type = helper_set_error_at_hwm_type,
             .helper_set_rule_name_type = helper_set_rule_name_type,
             .helper_ensure_capacity_type = helper_ensure_capacity_type,
             .grammar = grammar,
@@ -132,7 +140,7 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
     }
 
     // Generate zgram_parse entry point
-    try emitParseEntryPoint(&b, rule_fns[0], rule_fn_type, grammar, helper_set_error, helper_set_error_type, helper_set_rule_name, helper_set_rule_name_type);
+    try emitParseEntryPoint(&b, rule_fns[0], rule_fn_type, grammar, helper_set_error, helper_set_error_type, helper_set_error_at_hwm, helper_set_error_at_hwm_type, helper_set_rule_name, helper_set_rule_name_type);
 
     return .{ .module = b.module, .context = b.ctx };
 }
@@ -154,6 +162,10 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenErr
 
     const is_silent = cg.silent_flags[rule_id];
 
+    // HWM field offsets in ParseOutput (computed from extern struct layout)
+    const hwm_max_pos_offset = 16940;
+    const hwm_rule_id_offset = 16944;
+
     if (is_silent) {
         // Silent rule: just match the expression, no node construction
         cg.child_count_ptr = null; // No child tracking for silent rules
@@ -163,8 +175,23 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenErr
         // Success: return new position
         _ = b.ret(result_pos);
 
-        // Fail block: return -1
+        // Fail block: update high-water mark, then return -1
         b.positionAtEnd(fail_block);
+        const hwm_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, hwm_max_pos_offset)}, "hwm_ptr");
+        const cur_hwm = b.load(b.i32, hwm_ptr, 4, "cur_hwm");
+        const pos_i32 = b.trunc(pos_arg, b.i32, "pos_i32");
+        const is_further = b.icmp(.ugt, pos_i32, cur_hwm, "is_further");
+        const update_hwm = try b.newBlock("update_hwm");
+        const skip_hwm = try b.newBlock("skip_hwm");
+        _ = b.condBr(is_further, update_hwm, skip_hwm);
+
+        b.positionAtEnd(update_hwm);
+        _ = b.store(pos_i32, hwm_ptr, 4);
+        const hwm_rid_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, hwm_rule_id_offset)}, "hwm_rid_ptr");
+        _ = b.store(b.constInt(b.i16, rule_id), hwm_rid_ptr, 2);
+        _ = b.br(skip_hwm);
+
+        b.positionAtEnd(skip_hwm);
         _ = b.ret(b.constSInt(b.i64, -1));
     } else {
         // Non-silent rule: reserve node, match, fill node on success
@@ -246,9 +273,24 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenErr
 
         _ = b.ret(result_pos);
 
-        // Fail block: rollback node_count and return -1
+        // Fail block: rollback node_count, update high-water mark, return -1
         b.positionAtEnd(fail_block);
         _ = b.store(node_idx, node_count_ptr, 4); // rollback to before we reserved
+        const hwm_ptr2 = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, hwm_max_pos_offset)}, "hwm_ptr2");
+        const cur_hwm2 = b.load(b.i32, hwm_ptr2, 4, "cur_hwm2");
+        const pos_i32_2 = b.trunc(pos_arg, b.i32, "pos_i32_2");
+        const is_further2 = b.icmp(.ugt, pos_i32_2, cur_hwm2, "is_further2");
+        const update_hwm2 = try b.newBlock("update_hwm2");
+        const skip_hwm2 = try b.newBlock("skip_hwm2");
+        _ = b.condBr(is_further2, update_hwm2, skip_hwm2);
+
+        b.positionAtEnd(update_hwm2);
+        _ = b.store(pos_i32_2, hwm_ptr2, 4);
+        const hwm_rid_ptr2 = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, hwm_rule_id_offset)}, "hwm_rid_ptr2");
+        _ = b.store(b.constInt(b.i16, rule_id), hwm_rid_ptr2, 2);
+        _ = b.br(skip_hwm2);
+
+        b.positionAtEnd(skip_hwm2);
         _ = b.ret(b.constSInt(b.i64, -1));
 
         // Alloc fail block: return -1
@@ -1066,6 +1108,8 @@ fn emitParseEntryPoint(
     grammar: *const gp.Grammar,
     helper_set_error: LB.Value,
     helper_set_error_type: LB.Type,
+    helper_set_error_at_hwm: LB.Value,
+    helper_set_error_at_hwm_type: LB.Type,
     helper_set_rule_name: LB.Value,
     helper_set_rule_name_type: LB.Type,
 ) CodegenError!void {
@@ -1087,6 +1131,9 @@ fn emitParseEntryPoint(
     // node_count = 0 (offset 16)
     const nc_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, 16)}, "nc_ptr");
     _ = b.store(b.constInt(b.i32, 0), nc_ptr, 4);
+    // max_pos = 0 (offset 16940)
+    const hwm_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, 16940)}, "hwm_reset_ptr");
+    _ = b.store(b.constInt(b.i32, 0), hwm_ptr, 4);
 
     // Set up rule names (only on first call, using a global flag)
     const names_registered = b.addGlobal("names_registered", b.i8);
@@ -1143,11 +1190,9 @@ fn emitParseEntryPoint(
     _ = b.call(helper_set_error_type, helper_set_error, &.{ output_ptr, input_ptr, input_len, result, partial_msg_global, b.constInt(b.i64, partial_msg.len) }, "");
     _ = b.ret(b.constInt(b.i32, 0));
 
-    // Parse failed: set error
+    // Parse failed: use high-water mark for error position and rule name
     b.positionAtEnd(parse_failed);
-    const fail_msg = "failed to match start rule";
-    const fail_msg_global = b.addGlobalString("fail_err_msg", fail_msg);
-    _ = b.call(helper_set_error_type, helper_set_error, &.{ output_ptr, input_ptr, input_len, zero_pos, fail_msg_global, b.constInt(b.i64, fail_msg.len) }, "");
+    _ = b.call(helper_set_error_at_hwm_type, helper_set_error_at_hwm, &.{ output_ptr, input_ptr, input_len }, "");
     _ = b.ret(b.constInt(b.i32, 0));
 }
 

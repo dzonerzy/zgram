@@ -15,6 +15,7 @@ const c = LB.llvm;
 extern fn zgram_reserve_node(output: *abi.ParseOutput) callconv(.c) i32;
 extern fn zgram_fill_node(output: *abi.ParseOutput, idx: u32, rule_id: u16, text_start: u32, text_end: u32, subtree_size: u32, child_count: u16) callconv(.c) void;
 extern fn zgram_set_error(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: usize, pos: usize, msg_ptr: [*]const u8, msg_len: usize) callconv(.c) void;
+extern fn zgram_set_error_at_hwm(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: usize) callconv(.c) void;
 extern fn zgram_set_rule_name(output: *abi.ParseOutput, rule_id: u16, name_ptr: [*]const u8, name_len: u8) callconv(.c) void;
 extern fn zgram_ensure_capacity(output: *abi.ParseOutput, needed: u32) callconv(.c) i32;
 
@@ -67,10 +68,11 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
     const es = c.LLVMOrcLLJITGetExecutionSession(jit);
     const exported_flags = c.LLVMJITSymbolFlags{ .GenericFlags = c.LLVMJITSymbolGenericFlagsExported | c.LLVMJITSymbolGenericFlagsCallable, .TargetFlags = 0 };
 
-    var syms: [5]c.LLVMOrcCSymbolMapPair = .{
+    var syms: [6]c.LLVMOrcCSymbolMapPair = .{
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_reserve_node"), .Sym = .{ .Address = @intFromPtr(&zgram_reserve_node), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_fill_node"), .Sym = .{ .Address = @intFromPtr(&zgram_fill_node), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_error"), .Sym = .{ .Address = @intFromPtr(&zgram_set_error), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_error_at_hwm"), .Sym = .{ .Address = @intFromPtr(&zgram_set_error_at_hwm), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_rule_name"), .Sym = .{ .Address = @intFromPtr(&zgram_set_rule_name), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_ensure_capacity"), .Sym = .{ .Address = @intFromPtr(&zgram_ensure_capacity), .Flags = exported_flags } },
     };

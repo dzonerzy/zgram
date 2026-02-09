@@ -70,6 +70,8 @@ const ParseError = struct {
 // ============================================================================
 
 const Node = struct {
+    /// Strong reference to the parser — keeps it alive while any Node exists
+    _parser: pyoz.Ref(GrammarParser) = .{},
     _rule: [abi.MAX_RULE_NAME]u8 = [_]u8{0} ** abi.MAX_RULE_NAME,
     _rule_len: usize = 0,
     _start: i64 = 0,
@@ -143,7 +145,8 @@ const Node = struct {
         }
         if (child_idx >= self._nodes_count) return null;
 
-        return nodeFromFlat(nodes, child_idx, self._nodes_count, self._input_ptr, self._input_len, self._rule_names_ptr);
+        const parser_obj = self._parser.object() orelse return null;
+        return nodeFromFlat(nodes, child_idx, self._nodes_count, self._input_ptr, self._input_len, self._rule_names_ptr, parser_obj);
     }
 
     // ── Sequence protocol ──
@@ -235,8 +238,9 @@ const Node = struct {
     /// Search descendants depth-first for nodes matching a rule name.
     pub fn find(self: *const Node, rule_name: []const u8) []Node {
         const nodes = self._nodes_ptr orelse return &.{};
+        const parser_obj = self._parser.object() orelse return &.{};
         var result: std.ArrayList(Node) = .empty;
-        findRecursive(nodes, self._nodes_count, self._input_ptr, self._input_len, self._rule_names_ptr, @intCast(self._node_index), rule_name, &result);
+        findRecursive(nodes, self._nodes_count, self._input_ptr, self._input_len, self._rule_names_ptr, parser_obj, @intCast(self._node_index), rule_name, &result);
         return result.items;
     }
 
@@ -265,6 +269,7 @@ fn nodeFromFlat(
     input_ptr: ?[*]const u8,
     input_len: usize,
     rule_names: ?*const [abi.MAX_RULES]abi.RuleNameEntry,
+    parser_obj: *pyoz.PyObject,
 ) Node {
     const flat = nodes[idx];
     var node = Node{
@@ -275,6 +280,7 @@ fn nodeFromFlat(
         ._input_len = input_len,
         ._rule_names_ptr = rule_names,
     };
+    node._parser.set(parser_obj);
 
     // Look up rule name from rule_id via the rule name table
     if (rule_names) |rn| {
@@ -344,6 +350,7 @@ fn findRecursive(
     input_ptr: ?[*]const u8,
     input_len: usize,
     rule_names: ?*const [abi.MAX_RULES]abi.RuleNameEntry,
+    parser_obj: *pyoz.PyObject,
     node_idx: usize,
     target_rule: []const u8,
     result: *std.ArrayList(Node),
@@ -358,7 +365,7 @@ fn findRecursive(
             const entry = rn[rid];
             const name = entry.name[0..entry.name_len];
             if (std.mem.eql(u8, name, target_rule)) {
-                const node = nodeFromFlat(nodes, node_idx, count, input_ptr, input_len, rule_names);
+                const node = nodeFromFlat(nodes, node_idx, count, input_ptr, input_len, rule_names, parser_obj);
                 result.append(std.heap.c_allocator, node) catch return;
             }
         }
@@ -371,7 +378,7 @@ fn findRecursive(
         var i: usize = 0;
         while (i < cc) : (i += 1) {
             if (child_idx >= count) break;
-            findRecursive(nodes, count, input_ptr, input_len, rule_names, child_idx, target_rule, result);
+            findRecursive(nodes, count, input_ptr, input_len, rule_names, parser_obj, child_idx, target_rule, result);
             if (child_idx >= count) break;
             const skip = @as(usize, nodes[child_idx].subtree_size) + 1;
             child_idx, const overflow = @addWithOverflow(child_idx, skip);
@@ -478,6 +485,7 @@ const GrammarParser = struct {
 
         if (output.status == 1 and output.node_count > 0) {
             const nodes = output.nodes_ptr orelse return error.ParseFailed;
+            const self_obj = Module.selfObject(GrammarParser, self);
             return nodeFromFlat(
                 nodes,
                 0,
@@ -485,6 +493,7 @@ const GrammarParser = struct {
                 self._input_buf,
                 self._input_len,
                 &output.rule_names,
+                self_obj,
             );
         }
 

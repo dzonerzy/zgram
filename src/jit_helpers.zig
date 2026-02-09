@@ -118,6 +118,61 @@ export fn zgram_set_error(
     output.error_message_len = @intCast(mlen);
 }
 
+/// Record a parse error at the high-water mark position.
+/// Reads max_pos and max_pos_rule_id from the output struct, looks up the
+/// rule name, and formats an "expected <rule_name>" error message.
+export fn zgram_set_error_at_hwm(
+    output: *abi.ParseOutput,
+    input_ptr: [*]const u8,
+    input_len: usize,
+) callconv(.c) void {
+    const pos: usize = output.max_pos;
+    const rule_id = output.max_pos_rule_id;
+
+    // Build message: "expected <rule_name>" if we have a rule name, else "unexpected input"
+    var msg_buf: [128]u8 = undefined;
+    var msg_len: usize = 0;
+
+    if (rule_id < abi.MAX_RULES) {
+        const entry = output.rule_names[rule_id];
+        if (entry.name_len > 0) {
+            const prefix = "expected ";
+            @memcpy(msg_buf[0..prefix.len], prefix);
+            msg_len = prefix.len;
+            const nlen: usize = entry.name_len;
+            @memcpy(msg_buf[msg_len .. msg_len + nlen], entry.name[0..nlen]);
+            msg_len += nlen;
+        }
+    }
+    if (msg_len == 0) {
+        const fallback = "unexpected input";
+        @memcpy(msg_buf[0..fallback.len], fallback);
+        msg_len = fallback.len;
+    }
+
+    output.status = 0;
+    output.error_offset = @intCast(pos);
+
+    // Compute line/col from input
+    var line: u32 = 1;
+    var col: u32 = 1;
+    const scan_end = @min(pos, input_len);
+    for (input_ptr[0..scan_end]) |ch| {
+        if (ch == '\n') {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    output.error_line = line;
+    output.error_col = col;
+
+    const mlen: usize = @min(msg_len, 256);
+    @memcpy(output.error_message[0..mlen], msg_buf[0..mlen]);
+    output.error_message_len = @intCast(mlen);
+}
+
 /// Copy rule names into the ParseOutput rule name table.
 /// Called once at the start of parsing to populate the rule name table.
 export fn zgram_set_rule_name(

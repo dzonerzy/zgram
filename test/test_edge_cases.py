@@ -688,20 +688,43 @@ class TestResourceTrackerCleanup:
         del p
         gc.collect()
 
-    def test_node_does_not_keep_parser_alive(self):
-        """Nodes hold raw pointers, not Python references.
-        After parser is deleted, node access is unsafe but shouldn't crash
-        during normal operation (test that we can at least delete cleanly)."""
+    def test_node_keeps_parser_alive(self):
+        """Nodes hold a Ref to the parser, keeping it alive via INCREF."""
         p = zgram.compile("root = [a-z]+\n")
         r = p.parse("hello")
-        text = r.text()
-        assert text == "hello"
         del p
         gc.collect()
-        # Node still exists but underlying data may be invalid
-        # Just verify no crash on cleanup
+        # Node still works because it holds a strong reference to the parser
+        assert r.text() == "hello"
         del r
         gc.collect()
+
+    def test_inline_compile_parse(self):
+        """Parser created inline is kept alive by the returned Node."""
+        node = zgram.compile("root = [a-z]+\n").parse("hello")
+        gc.collect()
+        assert node.text() == "hello"
+
+    def test_child_access_after_parser_gc(self):
+        """Children remain valid after parser is garbage collected."""
+        p = zgram.compile("root = word ' ' word\nword = [a-z]+\n")
+        r = p.parse("hello world")
+        del p
+        gc.collect()
+        assert r.child_count() == 2
+        assert r.child(0).text() == "hello"
+        assert r.child(1).text() == "world"
+
+    def test_find_after_parser_gc(self):
+        """find() works after parser is garbage collected."""
+        p = zgram.compile("root = word ' ' word\nword = [a-z]+\n")
+        r = p.parse("hello world")
+        del p
+        gc.collect()
+        words = r.find("word")
+        assert len(words) == 2
+        assert words[0].text() == "hello"
+        assert words[1].text() == "world"
 
     def test_compile_loop_stress(self):
         """Compile in a loop to stress ResourceTracker allocation/release."""
@@ -732,10 +755,7 @@ class TestErrorReporting:
         p = zgram.compile("root = 'hello'\n")
         with pytest.raises(Exception) as exc_info:
             p.parse("goodbye")
-        assert (
-            "fail" in str(exc_info.value).lower()
-            or "match" in str(exc_info.value).lower()
-        )
+        assert "expected" in str(exc_info.value).lower()
 
     def test_error_line_column_multiline(self):
         p = zgram.compile("root = 'line1\\nline2\\nline3'\n")
