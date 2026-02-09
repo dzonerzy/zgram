@@ -4,7 +4,8 @@
     .fingerprint = 0xcb213bf46558da2a,
     .dependencies = .{
         .PyOZ = .{
-            .path = "../PyOZ",
+            .url = "https://github.com/pyozig/pyoz/archive/refs/tags/v0.10.5.tar.gz",
+            .hash = "PyOZ-0.10.5-ntlpPnfNFABA5ZPNB6BAy2PkUEIcdmik0gAd8ZuqATjX",
         },
         .llvm_x86_64_linux = .{
             .url = "https://github.com/dzonerzy/zgram-llvm/releases/download/v21.1.8/llvm-21.1.8-x86_64-linux.tar.xz",
