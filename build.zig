@@ -143,4 +143,58 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = "zgram" ++ ext,
     });
     b.getInstallStep().dependOn(&install.step);
+
+    // ── Benchmark executable (no Python / PyOZ dependency) ──
+
+    // Core module: re-exports the compiler pipeline without Python/PyOZ
+    const core_mod = b.createModule(.{
+        .root_source_file = b.path("src/zgram_core.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    core_mod.addIncludePath(llvm_include_path);
+    for (llvm_libs) |lib_name| {
+        core_mod.addObjectFile(llvm_lib_path.path(b, b.fmt("lib{s}.a", .{lib_name})));
+    }
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("benchmark/zgram/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zgram_core", .module = core_mod },
+        },
+    });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "zgram_bench",
+        .root_module = bench_mod,
+    });
+    bench_exe.rdynamic = true;
+    bench_exe.linkLibC();
+    bench_exe.linkLibCpp();
+
+    switch (target_os) {
+        .linux => {
+            bench_mod.linkSystemLibrary("rt", .{});
+            bench_mod.linkSystemLibrary("dl", .{});
+            bench_mod.linkSystemLibrary("m", .{});
+            bench_mod.linkSystemLibrary("pthread", .{});
+        },
+        .windows => {
+            bench_mod.linkSystemLibrary("psapi", .{});
+            bench_mod.linkSystemLibrary("ole32", .{});
+            bench_mod.linkSystemLibrary("oleaut32", .{});
+            bench_mod.linkSystemLibrary("advapi32", .{});
+            bench_mod.linkSystemLibrary("shell32", .{});
+            bench_mod.linkSystemLibrary("shlwapi", .{});
+            bench_mod.linkSystemLibrary("uuid", .{});
+            bench_mod.linkSystemLibrary("user32", .{});
+        },
+        else => {},
+    }
+
+    const bench_install = b.addInstallArtifact(bench_exe, .{});
+    const bench_step = b.step("bench", "Build the native benchmark");
+    bench_step.dependOn(&bench_install.step);
 }

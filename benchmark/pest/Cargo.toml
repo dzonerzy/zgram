@@ -1,0 +1,12 @@
+[package]
+name = "pest_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pest = "2.7"
+pest_derive = "2.7"
+
+[profile.release]
+opt-level = 3
+lto = true

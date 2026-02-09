@@ -16,7 +16,7 @@ const MAX_NODE_CAPACITY: u32 = 16 * 1024 * 1024;
 
 /// Ensure the node array has capacity for at least `needed` nodes.
 /// Returns 1 on success, 0 on failure.
-export fn zgram_ensure_capacity(output: *abi.ParseOutput, needed: u32) callconv(.c) i32 {
+pub export fn zgram_ensure_capacity(output: *abi.ParseOutput, needed: u32) callconv(.c) i32 {
     if (needed <= output.node_capacity) return 1;
     if (needed > MAX_NODE_CAPACITY) return 0;
 
@@ -59,7 +59,7 @@ export fn zgram_ensure_capacity(output: *abi.ParseOutput, needed: u32) callconv(
 }
 
 /// Reserve a node slot. Returns the index, or -1 on failure.
-export fn zgram_reserve_node(output: *abi.ParseOutput) callconv(.c) i32 {
+pub export fn zgram_reserve_node(output: *abi.ParseOutput) callconv(.c) i32 {
     if (output.node_count >= MAX_NODE_CAPACITY) return -1;
     if (zgram_ensure_capacity(output, output.node_count + 1) == 0) return -1;
     const idx = output.node_count;
@@ -68,7 +68,7 @@ export fn zgram_reserve_node(output: *abi.ParseOutput) callconv(.c) i32 {
 }
 
 /// Fill a previously reserved node with its final data.
-export fn zgram_fill_node(
+pub export fn zgram_fill_node(
     output: *abi.ParseOutput,
     idx: u32,
     rule_id: u16,
@@ -87,7 +87,7 @@ export fn zgram_fill_node(
 }
 
 /// Record a parse error with position and message.
-export fn zgram_set_error(
+pub export fn zgram_set_error(
     output: *abi.ParseOutput,
     input_ptr: [*]const u8,
     input_len: usize,
@@ -121,7 +121,7 @@ export fn zgram_set_error(
 /// Record a parse error at the high-water mark position.
 /// Reads max_pos and max_pos_rule_id from the output struct, looks up the
 /// rule name, and formats an "expected <rule_name>" error message.
-export fn zgram_set_error_at_hwm(
+pub export fn zgram_set_error_at_hwm(
     output: *abi.ParseOutput,
     input_ptr: [*]const u8,
     input_len: usize,
@@ -175,7 +175,7 @@ export fn zgram_set_error_at_hwm(
 
 /// Copy rule names into the ParseOutput rule name table.
 /// Called once at the start of parsing to populate the rule name table.
-export fn zgram_set_rule_name(
+pub export fn zgram_set_rule_name(
     output: *abi.ParseOutput,
     rule_id: u16,
     name_ptr: [*]const u8,

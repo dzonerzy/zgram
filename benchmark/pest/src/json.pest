@@ -1,0 +1,23 @@
+json = { SOI ~ value ~ EOI }
+
+value = { object | array | string | number | boolean | null }
+
+object = { "{" ~ "}" | "{" ~ pair ~ ("," ~ pair)* ~ "}" }
+pair   = { string ~ ":" ~ value }
+
+array = { "[" ~ "]" | "[" ~ value ~ ("," ~ value)* ~ "]" }
+
+string  = @{ "\"" ~ char* ~ "\"" }
+char    = { escape | plain }
+escape  = { "\\" ~ ("\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t" | "u" ~ ASCII_HEX_DIGIT{4}) }
+plain   = { !("\"" | "\\") ~ ANY }
+
+number = @{ "-"? ~ int ~ frac? ~ exp? }
+int    = { "0" | ASCII_NONZERO_DIGIT ~ ASCII_DIGIT* }
+frac   = { "." ~ ASCII_DIGIT+ }
+exp    = { ("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+ }
+
+boolean = { "true" | "false" }
+null    = { "null" }
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }

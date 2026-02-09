@@ -1,0 +1,11 @@
+[package]
+name = "rustpeg_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+peg = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
