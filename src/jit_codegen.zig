@@ -140,7 +140,7 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
     }
 
     // Generate zgram_parse entry point
-    try emitParseEntryPoint(&b, rule_fns[0], rule_fn_type, grammar, helper_set_error, helper_set_error_type, helper_set_error_at_hwm, helper_set_error_at_hwm_type, helper_set_rule_name, helper_set_rule_name_type);
+    try emitParseEntryPoint(&b, rule_fns[0], rule_fn_type, grammar, helper_set_error, helper_set_error_type, helper_set_error_at_hwm, helper_set_error_at_hwm_type, helper_set_rule_name, helper_set_rule_name_type, silent_flags[0]);
 
     return .{ .module = b.module, .context = b.ctx };
 }
@@ -167,13 +167,20 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenErr
     const hwm_rule_id_offset = 16944;
 
     if (is_silent) {
-        // Silent rule: just match the expression, no node construction
-        cg.child_count_ptr = null; // No child tracking for silent rules
+        // Silent rule: no node for itself, but track child count so the caller
+        // can adopt this rule's non-silent children as its own direct children.
+        // Return convention: (child_count << 32) | position on success, -1 on failure.
+        cg.child_count_ptr = LB.llvm.LLVMBuildAlloca(b.b, b.i32, "silent_cc");
+        _ = b.store(b.constInt(b.i32, 0), cg.child_count_ptr, 4);
         const fail_block = try b.newBlock("fail");
         const result_pos = try emitExpr(cg, rule.expr, pos_arg, fail_block);
 
-        // Success: return new position
-        _ = b.ret(result_pos);
+        // Success: pack child count into upper 32 bits of return value
+        const cc_val = b.load(b.i32, cg.child_count_ptr, 4, "silent_cc_val");
+        const cc_i64 = b.zext(cc_val, b.i64, "cc_i64");
+        const cc_shifted = b.shl(cc_i64, b.constInt(b.i64, 32), "cc_shifted");
+        const ret_val = b.@"or"(cc_shifted, result_pos, "packed_ret");
+        _ = b.ret(ret_val);
 
         // Fail block: update high-water mark, then return -1
         b.positionAtEnd(fail_block);
@@ -480,15 +487,31 @@ fn emitReference(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
     _ = b.condBr(failed, fail_block, ok_block);
     b.positionAtEnd(ok_block);
 
-    // Increment parent's direct child count if the referenced rule is non-silent
-    // and we're inside a non-silent rule (child_count_ptr is non-null)
-    if (!cg.silent_flags[rule_idx] and cg.child_count_ptr != null) {
-        const cur_cc = b.load(b.i32, cg.child_count_ptr, 4, "cur_cc");
-        const new_cc = b.add(cur_cc, b.constInt(b.i32, 1), "new_cc");
-        _ = b.store(new_cc, cg.child_count_ptr, 4);
-    }
+    if (cg.silent_flags[rule_idx]) {
+        // Silent rule packs child count in upper 32 bits: (cc << 32) | pos
+        // Extract position from lower 32 bits, child count from upper 32 bits
+        const pos_masked = b.@"and"(result, b.constInt(b.i64, 0xFFFFFFFF), "silent_pos");
 
-    return result;
+        // Add the silent rule's child count to our own (if we're tracking)
+        if (cg.child_count_ptr != null) {
+            const silent_cc = b.lshr(result, b.constInt(b.i64, 32), "silent_cc");
+            const silent_cc_i32 = b.trunc(silent_cc, b.i32, "silent_cc32");
+            const cur_cc = b.load(b.i32, cg.child_count_ptr, 4, "cur_cc");
+            const new_cc = b.add(cur_cc, silent_cc_i32, "new_cc");
+            _ = b.store(new_cc, cg.child_count_ptr, 4);
+        }
+
+        return pos_masked;
+    } else {
+        // Non-silent rule: increment parent's direct child count by 1
+        if (cg.child_count_ptr != null) {
+            const cur_cc = b.load(b.i32, cg.child_count_ptr, 4, "cur_cc");
+            const new_cc = b.add(cur_cc, b.constInt(b.i32, 1), "new_cc");
+            _ = b.store(new_cc, cg.child_count_ptr, 4);
+        }
+
+        return result;
+    }
 }
 
 /// Emit sequence: match each child in order, fail if any fails.
@@ -1112,6 +1135,7 @@ fn emitParseEntryPoint(
     helper_set_error_at_hwm_type: LB.Type,
     helper_set_rule_name: LB.Value,
     helper_set_rule_name_type: LB.Type,
+    root_is_silent: bool,
 ) CodegenError!void {
     // i32 @zgram_parse(ptr input, i64 len, ptr output)
     const parse_fn_type = b.fnType(b.i32, &.{ b.ptr, b.i64, b.ptr });
@@ -1165,15 +1189,23 @@ fn emitParseEntryPoint(
     const zero_pos = b.constInt(b.i64, 0);
     const result = b.call(rule_fn_type, rule_0, &.{ input_ptr, input_len, output_ptr, zero_pos }, "result");
 
+    // If root rule is silent, it packs child count in upper 32 bits.
+    // Extract the position from lower 32 bits; -1 check uses slt since
+    // packed values are always non-negative.
+    const result_pos = if (root_is_silent)
+        b.@"and"(result, b.constInt(b.i64, 0xFFFFFFFF), "root_pos")
+    else
+        result;
+
     // Check result
-    const failed = b.icmp(.eq, result, b.constSInt(b.i64, -1), "failed");
+    const failed = b.icmp(.slt, result, b.constSInt(b.i64, 0), "failed");
     const check_full = try b.newBlock("check_full");
     const parse_failed = try b.newBlock("parse_failed");
     _ = b.condBr(failed, parse_failed, check_full);
 
     // Check full consumption
     b.positionAtEnd(check_full);
-    const fully_consumed = b.icmp(.eq, result, input_len, "full");
+    const fully_consumed = b.icmp(.eq, result_pos, input_len, "full");
     const success_block = try b.newBlock("success");
     const partial_block = try b.newBlock("partial");
     _ = b.condBr(fully_consumed, success_block, partial_block);
@@ -1187,7 +1219,7 @@ fn emitParseEntryPoint(
     b.positionAtEnd(partial_block);
     const partial_msg = "unexpected input after match";
     const partial_msg_global = b.addGlobalString("partial_err_msg", partial_msg);
-    _ = b.call(helper_set_error_type, helper_set_error, &.{ output_ptr, input_ptr, input_len, result, partial_msg_global, b.constInt(b.i64, partial_msg.len) }, "");
+    _ = b.call(helper_set_error_type, helper_set_error, &.{ output_ptr, input_ptr, input_len, result_pos, partial_msg_global, b.constInt(b.i64, partial_msg.len) }, "");
     _ = b.ret(b.constInt(b.i32, 0));
 
     // Parse failed: use high-water mark for error position and rule name

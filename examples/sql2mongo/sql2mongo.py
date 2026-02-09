@@ -34,8 +34,8 @@ import zgram
 # ============================================================================
 
 SQL_GRAMMAR = r"""
-query       = ws select_clause from_clause where_clause? order_clause? limit_clause? offset_clause? ws
-select_clause = select_kw ws distinct_kw? ws field_list ws
+query       = ws select_clause from_clause where_clause? order_clause? limit_clause? offset_clause? ws semicolon? ws
+@silent select_clause = select_kw ws distinct_kw? ws field_list ws
 from_clause   = from_kw ws identifier ws
 
 where_clause  = where_kw ws expression ws
@@ -49,7 +49,7 @@ aggregate   = agg_func ws lparen ws agg_arg ws rparen
 agg_func    = count_kw | sum_kw | avg_kw | min_kw | max_kw
 agg_arg     = star | identifier
 
-order_list  = order_item (ws comma ws order_item)*
+@silent order_list  = order_item (ws comma ws order_item)*
 order_item  = identifier ws order_dir?
 order_dir   = asc_kw | desc_kw
 
@@ -67,22 +67,22 @@ null_cond   = identifier ws is_kw ws not_null | identifier ws is_kw ws null_kw
 not_null    = not_kw ws null_kw
 comparison  = identifier ws comp_op ws value
 
-value_list  = value (ws comma ws value)*
+@silent value_list  = value (ws comma ws value)*
 value       = number | string | true_kw | false_kw | null_kw | identifier
 number      = minus? digits dot_digits? exp_part?
-digits      = [0-9]+
-dot_digits  = '.' [0-9]+
-exp_part    = [eE] [+\-]? [0-9]+
-minus       = '-'
+@silent digits      = [0-9]+
+@silent dot_digits  = '.' [0-9]+
+@silent exp_part    = [eE] [+\-]? [0-9]+
+@silent minus       = '-'
 string      = squo squo_chars squo | dquo dquo_chars dquo
-squo_chars  = squo_char*
-squo_char   = squo_esc | squo_plain
-squo_esc    = '\\' ['\\/bfnrt]
-squo_plain  = [^'\\]
-dquo_chars  = dquo_char*
-dquo_char   = dquo_esc | dquo_plain
-dquo_esc    = '\\' ["\\/bfnrt]
-dquo_plain  = [^"\\]
+@silent squo_chars  = squo_char*
+@silent squo_char   = squo_esc | squo_plain
+@silent squo_esc    = '\\' ['\\/bfnrt]
+@silent squo_plain  = [^'\\]
+@silent dquo_chars  = dquo_char*
+@silent dquo_char   = dquo_esc | dquo_plain
+@silent dquo_esc    = '\\' ["\\/bfnrt]
+@silent dquo_plain  = [^"\\]
 integer     = [0-9]+
 
 identifier  = [a-zA-Z_] [a-zA-Z0-9_.]*
@@ -96,39 +96,40 @@ gt          = '>'
 lte         = '<='
 gte         = '>='
 
-select_kw   = [sS] [eE] [lL] [eE] [cC] [tT]
-from_kw     = [fF] [rR] [oO] [mM]
-where_kw    = [wW] [hH] [eE] [rR] [eE]
-order_kw    = [oO] [rR] [dD] [eE] [rR]
-by_kw       = [bB] [yY]
-limit_kw    = [lL] [iI] [mM] [iI] [tT]
-offset_kw   = [oO] [fF] [fF] [sS] [eE] [tT]
-and_kw      = [aA] [nN] [dD]
-or_kw       = [oO] [rR]
+@silent select_kw   = [sS] [eE] [lL] [eE] [cC] [tT]
+@silent from_kw     = [fF] [rR] [oO] [mM]
+@silent where_kw    = [wW] [hH] [eE] [rR] [eE]
+@silent order_kw    = [oO] [rR] [dD] [eE] [rR]
+@silent by_kw       = [bB] [yY]
+@silent limit_kw    = [lL] [iI] [mM] [iI] [tT]
+@silent offset_kw   = [oO] [fF] [fF] [sS] [eE] [tT]
+@silent and_kw      = [aA] [nN] [dD]
+@silent or_kw       = [oO] [rR]
 not_kw      = [nN] [oO] [tT]
-in_kw       = [iI] [nN]
-like_kw     = [lL] [iI] [kK] [eE]
-between_kw  = [bB] [eE] [tT] [wW] [eE] [eE] [nN]
-is_kw       = [iI] [sS]
+@silent in_kw       = [iI] [nN]
+@silent like_kw     = [lL] [iI] [kK] [eE]
+@silent between_kw  = [bB] [eE] [tT] [wW] [eE] [eE] [nN]
+@silent is_kw       = [iI] [sS]
 null_kw     = [nN] [uU] [lL] [lL]
 true_kw     = [tT] [rR] [uU] [eE]
 false_kw    = [fF] [aA] [lL] [sS] [eE]
 distinct_kw = [dD] [iI] [sS] [tT] [iI] [nN] [cC] [tT]
-asc_kw      = [aA] [sS] [cC]
+@silent asc_kw      = [aA] [sS] [cC]
 desc_kw     = [dD] [eE] [sS] [cC]
-count_kw    = [cC] [oO] [uU] [nN] [tT]
-sum_kw      = [sS] [uU] [mM]
-avg_kw      = [aA] [vV] [gG]
-min_kw      = [mM] [iI] [nN]
-max_kw      = [mM] [aA] [xX]
+@silent count_kw    = [cC] [oO] [uU] [nN] [tT]
+@silent sum_kw      = [sS] [uU] [mM]
+@silent avg_kw      = [aA] [vV] [gG]
+@silent min_kw      = [mM] [iI] [nN]
+@silent max_kw      = [mM] [aA] [xX]
 
 star        = '*'
-comma       = ','
-lparen      = '('
-rparen      = ')'
-squo        = "'"
-dquo        = '"'
-ws          = [ \t\n\r]*
+@silent comma       = ','
+@silent lparen      = '('
+@silent rparen      = ')'
+@silent semicolon   = ';'
+@silent squo        = "'"
+@silent dquo        = '"'
+@silent ws          = [ \t\n\r]*
 """
 
 # ============================================================================
