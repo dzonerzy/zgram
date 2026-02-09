@@ -4,9 +4,9 @@
 
 # zgram
 
-**Comptime-optimized PEG parser generator for Python.**
+**JIT-compiled PEG parser generator for Python.**
 
-Compiles grammars to SIMD-accelerated native shared libraries via Zig, callable from Python with zero-copy text access and a rich Pythonic API.
+Compiles grammars to SIMD-accelerated native code via LLVM JIT, callable from Python with zero-copy text access and a rich Pythonic API.
 
 [![GitHub Stars](https://img.shields.io/github/stars/dzonerzy/zgram?style=flat)](https://github.com/dzonerzy/zgram)
 [![Python](https://img.shields.io/badge/python-3.8+-blue)](https://www.python.org/)
@@ -21,30 +21,32 @@ Built with [PyOZ](https://github.com/pyozig/PyOZ)
 
 ## Performance
 
-zgram compiles PEG grammars into SIMD-accelerated native code. On a JSON parsing benchmark:
+zgram compiles PEG grammars into SIMD-accelerated native code via LLVM JIT at runtime. No subprocess, no disk cache, no `.so` files -- grammars compile in-process in milliseconds.
+
+On a JSON parsing benchmark:
 
 ```
-Small JSON (43 bytes):    0.3us  -  3x faster than json.loads
-Medium JSON (1.2KB):      5.3us  -  1.4x slower than json.loads
-Large JSON (15KB):       72.4us  -  ~same as json.loads
+Small JSON (43 bytes):    0.1us  -  6x faster than json.loads
+Medium JSON (1.2KB):      2.1us  -  2x faster than json.loads
+Large JSON (15KB):       32.3us  -  2x faster than json.loads
 ```
 
 Compared to other Python parser generators:
 
 | Parser | Type | Small (43B) | Medium (1.2KB) | Large (15KB) |
 |--------|------|-------------|----------------|--------------|
-| **zgram** | **PEG, native .so** | **0.3us** | **5.3us** | **72.4us** |
-| json.loads | Hand-tuned C | 0.8us | 3.8us | 75.5us |
-| pe | PEG, C ext | 9.0us (34x) | 200us (38x) | 3,369us (47x) |
-| pyparsing | Combinator | 69.6us (263x) | 1,257us (238x) | 19,734us (273x) |
-| parsimonious | PEG, pure Python | 69.9us (264x) | 2,452us (464x) | 33,194us (459x) |
-| lark | Earley | 516.9us (1,952x) | 12,987us (2,459x) | 305,548us (4,221x) |
+| **zgram** | **PEG, LLVM JIT** | **0.1us** | **2.1us** | **32.3us** |
+| json.loads | Hand-tuned C | 0.8us | 3.9us | 76.7us |
+| pe | PEG, C ext | 9.3us (74x) | 204us (99x) | 3,375us (104x) |
+| pyparsing | Combinator | 68.6us (546x) | 1,266us (615x) | 19,896us (615x) |
+| parsimonious | PEG, pure Python | 68.4us (544x) | 2,438us (1185x) | 34,871us (1079x) |
+| lark | Earley | 516us (4107x) | 13,330us (6478x) | 312,022us (9651x) |
 
 > `json.loads` does **more** work (parses + builds Python dicts/lists). zgram returns a zero-copy parse tree.
 
 ### SQL-to-MongoDB Converter
 
-The included [sql2mongo example](examples/sql2mongo/) demonstrates zgram as a real-time query translator.
+The included [sql2mongo example](sql2mongo/) demonstrates zgram as a real-time query translator.
 Parse latency is sub-microsecond; the Python tree-walking dominates total conversion time:
 
 ```
@@ -64,20 +66,11 @@ Nested boolean                0.8us         34.8us     34.0us      28,741
 Pagination                    0.3us         14.6us     14.3us      68,532
 ```
 
-Even the most complex queries (nested booleans with OR) convert in under 35us (28K ops/sec), making zgram suitable for real-time SQL-to-MongoDB translation.
-
 ## Installation
 
 ### From source
 
 Requires [Zig](https://ziglang.org/) (0.15+) and [PyOZ](https://github.com/pyozig/PyOZ).
-
-```bash
-pyoz build --release
-pip install dist/zgram-0.1.0-cp310-cp310-linux_x86_64.whl
-```
-
-or from inside the zgram directory
 
 ```bash
 pip install .
@@ -90,14 +83,14 @@ import zgram
 
 # Define a grammar using PEG syntax
 parser = zgram.compile("""
-    value   = object / array / string / number / 'true' / 'false' / 'null'
+    value   = object | array | string | number | 'true' | 'false' | 'null'
     object  = '{' (pair (',' pair)*)? '}'
     pair    = string ':' value
     array   = '[' (value (',' value)*)? ']'
-    string  = '"' (escape / plain)* '"'
-    escape  = '\\\\' ["\\\\/bfnrt]
-    plain   = [^"\\\\]+
-    number  = '-'? ('0' / [1-9] [0-9]*) ('.' [0-9]+)?
+    string  = '"' (escape | plain)* '"'
+    @silent escape = '\\\\' ["\\\\/bfnrt]
+    @silent plain  = [^"\\\\]+
+    number  = '-'? ('0' | [1-9] [0-9]*) ('.' [0-9]+)?
 """)
 
 # Parse input - returns the root Node
@@ -131,8 +124,23 @@ rule_name = expression
 | `(e)` | Grouping |
 | `!e` | Negative lookahead (not predicate) |
 | `&e` | Positive lookahead (and predicate) |
+| `@silent` | Annotation: suppress node in parse tree |
 
-The first rule is the start rule. Rules referenced only inside repetitions are automatically silenced (their nodes are inlined into the parent).
+The first rule is the start rule.
+
+### `@silent` Annotation
+
+Rules annotated with `@silent` match input but produce no node in the parse tree. Use this for whitespace, delimiters, and other structural rules you don't need in the tree:
+
+```
+value  = ws (number | string) ws
+number = [0-9]+
+string = '"' chars '"'
+@silent chars = [^"]*
+@silent ws    = [ \t\n\r]*
+```
+
+Predicates (`!e`, `&e`) are composable: `!!e`, `!&e`, `&!e` all work as expected.
 
 ## API Reference
 
@@ -141,12 +149,12 @@ The first rule is the start rule. Rules referenced only inside repetitions are a
 ```python
 zgram.compile(grammar: str) -> GrammarParser
 ```
-Compile a PEG grammar string into a native parser. The compiled `.so` is cached in `~/.cache/zgram/` for instant reuse.
+Compile a PEG grammar string into a native parser via LLVM JIT. Compilation happens in-process -- no subprocess, no disk I/O.
 
 ```python
-zgram.clear_cache() -> int
+zgram.dump_ir(grammar: str) -> str
 ```
-Clear all cached grammar `.so` files. Returns the number of files removed.
+Return the LLVM IR text for a grammar (useful for debugging/optimization).
 
 ```python
 zgram.version() -> str
@@ -161,12 +169,19 @@ tree = parser.parse("hello")
 ```
 
 - **`parse(input: str) -> Node`** -- Parse input and return the root node. Raises `ParseError` on failure.
-- **`get_error() -> ParseError | None`** -- Get error details from the last failed parse (alternative to exception handling).
-- **`error`** -- Property alias for `get_error()`.
+- **`get_error() -> ParseError | None`** -- Get error details from the last failed parse.
 
 ### Node
 
 A node in the parse tree. Supports the full Python sequence and iterator protocols.
+
+Nodes hold a strong reference to their parser, so they remain valid even if the parser variable goes out of scope:
+
+```python
+# This is safe -- the node keeps the parser alive
+node = zgram.compile("root = [a-z]+").parse("hello")
+print(node.text())  # "hello"
+```
 
 #### Methods
 
@@ -213,18 +228,20 @@ for child in tree:
 
 ### ParseError
 
-Raised when parsing fails. Also available via `parser.get_error()`.
+Raised when parsing fails. Error position uses high-water mark tracking -- it points to the furthest position the parser reached, not just position 0.
 
 ```python
 try:
-    tree = parser.parse("invalid input")
+    tree = parser.parse('{"name": }')
 except zgram.ParseError as e:
-    print(e)           # "line 1, col 5: failed to match start rule"
-    print(e.message()) # "failed to match start rule"
+    print(e)           # "line 1, col 10: expected value"
+    print(e.message()) # "expected value"
     print(e.line())    # 1
-    print(e.column())  # 5
-    print(e.offset())  # 4 (byte offset)
+    print(e.column())  # 10
+    print(e.offset())  # 9 (byte offset)
 ```
+
+Also available via `parser.get_error()` after a failed parse.
 
 ## Architecture
 
@@ -232,50 +249,57 @@ except zgram.ParseError as e:
 Grammar string
      |
      v
-[Grammar Parser] -- PEG syntax -> IR (grammar_parser.zig)
-     |
+[Grammar Parser]   -- PEG syntax -> IR (grammar_parser.zig)
+     |                 Left-recursion detection, @silent annotation
      v
-[Code Generator] -- IR -> Zig source (codegen.zig)
-     |
+[LLVM Codegen]     -- IR -> LLVM IR in memory (jit_codegen.zig)
+     |                 SIMD char scanning, inline node allocation,
+     |                 high-water mark error tracking
      v
-[Zig Compiler]   -- Zig source -> native .so (compiler.zig)
-     |                (ReleaseFast, SIMD-optimized)
+[LLVM JIT]         -- LLVM IR -> native code via ORC LLJIT (jit_compiler.zig)
+     |                 O3 optimization, vectorization, host CPU targeting
      v
-[Cache]          -- SHA-256 keyed, ~/.cache/zgram/ (cache.zig)
-     |
-     v
-[Python API]     -- dlopen .so, expose Node/GrammarParser (lib.zig)
+[Python API]       -- Call JIT'd function, expose Node/GrammarParser (lib.zig)
+                       Zero-copy text, Ref(T) node safety, freelist pooling
 ```
 
-The parser engine (`parser_engine.zig`) uses comptime code generation to specialize the parser for each grammar. Character class matching uses SIMD vector operations. The flat node tree uses a compact 16-byte-per-node layout with subtree-size-based navigation for O(children) child access.
+Key implementation details:
+
+- **LLVM JIT compilation**: Grammars compile to native x86-64 code in-process via LLVM's ORC LLJIT. No subprocess, no `.so` files, no disk cache. Each grammar gets its own ResourceTracker for independent cleanup.
+- **SIMD character scanning**: Character class repetitions (`[a-z]+`, `[^"\\]*`) use SSE2 vector operations to process 16 bytes per cycle. Single ranges, small included sets, and small excluded sets are all vectorized.
+- **Inline node allocation**: Rule functions reserve nodes via an inlined fast path (compare + increment) with a slow path fallback to `zgram_ensure_capacity`. Node filling is also inlined -- no function call overhead per node.
+- **High-water mark errors**: Every rule failure updates `max_pos = max(max_pos, pos)`. On parse failure, the error is reported at the furthest position reached with `"expected <rule_name>"`.
+- **Flat node tree**: 16-byte `FlatNode` structs with subtree-size navigation. O(children) child access, zero-copy text slicing from the input buffer.
+- **Node safety**: Nodes hold a `pyoz.Ref(GrammarParser)` that INCREFs the parser, preventing use-after-free when the parser is garbage collected while nodes are alive.
+
+## Thread Safety
+
+zgram is **not thread-safe**. Do not share `GrammarParser` instances across threads. For multi-threaded workloads, compile a separate parser per thread.
 
 ## Project Structure
 
 ```
 src/
-  lib.zig                  # Python module: Node, GrammarParser, ParseError
-  grammar_parser.zig       # PEG grammar -> IR
-  codegen.zig              # IR -> Zig source code
-  compiler.zig             # Invoke zig build on generated source
-  cache.zig                # Grammar .so caching (SHA-256 keyed)
-  parse_abi.zig            # FlatNode C ABI (16 bytes per node)
-  templates.zig            # @embedFile bridge for template files
-  zig_templates/
-    parser_engine.zig      # Comptime-specialized PEG engine (SIMD)
-    parse_abi.zig          # ABI copy for grammar .so builds
-    grammar_types.zig      # Grammar IR types
-    grammar_lib.zig        # Build scaffold for grammar .so
+  lib.zig               # Python module: Node, GrammarParser, ParseError
+  grammar_parser.zig    # PEG grammar -> IR (with left-recursion detection)
+  jit_codegen.zig       # IR -> LLVM IR (SIMD, inline alloc, HWM tracking)
+  jit_compiler.zig      # LLVM ORC LLJIT compilation + ResourceTracker
+  jit_helpers.zig       # Runtime helpers called by JIT code (node alloc, errors)
+  llvm_builder.zig      # Ergonomic wrapper over LLVM C API
+  parse_abi.zig         # FlatNode/ParseOutput C ABI structs (16 bytes per node)
 test/
-  conftest.py              # Shared fixtures, cache cleanup
-  test_node_api.py         # Python API tests (Node, GrammarParser, ParseError)
-  test_grammar_correctness.py  # Grammar correctness across PEG patterns
-  test_json_parsing.py     # JSON parsing: values, complex structures, errors
-  test_benchmark_json.py   # Multi-parser comparative benchmark
+  conftest.py                  # Shared fixtures (JSON/list grammars)
+  test_node_api.py             # Node/GrammarParser Python API tests
+  test_grammar_correctness.py  # Grammar pattern correctness
+  test_json_parsing.py         # JSON parsing: values, structures, errors
+  test_edge_cases.py           # 115 edge case tests (@silent, backtracking, GC, etc.)
+  test_hwm.py                  # High-water mark error position tests
+  test_benchmark_json.py       # Multi-parser comparative benchmark
   test_benchmark_sql2mongo.py  # SQL-to-MongoDB latency benchmark
-examples/
-  sql2mongo/sql2mongo.py   # SQL SELECT -> MongoDB query converter
-build.zig                  # Zig build configuration
-pyproject.toml             # Python package configuration
+sql2mongo/
+  sql2mongo.py          # SQL SELECT -> MongoDB query converter example
+build.zig               # Zig build configuration
+pyproject.toml          # Python package configuration
 ```
 
 ## License
