@@ -52,18 +52,18 @@ Parse latency is sub-microsecond; the Python tree-walking dominates total conver
 ```
 Query                    Parse (us)   Convert (us)   Overhead      Ops/sec
 ---------------------- ------------ -------------- ---------- ------------
-Simple SELECT *               0.1us          7.8us      7.7us     128,260
-WHERE filter                  0.4us         13.5us     13.1us      73,974
-AND + comparisons             0.5us         17.9us     17.3us      55,937
-BETWEEN range                 0.3us         13.3us     13.0us      75,129
-IN list                       0.4us         13.5us     13.1us      74,234
-LIKE pattern                  0.3us         11.8us     11.6us      84,500
-IS NOT NULL                   0.3us         11.1us     10.9us      89,714
-ORDER + LIMIT                 0.6us         17.9us     17.2us      56,015
-DISTINCT                      0.2us          2.0us      1.8us     507,398
-COUNT aggregate               0.5us         16.4us     16.0us      60,835
-Nested boolean                0.8us         34.8us     34.0us      28,741
-Pagination                    0.3us         14.6us     14.3us      68,532
+Simple SELECT *               0.1us          7.4us      7.3us     134,751
+WHERE filter                  0.2us         16.5us     16.3us      60,725
+AND + comparisons             0.3us         24.6us     24.4us      40,591
+BETWEEN range                 0.1us         16.0us     15.9us      62,430
+IN list                       0.2us         18.3us     18.2us      54,540
+LIKE pattern                  0.2us         15.8us     15.6us      63,381
+IS NOT NULL                   0.1us         14.4us     14.2us      69,657
+ORDER + LIMIT                 0.3us         23.5us     23.2us      42,568
+DISTINCT                      0.1us          2.5us      2.4us     399,715
+COUNT aggregate               0.2us         19.0us     18.8us      52,601
+Nested boolean                0.4us         38.1us     37.6us      26,271
+Pagination                    0.1us         15.5us     15.4us      64,443
 ```
 
 ## Installation
