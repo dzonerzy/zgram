@@ -133,33 +133,38 @@ star        = '*'
 """
 
 # ============================================================================
-# Tree Walker — extract structured data from parse tree
+# Tree Walker — extract structured data from the parse tree
 # ============================================================================
+#
+# The walker works on node.to_tuple(): nested (rule, text, children) tuples
+# built natively in one call. That's several times faster than walking Node
+# objects, because no Python object is created per node.
+
+RULE, TEXT, KIDS = 0, 1, 2
 
 
 def text(node):
     """Get trimmed text of a node."""
-    return node.text().strip()
+    return node[TEXT].strip()
+
+
+def kids(node, rule_name):
+    """Direct children matching a rule name."""
+    return [c for c in node[KIDS] if c[RULE] == rule_name]
 
 
 def extract_string(node):
     """Extract string content without quotes."""
     t = text(node)
-    if (t.startswith("'") and t.endswith("'")) or (
-        t.startswith('"') and t.endswith('"')
-    ):
+    if (t.startswith("'") and t.endswith("'")) or (t.startswith('"') and t.endswith('"')):
         return t[1:-1]
     return t
 
 
 def extract_value(node):
     """Convert a value node to a Python value."""
-    children = node.children()
-    if not children:
-        return text(node)
-
-    for child in children:
-        rule = child.rule()
+    for child in node[KIDS]:
+        rule = child[RULE]
         if rule == "number":
             t = text(child)
             return float(t) if "." in t or "e" in t.lower() else int(t)
@@ -176,30 +181,26 @@ def extract_value(node):
     return text(node)
 
 
+COMP_OPS = {
+    "eq": "$eq",
+    "ne1": "$ne",
+    "ne2": "$ne",
+    "lt": "$lt",
+    "gt": "$gt",
+    "lte": "$lte",
+    "gte": "$gte",
+}
+
+
 def extract_comp_op(node):
     """Map SQL comparison operator to MongoDB operator."""
-    children = node.children()
-    if children:
-        rule = children[0].rule()
-        op_map = {
-            "eq": "$eq",
-            "ne1": "$ne",
-            "ne2": "$ne",
-            "lt": "$lt",
-            "gt": "$gt",
-            "lte": "$lte",
-            "gte": "$gte",
-        }
-        return op_map.get(rule, "$eq")
-    return "$eq"
+    return COMP_OPS.get(node[KIDS][0][RULE], "$eq") if node[KIDS] else "$eq"
 
 
 def like_to_regex(pattern):
     """Convert SQL LIKE pattern to MongoDB regex."""
     regex = "^"
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
+    for c in pattern:
         if c == "%":
             regex += ".*"
         elif c == "_":
@@ -208,129 +209,72 @@ def like_to_regex(pattern):
             regex += "\\" + c
         else:
             regex += c
-        i += 1
-    regex += "$"
-    return regex
+    return regex + "$"
 
 
 def extract_condition(node):
     """Convert a condition node to a MongoDB filter dict."""
-    children = node.children()
-    if not children:
+    if not node[KIDS]:
         return {}
+    cond = node[KIDS][0]
+    rule = cond[RULE]
+    identifiers = kids(cond, "identifier")
+    values = kids(cond, "value")
 
-    first_rule = children[0].rule()
-
-    if first_rule == "comparison":
-        comp = children[0]
-        identifiers = comp.find("identifier")
-        comp_ops = comp.find("comp_op")
-        values = comp.find("value")
+    if rule == "comparison":
+        comp_ops = kids(cond, "comp_op")
         if identifiers and comp_ops and values:
             field = text(identifiers[0])
             op = extract_comp_op(comp_ops[0])
             val = extract_value(values[0])
-            if op == "$eq":
-                return {field: val}
-            return {field: {op: val}}
+            return {field: val} if op == "$eq" else {field: {op: val}}
 
-    if first_rule == "between_cond":
-        bc = children[0]
-        identifiers = bc.find("identifier")
-        values = bc.find("value")
-        if identifiers and len(values) >= 2:
-            field = text(identifiers[0])
-            low = extract_value(values[0])
-            high = extract_value(values[1])
-            return {field: {"$gte": low, "$lte": high}}
+    if rule == "between_cond" and identifiers and len(values) >= 2:
+        return {text(identifiers[0]): {"$gte": extract_value(values[0]), "$lte": extract_value(values[1])}}
 
-    if first_rule == "in_cond":
-        ic = children[0]
-        identifiers = ic.find("identifier")
-        values = ic.find("value")
-        if identifiers and values:
-            field = text(identifiers[0])
-            vals = [extract_value(v) for v in values]
-            return {field: {"$in": vals}}
+    if rule == "in_cond" and identifiers and values:
+        return {text(identifiers[0]): {"$in": [extract_value(v) for v in values]}}
 
-    if first_rule == "like_cond":
-        lc = children[0]
-        identifiers = lc.find("identifier")
-        strings = lc.find("string")
+    if rule == "like_cond":
+        strings = kids(cond, "string")
         if identifiers and strings:
-            field = text(identifiers[0])
-            pattern = extract_string(strings[0])
-            return {field: {"$regex": like_to_regex(pattern)}}
+            return {text(identifiers[0]): {"$regex": like_to_regex(extract_string(strings[0]))}}
 
-    if first_rule == "null_cond":
-        nc = children[0]
-        identifiers = nc.find("identifier")
+    if rule == "null_cond":
         field = text(identifiers[0])
-        not_nulls = nc.find("not_null")
-        if not_nulls:
+        if kids(cond, "not_null"):
             return {field: {"$ne": None}}
         return {field: None}
 
     return {}
 
 
-def children_by_rule(node, rule_name):
-    """Get direct children matching a rule name (not recursive like find())."""
-    return [c for c in node.children() if c.rule() == rule_name]
-
-
 def extract_expression(node):
     """Recursively convert an expression tree to a MongoDB filter."""
-    rule = node.rule()
+    rule = node[RULE]
 
     if rule == "expression":
-        children = node.children()
-        if children:
-            return extract_expression(children[0])
-        return {}
+        return extract_expression(node[KIDS][0]) if node[KIDS] else {}
 
     if rule == "or_expr":
-        and_exprs = children_by_rule(node, "and_expr")
-        if len(and_exprs) == 1:
-            return extract_expression(and_exprs[0])
-        parts = [extract_expression(a) for a in and_exprs]
-        return {"$or": parts}
+        parts = [extract_expression(a) for a in kids(node, "and_expr")]
+        return parts[0] if len(parts) == 1 else {"$or": parts}
 
     if rule == "and_expr":
-        not_exprs = children_by_rule(node, "not_expr")
-        if len(not_exprs) == 1:
-            return extract_expression(not_exprs[0])
-        parts = [extract_expression(n) for n in not_exprs]
-        return {"$and": parts}
+        parts = [extract_expression(n) for n in kids(node, "not_expr")]
+        return parts[0] if len(parts) == 1 else {"$and": parts}
 
     if rule == "not_expr":
-        children = node.children()
-        has_not = any(c.rule() == "not_kw" for c in children)
-        inner_not = [c for c in children if c.rule() == "not_expr"]
-        inner_primary = [c for c in children if c.rule() == "primary_expr"]
-        if has_not:
-            target = (
-                inner_not[0]
-                if inner_not
-                else inner_primary[0]
-                if inner_primary
-                else None
-            )
-            if target:
-                return {"$not": extract_expression(target)}
-            return {}
-        if inner_primary:
-            return extract_expression(inner_primary[0])
-        if inner_not:
-            return extract_expression(inner_not[0])
-        return {}
+        inner = kids(node, "not_expr") or kids(node, "primary_expr")
+        if kids(node, "not_kw"):
+            return {"$not": extract_expression(inner[0])} if inner else {}
+        return extract_expression(inner[0]) if inner else {}
 
     if rule == "primary_expr":
-        children = node.children()
-        for child in children:
-            if child.rule() == "expression":
+        for child in node[KIDS]:
+            if child[RULE] == "expression":
                 return extract_expression(child)
-            if child.rule() == "condition":
+            if child[RULE] == "condition":
                 return extract_condition(child)
         return {}
 
@@ -353,89 +297,63 @@ class SQLToMongo:
 
     def convert(self, sql):
         """Convert a SQL SELECT query to a MongoDB query."""
-        tree = self.parser.parse(sql)  # raises ParseError on failure
-        assert tree is not None
+        # parse() raises ParseError on failure; to_tuple() gives the whole tree
+        query = self.parser.parse(sql).to_tuple()
 
-        query = tree.find("query")[0] if tree.find("query") else tree
-
-        # Extract collection name
-        from_clauses = query.find("from_clause")
-        identifiers = from_clauses[0].find("identifier") if from_clauses else []
-        collection = text(identifiers[0]) if identifiers else "collection"
-
-        # Extract DISTINCT
-        distinct = bool(query.find("distinct_kw"))
-
-        # Extract fields and aggregates
-        field_lists = query.find("field_list")
+        collection = "collection"
+        distinct = False
         fields = []
         aggregates = []
         has_star = False
-
-        if field_lists:
-            fl = field_lists[0]
-            if fl.find("star"):
-                has_star = True
-            for fi in fl.find("field_item"):
-                aggs = fi.find("aggregate")
-                if aggs:
-                    agg = aggs[0]
-                    func = text(agg.find("agg_func")[0]).upper()
-                    arg_nodes = agg.find("agg_arg")
-                    arg = text(arg_nodes[0]) if arg_nodes else "*"
-                    aggregates.append((func, arg))
-                else:
-                    ids = fi.find("identifier")
-                    if ids:
-                        fields.append(text(ids[0]))
-
-        # Extract WHERE filter
         where_filter = {}
-        where_clauses = query.find("where_clause")
-        if where_clauses:
-            exprs = where_clauses[0].find("expression")
-            if exprs:
-                where_filter = extract_expression(exprs[0])
-
-        # Extract ORDER BY
         sort_spec = {}
-        order_clauses = query.find("order_clause")
-        if order_clauses:
-            for item in order_clauses[0].find("order_item"):
-                ids = item.find("identifier")
-                if ids:
-                    field = text(ids[0])
-                    desc_nodes = item.find("desc_kw")
-                    sort_spec[field] = -1 if desc_nodes else 1
-
-        # Extract LIMIT
         limit = None
-        limit_clauses = query.find("limit_clause")
-        if limit_clauses:
-            ints = limit_clauses[0].find("integer")
-            if ints:
-                limit = int(text(ints[0]))
-
-        # Extract OFFSET
         skip = None
-        offset_clauses = query.find("offset_clause")
-        if offset_clauses:
-            ints = offset_clauses[0].find("integer")
-            if ints:
-                skip = int(text(ints[0]))
+
+        # select_clause and order_list are @silent, so their children are
+        # direct children of query / order_clause.
+        for clause in query[KIDS]:
+            rule = clause[RULE]
+            if rule == "from_clause":
+                ids = kids(clause, "identifier")
+                if ids:
+                    collection = text(ids[0])
+            elif rule == "distinct_kw":
+                distinct = True
+            elif rule == "field_list":
+                has_star = bool(kids(clause, "star"))
+                for fi in kids(clause, "field_item"):
+                    item = fi[KIDS][0]
+                    if item[RULE] == "aggregate":
+                        func = text(kids(item, "agg_func")[0]).upper()
+                        args = kids(item, "agg_arg")
+                        aggregates.append((func, text(args[0]) if args else "*"))
+                    elif item[RULE] == "identifier":
+                        fields.append(text(item))
+            elif rule == "where_clause":
+                exprs = kids(clause, "expression")
+                if exprs:
+                    where_filter = extract_expression(exprs[0])
+            elif rule == "order_clause":
+                for item in kids(clause, "order_item"):
+                    ids = kids(item, "identifier")
+                    if ids:
+                        dirs = kids(item, "order_dir")
+                        desc = bool(dirs and kids(dirs[0], "desc_kw"))
+                        sort_spec[text(ids[0])] = -1 if desc else 1
+            elif rule == "limit_clause":
+                limit = int(text(kids(clause, "integer")[0]))
+            elif rule == "offset_clause":
+                skip = int(text(kids(clause, "integer")[0]))
 
         # Build MongoDB query
         if aggregates:
-            return self._build_aggregate(
-                collection, aggregates, fields, where_filter, sort_spec, limit, skip
-            )
+            return self._build_aggregate(collection, aggregates, fields, where_filter, sort_spec, limit, skip)
 
         if distinct and fields:
             return self._build_distinct(collection, fields[0], where_filter)
 
-        return self._build_find(
-            collection, fields, has_star, where_filter, sort_spec, limit, skip
-        )
+        return self._build_find(collection, fields, has_star, where_filter, sort_spec, limit, skip)
 
     def _build_find(
         self, collection, fields, has_star, where_filter, sort_spec, limit, skip
