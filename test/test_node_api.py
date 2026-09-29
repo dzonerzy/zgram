@@ -191,3 +191,86 @@ class TestParseError:
             pytest.fail("should have raised")
         except Exception as e:
             assert str(e)  # has a message
+
+
+class TestTreeLifetime:
+    """Each parse owns its nodes and input; later parses must not affect earlier trees."""
+
+    def test_old_tree_survives_reparse(self, json_parser):
+        first = json_parser.parse("[true, false]")
+        json_parser.parse('{"k": [1, 2, 3]}')
+        assert first.text() == "[true, false]"
+        assert [c.text() for c in first.find("value")][1:] == ["true", "false"]
+
+    def test_old_tree_survives_buffer_growth(self, json_parser):
+        first = json_parser.parse("[1, 2]")
+        json_parser.parse("[" + ",".join(["123"] * 20000) + "]")
+        assert first.text() == "[1, 2]"
+        assert [n.text() for n in first.find("number")] == ["1", "2"]
+
+    def test_tree_keeps_input_alive(self, json_parser):
+        import gc
+
+        root = json_parser.parse("".join(["[", '"x"', "]"]))
+        gc.collect()
+        assert root.text() == '["x"]'
+
+    def test_nodes_outlive_parser(self):
+        root = zgram.compile("list = '[' item (',' item)* ']'\nitem = [a-z]+\n").parse("[ab,cd]")
+        import gc
+
+        gc.collect()
+        assert [c.rule() for c in root] == ["item", "item"]
+
+    def test_bytes_input(self, json_parser):
+        assert json_parser.parse(b"[1]").text() == "[1]"
+
+    def test_non_string_input_raises_type_error(self, json_parser):
+        with pytest.raises(TypeError):
+            json_parser.parse(123)
+
+
+class TestIterationSemantics:
+    def test_nested_iteration_over_same_node(self, list_parser):
+        root = list_parser.parse("[a,b,c]")
+        pairs = [(x.text(), y.text()) for x in root for y in root]
+        assert len(pairs) == 9
+
+    def test_iterators_are_independent(self, list_parser):
+        root = list_parser.parse("[a,b,c]")
+        it1, it2 = iter(root), iter(root)
+        assert next(it1).text() == "a"
+        assert next(it1).text() == "b"
+        assert next(it2).text() == "a"
+
+    def test_index_access_matches_iteration(self, json_parser):
+        root = json_parser.parse("[" + ",".join(str(i) for i in range(500)) + "]")[0]
+        by_iter = [c.text() for c in root]
+        by_index = [root[i].text() for i in range(len(root))]
+        by_index_rev = [root[i].text() for i in reversed(range(len(root)))][::-1]
+        assert by_iter == by_index == by_index_rev == root_children_text(root)
+
+    def test_rule_name_is_interned(self, list_parser):
+        root = list_parser.parse("[a,b]")
+        assert root[0].rule() is root[1].rule()
+
+    def test_find_includes_self_and_rejects_non_str(self, list_parser):
+        root = list_parser.parse("[a,b]")
+        assert root.find("list") == [root]
+        with pytest.raises(TypeError):
+            root.find(1)
+
+
+def root_children_text(node):
+    return [c.text() for c in node.children()]
+
+
+def test_version_matches_pyproject():
+    import pathlib
+    import re
+
+    pyproject = pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if not pyproject.exists():
+        pytest.skip("pyproject.toml not available")
+    declared = re.search(r'^version = "([^"]+)"', pyproject.read_text(), re.M).group(1)
+    assert zgram.version() == declared

@@ -2,7 +2,7 @@
 //!
 //! Grammar syntax:
 //!     rule_name = expression
-//!     expression = sequence ('|' sequence)*      # ordered choice
+//!     expression = sequence (('|' | '/') sequence)*   # ordered choice
 //!     sequence   = prefix+
 //!     prefix     = ('!' | '&')? suffix           # predicates
 //!     suffix     = primary ('*' | '+' | '?')?    # repetition
@@ -64,6 +64,8 @@ pub const Rule = struct {
     action: ?[]const u8 = null,
     /// Explicit @silent annotation — forces rule to be silent (no parse tree node).
     silent: bool = false,
+    /// @memo annotation — cache the rule's result per input position (packrat).
+    memo: bool = false,
 };
 
 pub const Grammar = struct {
@@ -136,6 +138,7 @@ const ParseErr = error{
     EmptyLiteral,
     TooManyRules,
     LeftRecursion,
+    UnknownAnnotation,
 };
 
 const MAX_NESTING_DEPTH = 128;
@@ -240,28 +243,20 @@ const GrammarParserImpl = struct {
             return self.parseRule();
         }
 
-        // Check for @silent annotation
+        // Annotations: @silent, @memo (any order, each at most once)
         var is_silent = false;
-        if (self.peek() == '@') {
-            const saved_pos = self.pos;
-            const saved_line = self.line;
-            const saved_col = self.col;
+        var is_memo = false;
+        while (self.peek() == '@') {
             self.advance(); // skip '@'
-            if (self.parseIdentifier()) |annotation| {
-                if (std.mem.eql(u8, annotation, "silent")) {
-                    is_silent = true;
-                    self.skipWs();
-                } else {
-                    // Unknown annotation — restore position
-                    self.pos = saved_pos;
-                    self.line = saved_line;
-                    self.col = saved_col;
-                }
+            const annotation = self.parseIdentifier() orelse return error.UnknownAnnotation;
+            if (std.mem.eql(u8, annotation, "silent")) {
+                is_silent = true;
+            } else if (std.mem.eql(u8, annotation, "memo")) {
+                is_memo = true;
             } else {
-                self.pos = saved_pos;
-                self.line = saved_line;
-                self.col = saved_col;
+                return error.UnknownAnnotation;
             }
+            self.skipWs();
         }
 
         // Parse rule name
@@ -296,6 +291,7 @@ const GrammarParserImpl = struct {
             .expr = expr,
             .action = action,
             .silent = is_silent,
+            .memo = is_memo,
         };
         return rule;
     }
@@ -310,7 +306,7 @@ const GrammarParserImpl = struct {
 
         while (true) {
             self.skipWs();
-            if (self.match('|')) {
+            if (self.match('|') or self.match('/')) {
                 self.skipWs();
                 const opt = try self.parseSequence();
                 try options.append(self.allocator, opt);
@@ -360,7 +356,7 @@ const GrammarParserImpl = struct {
     fn atSequenceEnd(self: *GrammarParserImpl) bool {
         if (self.pos >= self.text.len) return true;
         const c = self.peek();
-        if (c == '|' or c == ')') return true;
+        if (c == '|' or c == '/' or c == ')') return true;
         if (self.peekStr("->")) return true;
 
         // Check if we hit a new rule (identifier followed by =)

@@ -159,7 +159,8 @@ class TestBenchmarkJsonParsers:
     """Full comparative benchmark: zgram vs all other parsers on JSON."""
 
     @pytest.fixture(scope="class", autouse=True)
-    def parsers(self):
+    @classmethod
+    def parsers(cls):
         """Compile all parsers once."""
         p: dict[str, Any] = {
             "zgram": zgram.compile(JSON_GRAMMAR),
@@ -184,7 +185,7 @@ class TestBenchmarkJsonParsers:
         if name == "lark":
             return parsers["lark"].parse(data)
         if name == "pyparsing":
-            return parsers["pyparsing"].parseString(data, parseAll=True)
+            return parsers["pyparsing"].parse_string(data, parse_all=True)
         if name == "json.loads":
             return json.loads(data)
 
@@ -220,7 +221,7 @@ class TestBenchmarkJsonParsers:
                 (
                     "pyparsing",
                     "pyparsing",
-                    lambda d: parsers["pyparsing"].parseString(d, parseAll=True),
+                    lambda d: parsers["pyparsing"].parse_string(d, parse_all=True),
                 )
             )
         parser_configs.append(

@@ -1,16 +1,18 @@
-//! Shared C ABI contract between zgram and compiled grammar .so files.
+//! Shared C ABI contract between zgram and JIT-compiled grammars.
 //!
-//! The grammar .so exports: zgram_parse(input_ptr, input_len, out) -> i32
+//! The compiled grammar exports:
+//!   zgram_parse(input_ptr, input_len, out, start_rule, flags) -> i32
 //! It writes a dynamically growing array of FlatNode structs into the output.
 //! The zgram module reads these and converts them into Node class instances.
+//!
+//! ParseOutput is small and holds no per-grammar data, so each parse() call
+//! can use its own (on the stack), which makes parsing reentrant.
 
 const std = @import("std");
 
-/// Initial node capacity (grows as needed)
-pub const INITIAL_NODE_CAPACITY = 8192;
 /// Maximum number of rules in a grammar
 pub const MAX_RULES = 256;
-/// Maximum rule name length (for the rule name table)
+/// Maximum rule name length
 pub const MAX_RULE_NAME = 64;
 
 /// A flat node in the parse result (C ABI compatible, 16 bytes)
@@ -37,38 +39,59 @@ pub const FlatNode = extern struct {
     }
 };
 
-/// Rule name entry in the rule name table
-pub const RuleNameEntry = extern struct {
-    name: [MAX_RULE_NAME]u8 = [_]u8{0} ** MAX_RULE_NAME,
-    name_len: u8 = 0,
+/// Why a parse failed (ParseOutput.error_kind)
+pub const ErrorKind = enum(u8) {
+    none = 0,
+    /// No match: error_offset is the high-water mark, error_rule_id the rule tried there
+    expected_rule = 1,
+    /// The start rule matched but didn't consume the whole input
+    trailing_input = 2,
+    /// Node buffer allocation failed
+    out_of_memory = 3,
 };
 
-/// Parse output from grammar .so (C ABI compatible)
+/// Parse flags (zgram_parse `flags` argument)
+pub const FLAG_PREFIX: u32 = 1; // succeed without consuming the whole input
+
+/// Parse output (C ABI compatible). The JIT code reads and writes the node
+/// fields and the high-water mark directly, at the offsets exported below.
 pub const ParseOutput = extern struct {
     /// 1 = success, 0 = error
     status: u8 = 0,
+    /// Set by the helpers on failure (ErrorKind)
+    error_kind: u8 = 0,
 
-    /// Pointer to dynamically allocated node array
+    /// Pointer to dynamically allocated node array (c_allocator)
     nodes_ptr: ?[*]FlatNode = null,
     node_count: u32 = 0,
     node_capacity: u32 = 0,
-
-    /// Rule name table (filled by grammar .so at parse time)
-    rule_names: [MAX_RULES]RuleNameEntry = [_]RuleNameEntry{.{}} ** MAX_RULES,
-    rule_count: u16 = 0,
-
-    /// On error: error information
-    error_offset: u32 = 0,
-    error_line: u32 = 0,
-    error_col: u32 = 0,
-    error_message: [256]u8 = [_]u8{0} ** 256,
-    error_message_len: u32 = 0,
 
     /// High-water mark: furthest position reached during parsing
     max_pos: u32 = 0,
     /// Rule ID that was being attempted at the high-water mark position
     max_pos_rule_id: u16 = 0,
+
+    /// On error: location (line/col are 1-based, col counts bytes)
+    error_offset: u32 = 0,
+    error_line: u32 = 0,
+    error_col: u32 = 0,
+    error_rule_id: u16 = 0,
+
+    /// On success: end position of the match (== input length unless FLAG_PREFIX)
+    end_pos: u64 = 0,
+
+    /// Packrat memo table for @memo rules (jit_helpers.MemoState), created on
+    /// first use. The caller frees it with jit_helpers.memoFree() after parsing.
+    memo: ?*anyopaque = null,
 };
+
+/// Field offsets used by the code generator
+pub const OFF_NODES_PTR = @offsetOf(ParseOutput, "nodes_ptr");
+pub const OFF_NODE_COUNT = @offsetOf(ParseOutput, "node_count");
+pub const OFF_NODE_CAPACITY = @offsetOf(ParseOutput, "node_capacity");
+pub const OFF_MAX_POS = @offsetOf(ParseOutput, "max_pos");
+pub const OFF_MAX_POS_RULE_ID = @offsetOf(ParseOutput, "max_pos_rule_id");
+pub const OFF_END_POS = @offsetOf(ParseOutput, "end_pos");
 
 // Compile-time ABI assertions
 comptime {
@@ -76,9 +99,26 @@ comptime {
     if (@alignOf(FlatNode) != 4) @compileError("FlatNode must be 4-byte aligned");
 }
 
-/// Function signature that grammar .so files export
+/// Function signature exported by compiled grammars
 pub const ParseFn = *const fn (
     input_ptr: [*]const u8,
     input_len: usize,
     output: *ParseOutput,
+    start_rule: u32,
+    flags: u32,
 ) callconv(.c) i32;
+
+/// Line and column (1-based, column in bytes) of `pos` in `input`.
+pub fn lineCol(input: []const u8, pos: usize) struct { line: u32, col: u32 } {
+    var line: u32 = 1;
+    var col: u32 = 1;
+    for (input[0..@min(pos, input.len)]) |ch| {
+        if (ch == '\n') {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    return .{ .line = line, .col = col };
+}

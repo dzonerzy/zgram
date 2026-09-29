@@ -13,7 +13,8 @@ comptime {
     _ = jit_helpers.zgram_ensure_capacity;
     _ = jit_helpers.zgram_reserve_node;
     _ = jit_helpers.zgram_fill_node;
-    _ = jit_helpers.zgram_set_error;
+    _ = jit_helpers.zgram_set_error_trailing;
     _ = jit_helpers.zgram_set_error_at_hwm;
-    _ = jit_helpers.zgram_set_rule_name;
+    _ = jit_helpers.zgram_memo_lookup;
+    _ = jit_helpers.zgram_memo_store;
 }

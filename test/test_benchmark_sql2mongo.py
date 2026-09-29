@@ -69,7 +69,8 @@ class TestSql2MongoCorrectness:
     """Verify all queries convert without error."""
 
     @pytest.fixture(scope="class")
-    def converter(self):
+    @classmethod
+    def converter(cls):
         return SQLToMongo()
 
     @pytest.mark.parametrize("label,sql", QUERIES)
@@ -83,7 +84,8 @@ class TestBenchmarkSql2Mongo:
     """Benchmark parse + convert latency for real-time viability assessment."""
 
     @pytest.fixture(scope="class")
-    def converter(self):
+    @classmethod
+    def converter(cls):
         return SQLToMongo()
 
     def test_benchmark_all(self, converter):

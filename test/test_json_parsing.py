@@ -78,12 +78,12 @@ class TestJsonComplex:
 
 
 class TestJsonErrorReporting:
-    def test_get_error_on_invalid_input(self, json_parser):
+    def test_error_property_on_invalid_input(self, json_parser):
         try:
             json_parser.parse("{invalid}")
         except Exception:
             pass
-        err = json_parser.get_error()
+        err = json_parser.error
         assert err is not None
         assert err.message()
         assert err.offset() >= 0

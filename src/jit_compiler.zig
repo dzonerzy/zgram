@@ -14,10 +14,11 @@ const c = LB.llvm;
 // Extern declarations for JIT helper functions (defined in jit_helpers.zig via export)
 extern fn zgram_reserve_node(output: *abi.ParseOutput) callconv(.c) i32;
 extern fn zgram_fill_node(output: *abi.ParseOutput, idx: u32, rule_id: u16, text_start: u32, text_end: u32, subtree_size: u32, child_count: u16) callconv(.c) void;
-extern fn zgram_set_error(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: usize, pos: usize, msg_ptr: [*]const u8, msg_len: usize) callconv(.c) void;
+extern fn zgram_set_error_trailing(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: usize, pos: usize) callconv(.c) void;
 extern fn zgram_set_error_at_hwm(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: usize) callconv(.c) void;
-extern fn zgram_set_rule_name(output: *abi.ParseOutput, rule_id: u16, name_ptr: [*]const u8, name_len: u8) callconv(.c) void;
 extern fn zgram_ensure_capacity(output: *abi.ParseOutput, needed: u32) callconv(.c) i32;
+extern fn zgram_memo_lookup(output: *abi.ParseOutput, rule_id: u32, pos: u64) callconv(.c) i64;
+extern fn zgram_memo_store(output: *abi.ParseOutput, rule_id: u32, pos: u64, result: i64, node_start: u32) callconv(.c) void;
 
 // X86 target init (macro-generated in Target.h, must declare manually)
 extern fn LLVMInitializeX86TargetInfo() void;
@@ -36,8 +37,24 @@ pub const JitError = error{
 /// Global LLJIT instance — created once, reused across all grammar compilations.
 var global_jit: ?c.LLVMOrcLLJITRef = null;
 var jit_initialized: bool = false;
-/// Counter for creating unique JITDylib names per grammar compilation.
+/// Counter for creating unique entry point names per grammar compilation.
 var dylib_counter: u64 = 0;
+
+/// Serializes JIT setup, compilation and release, so grammars can be
+/// compiled from several threads (with the GIL released, or from async
+/// tasks). A spinning lock that yields is enough: compiles take milliseconds
+/// and rarely overlap.
+var jit_lock: std.atomic.Value(bool) = .init(false);
+
+fn lockJit() void {
+    while (jit_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn unlockJit() void {
+    jit_lock.store(false, .release);
+}
 
 /// Initialize the LLVM JIT subsystem. Called once on first compile.
 fn initJit() JitError!void {
@@ -68,13 +85,14 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
     const es = c.LLVMOrcLLJITGetExecutionSession(jit);
     const exported_flags = c.LLVMJITSymbolFlags{ .GenericFlags = c.LLVMJITSymbolGenericFlagsExported | c.LLVMJITSymbolGenericFlagsCallable, .TargetFlags = 0 };
 
-    var syms: [6]c.LLVMOrcCSymbolMapPair = .{
+    var syms: [7]c.LLVMOrcCSymbolMapPair = .{
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_reserve_node"), .Sym = .{ .Address = @intFromPtr(&zgram_reserve_node), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_fill_node"), .Sym = .{ .Address = @intFromPtr(&zgram_fill_node), .Flags = exported_flags } },
-        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_error"), .Sym = .{ .Address = @intFromPtr(&zgram_set_error), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_error_trailing"), .Sym = .{ .Address = @intFromPtr(&zgram_set_error_trailing), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_error_at_hwm"), .Sym = .{ .Address = @intFromPtr(&zgram_set_error_at_hwm), .Flags = exported_flags } },
-        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_rule_name"), .Sym = .{ .Address = @intFromPtr(&zgram_set_rule_name), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_ensure_capacity"), .Sym = .{ .Address = @intFromPtr(&zgram_ensure_capacity), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_memo_lookup"), .Sym = .{ .Address = @intFromPtr(&zgram_memo_lookup), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_memo_store"), .Sym = .{ .Address = @intFromPtr(&zgram_memo_store), .Flags = exported_flags } },
     };
 
     const mu = c.LLVMOrcAbsoluteSymbols(&syms, syms.len);
@@ -114,6 +132,11 @@ fn optimizeModule(module: c.LLVMModuleRef) JitError!void {
     );
     defer c.LLVMDisposeTargetMachine(tm);
 
+    // Give the optimizer the real data layout (sizes, alignments, native widths)
+    const layout = c.LLVMCreateTargetDataLayout(tm);
+    defer c.LLVMDisposeTargetData(layout);
+    c.LLVMSetModuleDataLayout(module, layout);
+
     // Configure pass builder options — enable everything
     const opts = c.LLVMCreatePassBuilderOptions();
     defer c.LLVMDisposePassBuilderOptions(opts);
@@ -144,12 +167,20 @@ pub const JitResult = struct {
 /// Returns a JitResult with the function pointer and a ResourceHandle that must
 /// be passed to `releaseGrammar()` when the grammar is no longer needed.
 pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!JitResult {
-    // Ensure JIT is initialized
-    try initJit();
-    const jit = global_jit orelse return JitError.JitNotInitialized;
+    // Ensure JIT (and the target registry the optimizer needs) is initialized
+    const jit = blk: {
+        lockJit();
+        defer unlockJit();
+        try initJit();
+        break :blk global_jit orelse return JitError.JitNotInitialized;
+    };
 
-    // Run full O3 optimization pipeline before JIT compilation
+    // Run the O3 pipeline. The module and context belong to this call, so
+    // concurrent compiles optimize in parallel.
     try optimizeModule(module);
+
+    lockJit();
+    defer unlockJit();
 
     // Give the entry point a unique name so multiple compiled parsers
     // can coexist without symbol conflicts.
@@ -207,6 +238,8 @@ pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!JitRe
 /// Release all JIT-compiled code and resources associated with a grammar.
 /// After this call, the parse function pointer is invalid and must not be used.
 pub fn releaseGrammar(resource: ResourceHandle) void {
+    lockJit();
+    defer unlockJit();
     if (resource) |rt| {
         // Remove all JIT code tracked by this ResourceTracker
         const err = c.LLVMOrcResourceTrackerRemove(rt);

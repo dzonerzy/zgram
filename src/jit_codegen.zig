@@ -6,7 +6,8 @@
 //! Architecture:
 //!   - Each grammar rule becomes a function: rule_N(ptr input, i64 len, ptr output, i64 pos) → i64
 //!     Returns new position on match, -1 on failure.
-//!   - zgram_parse(ptr input, i64 len, ptr output) → i32 is the C ABI entry point.
+//!   - zgram_parse(ptr input, i64 len, ptr output, i32 start_rule, i32 flags) → i32
+//!     is the C ABI entry point.
 //!   - Expression types emit basic block patterns within their rule function.
 //!   - Memory management (node alloc, error reporting) calls into exported Zig helpers.
 
@@ -14,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gp = @import("grammar_parser.zig");
 const LB = @import("llvm_builder.zig");
+const abi = @import("parse_abi.zig");
 
 pub const CodegenError = error{
     OutOfMemory,
@@ -42,17 +44,15 @@ const Codegen = struct {
     // Helper function declarations
     helper_reserve_node: LB.Value,
     helper_fill_node: LB.Value,
-    helper_set_error: LB.Value,
+    helper_set_error_trailing: LB.Value,
     helper_set_error_at_hwm: LB.Value,
-    helper_set_rule_name: LB.Value,
     helper_ensure_capacity: LB.Value,
 
     // Helper function types
     helper_reserve_node_type: LB.Type,
     helper_fill_node_type: LB.Type,
-    helper_set_error_type: LB.Type,
+    helper_set_error_trailing_type: LB.Type,
     helper_set_error_at_hwm_type: LB.Type,
-    helper_set_rule_name_type: LB.Type,
     helper_ensure_capacity_type: LB.Type,
 
     // Grammar info
@@ -61,6 +61,13 @@ const Codegen = struct {
 
     // Per-rule child count tracking (alloca i32, counts direct children)
     child_count_ptr: LB.Value,
+
+    // Bytes per SIMD step: 32 with AVX2 on this CPU, else 16
+    simd_width: u32,
+
+    // Per rule: can calling it add nodes? True for non-silent rules and for
+    // silent rules whose body references node-producing rules.
+    alloc_flags: []const bool,
 };
 
 /// Generate an LLVM module from a parsed grammar.
@@ -80,35 +87,72 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
     const helper_fill_node_type = b.fnType(b.void, &.{ b.ptr, b.i32, b.i16, b.i32, b.i32, b.i32, b.i16 });
     const helper_fill_node = b.addFunction("zgram_fill_node", helper_fill_node_type);
 
-    // void zgram_set_error(ptr output, ptr input, i64 input_len, i64 pos, ptr msg, i64 msg_len)
-    const helper_set_error_type = b.fnType(b.void, &.{ b.ptr, b.ptr, b.i64, b.i64, b.ptr, b.i64 });
-    const helper_set_error = b.addFunction("zgram_set_error", helper_set_error_type);
+    // void zgram_set_error_trailing(ptr output, ptr input, i64 input_len, i64 pos)
+    const helper_set_error_trailing_type = b.fnType(b.void, &.{ b.ptr, b.ptr, b.i64, b.i64 });
+    const helper_set_error_trailing = b.addFunction("zgram_set_error_trailing", helper_set_error_trailing_type);
 
     // void zgram_set_error_at_hwm(ptr output, ptr input, i64 input_len)
     const helper_set_error_at_hwm_type = b.fnType(b.void, &.{ b.ptr, b.ptr, b.i64 });
     const helper_set_error_at_hwm = b.addFunction("zgram_set_error_at_hwm", helper_set_error_at_hwm_type);
 
-    // void zgram_set_rule_name(ptr output, i16 rule_id, ptr name, i8 name_len)
-    const helper_set_rule_name_type = b.fnType(b.void, &.{ b.ptr, b.i16, b.ptr, b.i8 });
-    const helper_set_rule_name = b.addFunction("zgram_set_rule_name", helper_set_rule_name_type);
-
     // i32 zgram_ensure_capacity(ptr output, i32 needed)
     const helper_ensure_capacity_type = b.fnType(b.i32, &.{ b.ptr, b.i32 });
     const helper_ensure_capacity = b.addFunction("zgram_ensure_capacity", helper_ensure_capacity_type);
 
+    // None of the helpers unwind
+    for ([_]LB.Value{ helper_reserve_node, helper_fill_node, helper_set_error_trailing, helper_set_error_at_hwm, helper_ensure_capacity }) |h| {
+        b.addFnAttr(h, "nounwind");
+    }
+
+    // The JIT targets this machine, so size SIMD scans for its CPU
+    const simd_width: u32 = blk: {
+        const feats = LB.llvm.LLVMGetHostCPUFeatures();
+        defer LB.llvm.LLVMDisposeMessage(feats);
+        break :blk if (std.mem.indexOf(u8, std.mem.span(feats), "+avx2") != null) 32 else 16;
+    };
+
     // Compute silent flags
     const silent_flags = try computeSilentFlags(allocator, grammar);
     defer allocator.free(silent_flags);
+    const alloc_flags = try computeAllocFlags(allocator, grammar, silent_flags);
+    defer allocator.free(alloc_flags);
 
-    // Create rule functions
+    // Packrat memo helpers (only called from @memo rule wrappers)
+    // i64 zgram_memo_lookup(ptr output, i32 rule_id, i64 pos) -> MEMO_MISS (-2), -1, or result
+    const helper_memo_lookup_type = b.fnType(b.i64, &.{ b.ptr, b.i32, b.i64 });
+    const helper_memo_lookup = b.addFunction("zgram_memo_lookup", helper_memo_lookup_type);
+    // void zgram_memo_store(ptr output, i32 rule_id, i64 pos, i64 result, i32 node_start)
+    const helper_memo_store_type = b.fnType(b.void, &.{ b.ptr, b.i32, b.i64, b.i64, b.i32 });
+    const helper_memo_store = b.addFunction("zgram_memo_store", helper_memo_store_type);
+    b.addFnAttr(helper_memo_lookup, "nounwind");
+    b.addFnAttr(helper_memo_store, "nounwind");
+
+    // Create rule functions. References call rule_fns[i]; the rule's code
+    // goes in body_fns[i], which is the same function unless the rule is
+    // @memo, where rule_fns[i] is a caching wrapper around the body.
     const rule_fns = allocator.alloc(LB.Value, grammar.rules.len) catch return CodegenError.OutOfMemory;
     defer allocator.free(rule_fns);
+    const body_fns = allocator.alloc(LB.Value, grammar.rules.len) catch return CodegenError.OutOfMemory;
+    defer allocator.free(body_fns);
 
-    for (0..grammar.rules.len) |i| {
+    for (grammar.rules, 0..) |rule, i| {
         const name = std.fmt.allocPrintSentinel(allocator, "rule_{d}", .{i}, 0) catch return CodegenError.OutOfMemory;
         defer allocator.free(name);
         rule_fns[i] = b.addFunction(name, rule_fn_type);
-        b.setLinkageInternal(rule_fns[i]);
+        body_fns[i] = rule_fns[i];
+        if (rule.memo) {
+            const body_name = std.fmt.allocPrintSentinel(allocator, "rule_{d}_body", .{i}, 0) catch return CodegenError.OutOfMemory;
+            defer allocator.free(body_name);
+            body_fns[i] = b.addFunction(body_name, rule_fn_type);
+        }
+        for ([_]LB.Value{ rule_fns[i], body_fns[i] }) |f| {
+            b.setLinkageInternal(f);
+            b.addFnAttr(f, "nounwind");
+            // The input is read-only and never overlaps the output struct
+            b.addParamAttr(f, 0, "noalias");
+            b.addParamAttr(f, 0, "readonly");
+            b.addParamAttr(f, 2, "noalias");
+        }
     }
 
     // Generate each rule function body
@@ -122,33 +166,40 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
             .rule_fn_type = rule_fn_type,
             .helper_reserve_node = helper_reserve_node,
             .helper_fill_node = helper_fill_node,
-            .helper_set_error = helper_set_error,
+            .helper_set_error_trailing = helper_set_error_trailing,
             .helper_set_error_at_hwm = helper_set_error_at_hwm,
-            .helper_set_rule_name = helper_set_rule_name,
             .helper_ensure_capacity = helper_ensure_capacity,
             .helper_reserve_node_type = helper_reserve_node_type,
             .helper_fill_node_type = helper_fill_node_type,
-            .helper_set_error_type = helper_set_error_type,
+            .helper_set_error_trailing_type = helper_set_error_trailing_type,
             .helper_set_error_at_hwm_type = helper_set_error_at_hwm_type,
-            .helper_set_rule_name_type = helper_set_rule_name_type,
             .helper_ensure_capacity_type = helper_ensure_capacity_type,
             .grammar = grammar,
             .silent_flags = silent_flags,
             .child_count_ptr = undefined,
+            .simd_width = simd_width,
+            .alloc_flags = alloc_flags,
         };
-        try emitRuleFunction(&cg, rule, @intCast(i));
+        try emitRuleFunction(&cg, rule, @intCast(i), body_fns[i]);
+    }
+
+    // Wrappers for @memo rules
+    for (grammar.rules, 0..) |rule, i| {
+        if (!rule.memo) continue;
+        emitMemoWrapper(&b, rule_fns[i], body_fns[i], rule_fn_type, @intCast(i), helper_memo_lookup, helper_memo_lookup_type, helper_memo_store, helper_memo_store_type);
     }
 
     // Generate zgram_parse entry point
-    try emitParseEntryPoint(&b, rule_fns[0], rule_fn_type, grammar, helper_set_error, helper_set_error_type, helper_set_error_at_hwm, helper_set_error_at_hwm_type, helper_set_rule_name, helper_set_rule_name_type, silent_flags[0]);
+    try emitParseEntryPoint(&b, rule_fns, rule_fn_type, silent_flags, helper_set_error_trailing, helper_set_error_trailing_type, helper_set_error_at_hwm, helper_set_error_at_hwm_type);
 
+    // The module and context go to the caller; only the IR builder is ours
+    b.deinitBuilderOnly();
     return .{ .module = b.module, .context = b.ctx };
 }
 
 /// Emit the body of a rule function.
-fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenError!void {
+fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16, func: LB.Value) CodegenError!void {
     const b = cg.b;
-    const func = cg.rule_fns[rule_id];
     b.setCurrentFn(func);
 
     const entry = b.appendBlock("entry");
@@ -162,9 +213,9 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenErr
 
     const is_silent = cg.silent_flags[rule_id];
 
-    // HWM field offsets in ParseOutput (computed from extern struct layout)
-    const hwm_max_pos_offset = 16940;
-    const hwm_rule_id_offset = 16944;
+    // HWM field offsets in ParseOutput
+    const hwm_max_pos_offset = abi.OFF_MAX_POS;
+    const hwm_rule_id_offset = abi.OFF_MAX_POS_RULE_ID;
 
     if (is_silent) {
         // Silent rule: no node for itself, but track child count so the caller
@@ -210,8 +261,8 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenErr
 
         // Inline fast path for node reservation:
         // if (node_count < node_capacity) { idx = node_count; node_count++; } else { call ensure_capacity }
-        const node_count_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, 16)}, "nc_ptr");
-        const node_cap_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, 20)}, "cap_ptr");
+        const node_count_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "nc_ptr");
+        const node_cap_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_CAPACITY)}, "cap_ptr");
         const cur_count = b.load(b.i32, node_count_ptr, 4, "cur_nc");
         const cur_cap = b.load(b.i32, node_cap_ptr, 4, "cur_cap");
         const has_room = b.icmp(.ult, cur_count, cur_cap, "has_room");
@@ -252,7 +303,7 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenErr
 
         // Inline fill_node: write directly to nodes_ptr[idx]
         // FlatNode is 16 bytes: { text_start: u32, text_end: u32, subtree_size: u32, child_count_and_rule: u32 }
-        const nodes_ptr_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, 8)}, "nodes_pp");
+        const nodes_ptr_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODES_PTR)}, "nodes_pp");
         const nodes_base = b.load(b.ptr, nodes_ptr_ptr, 8, "nodes_base");
         const node_idx_i64 = b.zext(node_idx, b.i64, "nidx64");
         // GEP by 16 bytes per node (FlatNode size)
@@ -304,6 +355,49 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16) CodegenErr
         b.positionAtEnd(alloc_fail_block);
         _ = b.ret(b.constSInt(b.i64, -1));
     }
+}
+
+/// Emit the caching wrapper for a @memo rule:
+///   r = memo_lookup(out, id, pos); if r != MISS return r   (a hit also replays the nodes)
+///   nc0 = node_count; r = body(...); memo_store(out, id, pos, r, nc0); return r
+/// A replay leaves the high-water mark untouched, which matches re-running
+/// the rule: the first run already recorded every failure position it reached.
+fn emitMemoWrapper(
+    b: *LB.Builder,
+    wrapper: LB.Value,
+    body: LB.Value,
+    rule_fn_type: LB.Type,
+    rule_id: u32,
+    lookup: LB.Value,
+    lookup_type: LB.Type,
+    store: LB.Value,
+    store_type: LB.Type,
+) void {
+    b.setCurrentFn(wrapper);
+    const entry = b.appendBlock("entry");
+    const hit = b.appendBlock("memo_hit");
+    const miss = b.appendBlock("memo_miss");
+    b.positionAtEnd(entry);
+
+    const input_ptr = b.param(wrapper, 0);
+    const input_len = b.param(wrapper, 1);
+    const output_ptr = b.param(wrapper, 2);
+    const pos = b.param(wrapper, 3);
+    const id = b.constInt(b.i32, rule_id);
+
+    const cached = b.call(lookup_type, lookup, &.{ output_ptr, id, pos }, "memo");
+    const is_miss = b.icmp(.eq, cached, b.constSInt(b.i64, -2), "memo_is_miss");
+    _ = b.condBr(is_miss, miss, hit);
+
+    b.positionAtEnd(hit);
+    _ = b.ret(cached);
+
+    b.positionAtEnd(miss);
+    const nc_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "nc_ptr");
+    const nc0 = b.load(b.i32, nc_ptr, 4, "nc0");
+    const result = b.call(rule_fn_type, body, &.{ input_ptr, input_len, output_ptr, pos }, "result");
+    _ = b.call(store_type, store, &.{ output_ptr, id, pos, result, nc0 }, "");
+    _ = b.ret(result);
 }
 
 /// Emit LLVM IR for an expression. Returns the Value representing the new position.
@@ -532,14 +626,9 @@ fn exprAllocatesNodes(cg: *const Codegen, expr: *const gp.Expr) bool {
         .literal, .char_class, .any_char => return false,
         .not_predicate, .and_predicate => return false, // predicates always restore node_count
         .reference => {
-            // Check if the referenced rule is silent
             const ref_name = expr.ref_name orelse return true;
-            for (cg.grammar.rules, 0..) |rule, i| {
-                if (std.mem.eql(u8, rule.name, ref_name)) {
-                    return !cg.silent_flags[i];
-                }
-            }
-            return true; // unknown rule, assume it allocates
+            const idx = ruleIndex(cg, ref_name) orelse return true; // unknown rule, assume it allocates
+            return cg.alloc_flags[idx];
         },
         .sequence => {
             const children = expr.children orelse return false;
@@ -618,9 +707,11 @@ fn emitAlternative(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block
     // node_count pointer for save/restore (only if needed)
     var node_count_ptr: LB.Value = undefined;
     var saved_nc: LB.Value = undefined;
+    var saved_cc: ?LB.Value = null;
     if (needs_save_restore) {
-        node_count_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, 16)}, "alt_nc_ptr");
+        node_count_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "alt_nc_ptr");
         saved_nc = b.load(b.i32, node_count_ptr, 4, "alt_saved_nc");
+        saved_cc = saveChildCount(cg);
     }
 
     for (children, 0..) |child, i| {
@@ -629,7 +720,7 @@ fn emitAlternative(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block
 
         // Restore node_count before trying each alternative (except first)
         if (needs_save_restore and i > 0) {
-            _ = b.store(saved_nc, node_count_ptr, 4);
+            restoreState(cg, node_count_ptr, saved_nc, saved_cc);
         }
 
         const result_pos = try emitExpr(cg, child, pos, child_fail);
@@ -744,7 +835,7 @@ fn canSimdScan(expr: *const gp.Expr) bool {
 }
 
 /// Emit a SIMD-accelerated character class scanning loop.
-/// Processes 16 bytes per iteration using SSE2 vector operations.
+/// Processes 16 bytes (SSE2) or 32 bytes (AVX2) per iteration.
 ///
 /// Generated structure:
 ///   vec_check: can we load 16 bytes? if yes → vec_body, else → scalar_loop
@@ -752,12 +843,14 @@ fn canSimdScan(expr: *const gp.Expr) bool {
 ///   find_end:  bitcast mismatch mask to i16, cttz to find first mismatch offset
 ///   scalar_loop: one byte at a time for tail < 16 bytes
 ///   exit: phi merges results from find_end and scalar_loop
-fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fail_block: LB.Block, rep_kind: u8) CodegenError!LB.Value {
+fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fail_block: LB.Block, rep_kind: u8, hwm_chain: []const u16) CodegenError!LB.Value {
     const b = cg.b;
     const cls = classifySimd(expr);
 
-    const vec16i8 = b.vectorType(b.i8, 16);
-    const vec16i1 = b.vectorType(b.i1, 16);
+    const W = cg.simd_width;
+    const vec16i8 = b.vectorType(b.i8, W);
+    const vec16i1 = b.vectorType(b.i1, W);
+    const mask_int = if (W == 32) b.i32 else b.i16;
 
     // Look up intrinsics we need
     const cttz_id = b.lookupIntrinsic("llvm.cttz");
@@ -779,7 +872,7 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
     b.positionAtEnd(vec_check);
     const pos_phi = b.phi(b.i64, "simd_pos");
     const remaining = b.sub(cg.input_len, pos_phi, "rem");
-    const can_vec = b.icmp(.uge, remaining, b.constInt(b.i64, 16), "can_vec");
+    const can_vec = b.icmp(.uge, remaining, b.constInt(b.i64, W), "can_vec");
     _ = b.condBr(can_vec, vec_body, scalar_loop);
 
     // ── vec_body: load 16 bytes, vector compare ──
@@ -793,8 +886,8 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
             // %ge = icmp uge <16 x i8> %chunk, splat(lo)
             // %le = icmp ule <16 x i8> %chunk, splat(hi)
             // %mask = and %ge, %le
-            const lo_splat = b.splatVector(b.constInt(b.i8, cls.range_lo), 16);
-            const hi_splat = b.splatVector(b.constInt(b.i8, cls.range_hi), 16);
+            const lo_splat = b.splatVector(b.constInt(b.i8, cls.range_lo), W);
+            const hi_splat = b.splatVector(b.constInt(b.i8, cls.range_hi), W);
             const ge = b.icmp(.uge, chunk, lo_splat, "vec_ge");
             const le = b.icmp(.ule, chunk, hi_splat, "vec_le");
             break :blk b.@"and"(ge, le, "vec_mask");
@@ -803,7 +896,7 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
             // OR-chain of equality comparisons
             var mask: LB.Value = undefined;
             for (0..cls.char_count) |i| {
-                const splat = b.splatVector(b.constInt(b.i8, cls.chars[i]), 16);
+                const splat = b.splatVector(b.constInt(b.i8, cls.chars[i]), W);
                 const eq = b.icmp(.eq, chunk, splat, "vec_eq");
                 if (i == 0) {
                     mask = eq;
@@ -817,7 +910,7 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
             // OR-chain of equality for excluded chars, then NOT
             var excluded: LB.Value = undefined;
             for (0..cls.char_count) |i| {
-                const splat = b.splatVector(b.constInt(b.i8, cls.chars[i]), 16);
+                const splat = b.splatVector(b.constInt(b.i8, cls.chars[i]), W);
                 const eq = b.icmp(.eq, chunk, splat, "vec_eq");
                 if (i == 0) {
                     excluded = eq;
@@ -826,7 +919,7 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
                 }
             }
             // Negate: match = NOT excluded
-            const all_true = b.splatVector(b.constInt(b.i1, 1), 16);
+            const all_true = b.splatVector(b.constInt(b.i1, 1), W);
             break :blk b.xor(excluded, all_true, "vec_mask");
         },
         .unsupported => unreachable,
@@ -834,7 +927,7 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
 
     // Check if ALL 16 bytes matched
     const all_match = b.callIntrinsic(reduce_and_id, &.{vec16i1}, &.{match_mask}, "all_match");
-    const next_pos = b.add(pos_phi, b.constInt(b.i64, 16), "next_pos");
+    const next_pos = b.add(pos_phi, b.constInt(b.i64, W), "next_pos");
     const vec_body_end = b.getCurrentBlock();
     _ = b.condBr(all_match, vec_check, find_end);
 
@@ -844,11 +937,11 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
     // ── find_end: find first non-matching byte in the 16-byte chunk ──
     b.positionAtEnd(find_end);
     // Invert the mask: we want the first bit that is 0 (non-matching)
-    const inv_mask = b.xor(match_mask, b.splatVector(b.constInt(b.i1, 1), 16), "inv_mask");
-    // Bitcast <16 x i1> to i16
-    const bitmask = b.bitcast(inv_mask, b.i16, "bitmask");
+    const inv_mask = b.xor(match_mask, b.splatVector(b.constInt(b.i1, 1), W), "inv_mask");
+    // Bitcast <W x i1> to iW
+    const bitmask = b.bitcast(inv_mask, mask_int, "bitmask");
     // Count trailing zeros to find first mismatch position
-    const offset = b.callIntrinsic(cttz_id, &.{b.i16}, &.{ bitmask, b.constInt(b.i1, 0) }, "offset");
+    const offset = b.callIntrinsic(cttz_id, &.{mask_int}, &.{ bitmask, b.constInt(b.i1, 0) }, "offset");
     const offset64 = b.zext(offset, b.i64, "offset64");
     const find_end_pos = b.add(pos_phi, offset64, "find_end_pos");
     _ = b.br(exit);
@@ -917,6 +1010,9 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
     const final_pos = b.phi(b.i64, "simd_final");
     b.addIncoming(final_pos, &.{ find_end_pos, scalar_final }, &.{ find_end, scalar_exit });
 
+    // The (inlined) silent rules around the class failed at final_pos
+    try emitHwmChain(cg, final_pos, hwm_chain);
+
     // For '+' repetition, we need at least one match
     if (rep_kind == '+') {
         const no_match = b.icmp(.eq, final_pos, start_pos, "no_match");
@@ -929,16 +1025,220 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
     return final_pos;
 }
 
+fn ruleIndex(cg: *const Codegen, name: []const u8) ?usize {
+    for (cg.grammar.rules, 0..) |rule, i| {
+        if (std.mem.eql(u8, rule.name, name)) return i;
+    }
+    return null;
+}
+
+/// Follow references to @silent rules down to the expression they match.
+/// `chain` receives the ids of the silent rules passed through, outermost first.
+/// Inlining a silent rule is equivalent except for its high-water-mark update
+/// on failure, which callers re-emit with emitHwmChain.
+fn resolveSilent(cg: *const Codegen, expr: *const gp.Expr, chain: *[8]u16, chain_len: *usize) *const gp.Expr {
+    var e = expr;
+    while (e.tag == .reference and chain_len.* < chain.len) {
+        const idx = ruleIndex(cg, e.ref_name orelse return e) orelse return e;
+        if (!cg.silent_flags[idx]) return e;
+        chain[chain_len.*] = @intCast(idx);
+        chain_len.* += 1;
+        e = cg.grammar.rules[idx].expr;
+    }
+    return e;
+}
+
+/// Record a failure of `rule_id` at `pos` in the high-water mark, exactly as
+/// the rule's own fail block would.
+fn emitHwmUpdate(cg: *Codegen, pos: LB.Value, rule_id: u16) CodegenError!void {
+    const b = cg.b;
+    const hwm_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_MAX_POS)}, "hwm_ptr");
+    const cur = b.load(b.i32, hwm_ptr, 4, "cur_hwm");
+    const pos_i32 = b.trunc(pos, b.i32, "pos_i32");
+    const further = b.icmp(.ugt, pos_i32, cur, "is_further");
+    const update = try b.newBlock("hwm_update");
+    const done = try b.newBlock("hwm_done");
+    _ = b.condBr(further, update, done);
+    b.positionAtEnd(update);
+    _ = b.store(pos_i32, hwm_ptr, 4);
+    const rid_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_MAX_POS_RULE_ID)}, "hwm_rid_ptr");
+    _ = b.store(b.constInt(b.i16, rule_id), rid_ptr, 2);
+    _ = b.br(done);
+    b.positionAtEnd(done);
+}
+
+/// Failure updates for a chain of inlined silent rules: innermost fails first.
+fn emitHwmChain(cg: *Codegen, pos: LB.Value, chain: []const u16) CodegenError!void {
+    var i = chain.len;
+    while (i > 0) {
+        i -= 1;
+        try emitHwmUpdate(cg, pos, chain[i]);
+    }
+}
+
+const ByteSet = std.StaticBitSet(256);
+
+fn charClassSet(expr: *const gp.Expr) ByteSet {
+    var set = ByteSet.initEmpty();
+    if (expr.char_ranges) |ranges| {
+        for (ranges) |r| {
+            var cv: u16 = r.start;
+            while (cv <= r.end) : (cv += 1) set.set(cv);
+        }
+    }
+    if (expr.char_negated) set.toggleAll();
+    return set;
+}
+
+/// Bytes an expression can start with, or null if unknown or if it can match
+/// the empty string (so a non-null result also means "consumes at least 1 byte").
+fn firstSet(cg: *const Codegen, expr: *const gp.Expr, depth: u8) ?ByteSet {
+    if (depth > 16) return null;
+    switch (expr.tag) {
+        .literal => {
+            const lit = expr.literal_value orelse return null;
+            if (lit.len == 0) return null;
+            var set = ByteSet.initEmpty();
+            set.set(lit[0]);
+            return set;
+        },
+        .char_class => return charClassSet(expr),
+        .any_char => return ByteSet.initFull(),
+        .reference => {
+            const idx = ruleIndex(cg, expr.ref_name orelse return null) orelse return null;
+            return firstSet(cg, cg.grammar.rules[idx].expr, depth + 1);
+        },
+        .sequence => {
+            const children = expr.children orelse return null;
+            if (children.len == 0) return null;
+            return firstSet(cg, children[0], depth + 1);
+        },
+        .alternative => {
+            const children = expr.children orelse return null;
+            if (children.len == 0) return null;
+            var set = ByteSet.initEmpty();
+            for (children) |child| set.setUnion(firstSet(cg, child, depth + 1) orelse return null);
+            return set;
+        },
+        .repetition => {
+            if (expr.rep_kind != '+') return null;
+            return firstSet(cg, expr.rep_expr orelse return null, depth + 1);
+        },
+        .not_predicate, .and_predicate => return null,
+    }
+}
+
+/// `(a | cls | b)*` where exactly one branch is a SIMD-able character class
+/// and no other branch can start with a byte in it: at any position inside a
+/// run of cls bytes every other branch fails on the first byte, so the run
+/// can be vector-scanned and the other branches tried only where it stops.
+/// Returns null if the pattern doesn't apply.
+fn emitSimdAltLoop(cg: *Codegen, alt: *const gp.Expr, pos: LB.Value, outer_chain: []const u16) CodegenError!?LB.Value {
+    const branches = alt.children orelse return null;
+
+    var cls_idx: ?usize = null;
+    var cls_expr: *const gp.Expr = undefined;
+    var cls_chain: [8]u16 = undefined;
+    var cls_chain_len: usize = 0;
+    for (branches, 0..) |br, i| {
+        var ch: [8]u16 = undefined;
+        var n: usize = 0;
+        const r = resolveSilent(cg, br, &ch, &n);
+        if (canSimdScan(r)) {
+            if (cls_idx != null) return null;
+            cls_idx = i;
+            cls_expr = r;
+            cls_chain = ch;
+            cls_chain_len = n;
+        }
+    }
+    const ci = cls_idx orelse return null;
+    const cls_set = charClassSet(cls_expr);
+    var needs_nc_save = false;
+    for (branches, 0..) |br, i| {
+        if (i == ci) continue;
+        const fs = firstSet(cg, br, 0) orelse return null;
+        if (fs.intersectWith(cls_set).count() != 0) return null;
+        if (exprAllocatesNodes(cg, br)) needs_nc_save = true;
+    }
+
+    const b = cg.b;
+    const header = try b.newBlock("salt_header");
+    const exit = try b.newBlock("salt_exit");
+
+    const entry_block = b.getCurrentBlock();
+    _ = b.br(header);
+
+    b.positionAtEnd(header);
+    const pos_phi = b.phi(b.i64, "salt_pos");
+
+    // Scan the run of cls bytes ('*': never fails)
+    const run_end = try emitSimdCharScan(cg, cls_expr, pos_phi, exit, '*', &.{});
+
+    var nc_ptr: LB.Value = undefined;
+    var saved_nc: LB.Value = undefined;
+    var saved_cc: ?LB.Value = null;
+    if (needs_nc_save) {
+        nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "salt_nc_ptr");
+        saved_nc = b.load(b.i32, nc_ptr, 4, "salt_saved_nc");
+        saved_cc = saveChildCount(cg);
+    }
+
+    const loop_vals = b.allocator.alloc(LB.Value, branches.len + 1) catch return CodegenError.OutOfMemory;
+    defer b.allocator.free(loop_vals);
+    const loop_blocks = b.allocator.alloc(LB.Block, branches.len + 1) catch return CodegenError.OutOfMemory;
+    defer b.allocator.free(loop_blocks);
+    loop_vals[0] = pos;
+    loop_blocks[0] = entry_block;
+    var n_loop: usize = 1;
+
+    // Try the other branches in their original order at the end of the run
+    for (branches, 0..) |br, i| {
+        if (i == ci) {
+            // The class branch fails here: its inlined rules' failure updates
+            try emitHwmChain(cg, run_end, cls_chain[0..cls_chain_len]);
+            continue;
+        }
+        const next = try b.newBlock("salt_next");
+        if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
+        const end = try emitExpr(cg, br, run_end, next);
+        loop_vals[n_loop] = end;
+        loop_blocks[n_loop] = b.getCurrentBlock();
+        n_loop += 1;
+        _ = b.br(header);
+        b.positionAtEnd(next);
+    }
+
+    // Every branch failed: the repetition ends at run_end
+    if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
+    try emitHwmChain(cg, run_end, outer_chain);
+    _ = b.br(exit);
+
+    b.addIncoming(pos_phi, loop_vals[0..n_loop], loop_blocks[0..n_loop]);
+
+    b.positionAtEnd(exit);
+    return run_end;
+}
+
 /// Emit repetition: *, +, ?
 fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
     const b = cg.b;
     const sub = expr.rep_expr orelse return CodegenError.InvalidGrammar;
     const kind = expr.rep_kind;
 
-    // SIMD fast path: if sub-expression is a char_class with a supported pattern,
-    // emit vectorized 16-bytes-at-a-time scanning instead of byte-by-byte loop.
-    if ((kind == '*' or kind == '+') and canSimdScan(sub)) {
-        return emitSimdCharScan(cg, sub, pos, fail_block, kind);
+    // SIMD fast paths, looking through references to @silent rules:
+    //   cls* / cls+             -> vector scan
+    //   (a | cls | b)*          -> vector scan of cls runs, a/b tried where a run stops
+    if (kind == '*' or kind == '+') {
+        var chain: [8]u16 = undefined;
+        var chain_len: usize = 0;
+        const resolved = resolveSilent(cg, sub, &chain, &chain_len);
+        if (canSimdScan(resolved)) {
+            return emitSimdCharScan(cg, resolved, pos, fail_block, kind, chain[0..chain_len]);
+        }
+        if (kind == '*' and resolved.tag == .alternative) {
+            if (try emitSimdAltLoop(cg, resolved, pos, chain[0..chain_len])) |end| return end;
+        }
     }
 
     const needs_nc_save = exprAllocatesNodes(cg, sub);
@@ -951,9 +1251,11 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
 
         var nc_ptr: LB.Value = undefined;
         var saved_nc: LB.Value = undefined;
+        var saved_cc: ?LB.Value = null;
         if (needs_nc_save) {
-            nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, 16)}, "opt_nc_ptr");
+            nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "opt_nc_ptr");
             saved_nc = b.load(b.i32, nc_ptr, 4, "opt_saved_nc");
+            saved_cc = saveChildCount(cg);
         }
 
         const result_pos = try emitExpr(cg, sub, pos, try_fail);
@@ -962,7 +1264,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
 
         // Fail: restore node_count if needed, use original pos
         b.positionAtEnd(try_fail);
-        if (needs_nc_save) _ = b.store(saved_nc, nc_ptr, 4);
+        if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
         _ = b.br(merge);
 
         // Merge
@@ -981,14 +1283,21 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
 
     var nc_ptr: LB.Value = undefined;
     if (needs_nc_save) {
-        nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, 16)}, "rep_nc_ptr");
+        nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "rep_nc_ptr");
     }
 
     if (kind == '+') {
         // +: try first match, fail entirely if it doesn't match
         const first_result = try emitExpr(cg, sub, pos, fail_block);
         const first_block = b.getCurrentBlock();
-        _ = b.br(loop_header);
+        if (always_consumes) {
+            _ = b.br(loop_header);
+        } else {
+            // A zero-length first match ends the loop, as in `*`; looping
+            // again would match the same empty string (and its nodes) twice.
+            const first_no_progress = b.icmp(.eq, first_result, pos, "first_no_prog");
+            _ = b.condBr(first_no_progress, loop_exit, loop_header);
+        }
 
         // Loop header: phi for current position
         b.positionAtEnd(loop_header);
@@ -1000,7 +1309,11 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         // Loop body
         b.positionAtEnd(loop_body);
         var saved_nc: LB.Value = undefined;
-        if (needs_nc_save) saved_nc = b.load(b.i32, nc_ptr, 4, "rep_saved");
+        var saved_cc: ?LB.Value = null;
+        if (needs_nc_save) {
+            saved_nc = b.load(b.i32, nc_ptr, 4, "rep_saved");
+            saved_cc = saveChildCount(cg);
+        }
         const body_result = try emitExpr(cg, sub, pos_phi, loop_fail);
         const body_end_block = b.getCurrentBlock();
         if (always_consumes) {
@@ -1013,7 +1326,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
 
         // Loop fail: restore node_count if needed, exit loop
         b.positionAtEnd(loop_fail);
-        if (needs_nc_save) _ = b.store(saved_nc, nc_ptr, 4);
+        if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
         _ = b.br(loop_exit);
 
         // Finish phi: incoming from entry (first result) and from body (next result)
@@ -1026,7 +1339,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
             return pos_phi;
         } else {
             const exit_phi = b.phi(b.i64, "rep_exit_pos");
-            b.addIncoming(exit_phi, &.{ pos_phi, pos_phi }, &.{ loop_fail, body_end_block });
+            b.addIncoming(exit_phi, &.{ pos_phi, pos_phi, first_result }, &.{ loop_fail, body_end_block, first_block });
             return exit_phi;
         }
     } else {
@@ -1042,7 +1355,11 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         // Loop body
         b.positionAtEnd(loop_body);
         var saved_nc: LB.Value = undefined;
-        if (needs_nc_save) saved_nc = b.load(b.i32, nc_ptr, 4, "rep_saved");
+        var saved_cc: ?LB.Value = null;
+        if (needs_nc_save) {
+            saved_nc = b.load(b.i32, nc_ptr, 4, "rep_saved");
+            saved_cc = saveChildCount(cg);
+        }
         const body_result = try emitExpr(cg, sub, pos_phi, loop_fail);
         const body_end_block = b.getCurrentBlock();
         if (always_consumes) {
@@ -1054,7 +1371,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
 
         // Loop fail: restore nc if needed, exit
         b.positionAtEnd(loop_fail);
-        if (needs_nc_save) _ = b.store(saved_nc, nc_ptr, 4);
+        if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
         _ = b.br(loop_exit);
 
         // Finish phi
@@ -1080,9 +1397,11 @@ fn emitNotPredicate(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_bloc
 
     var nc_ptr: LB.Value = undefined;
     var saved_nc: LB.Value = undefined;
+    var saved_cc: ?LB.Value = null;
     if (needs_save) {
-        nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, 16)}, "not_nc_ptr");
+        nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "not_nc_ptr");
         saved_nc = b.load(b.i32, nc_ptr, 4, "not_saved");
+        saved_cc = saveChildCount(cg);
     }
 
     const pred_fail = try b.newBlock("not_fail");
@@ -1091,12 +1410,12 @@ fn emitNotPredicate(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_bloc
     _ = try emitExpr(cg, sub, pos, pred_fail);
 
     // Sub-expression matched — NOT predicate fails
-    if (needs_save) _ = b.store(saved_nc, nc_ptr, 4);
+    if (needs_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
     _ = b.br(fail_block);
 
     // Sub-expression failed — NOT predicate succeeds
     b.positionAtEnd(pred_fail);
-    if (needs_save) _ = b.store(saved_nc, nc_ptr, 4);
+    if (needs_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
 
     return pos;
 }
@@ -1109,37 +1428,51 @@ fn emitAndPredicate(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_bloc
 
     var nc_ptr: LB.Value = undefined;
     var saved_nc: LB.Value = undefined;
+    var saved_cc: ?LB.Value = null;
     if (needs_save) {
-        nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, 16)}, "and_nc_ptr");
+        nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "and_nc_ptr");
         saved_nc = b.load(b.i32, nc_ptr, 4, "and_saved");
+        saved_cc = saveChildCount(cg);
     }
 
-    // Try the sub-expression (on fail, branches to fail_block)
-    _ = try emitExpr(cg, sub, pos, fail_block);
+    // Try the sub-expression. If it fails part-way it may have added nodes,
+    // so restore on the failure path too (callers rely on predicates never
+    // leaving nodes behind).
+    const sub_fail = if (needs_save) try b.newBlock("and_fail") else fail_block;
+    _ = try emitExpr(cg, sub, pos, sub_fail);
 
     // Sub-expression matched — restore node_count
-    if (needs_save) _ = b.store(saved_nc, nc_ptr, 4);
+    if (needs_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
+
+    if (needs_save) {
+        const ok = try b.newBlock("and_ok");
+        _ = b.br(ok);
+        b.positionAtEnd(sub_fail);
+        restoreState(cg, nc_ptr, saved_nc, saved_cc);
+        _ = b.br(fail_block);
+        b.positionAtEnd(ok);
+    }
 
     return pos;
 }
 
-/// Emit the zgram_parse entry point function.
+/// Emit the zgram_parse entry point:
+///   i32 @zgram_parse(ptr input, i64 len, ptr output, i32 start_rule, i32 flags)
+/// Any rule can be the start rule. Returns 0 (status/error in output), or -1
+/// for an out-of-range start_rule.
 fn emitParseEntryPoint(
     b: *LB.Builder,
-    rule_0: LB.Value,
+    rule_fns: []const LB.Value,
     rule_fn_type: LB.Type,
-    grammar: *const gp.Grammar,
-    helper_set_error: LB.Value,
-    helper_set_error_type: LB.Type,
+    silent_flags: []const bool,
+    helper_set_error_trailing: LB.Value,
+    helper_set_error_trailing_type: LB.Type,
     helper_set_error_at_hwm: LB.Value,
     helper_set_error_at_hwm_type: LB.Type,
-    helper_set_rule_name: LB.Value,
-    helper_set_rule_name_type: LB.Type,
-    root_is_silent: bool,
 ) CodegenError!void {
-    // i32 @zgram_parse(ptr input, i64 len, ptr output)
-    const parse_fn_type = b.fnType(b.i32, &.{ b.ptr, b.i64, b.ptr });
+    const parse_fn_type = b.fnType(b.i32, &.{ b.ptr, b.i64, b.ptr, b.i32, b.i32 });
     const func = b.addFunction("zgram_parse", parse_fn_type);
+    b.addFnAttr(func, "nounwind");
     b.setCurrentFn(func);
 
     const entry = b.appendBlock("entry");
@@ -1148,84 +1481,139 @@ fn emitParseEntryPoint(
     const input_ptr = b.param(func, 0);
     const input_len = b.param(func, 1);
     const output_ptr = b.param(func, 2);
+    const start_rule = b.param(func, 3);
+    const flags = b.param(func, 4);
 
-    // Reset output fields
-    // status = 0
+    // Reset output: status, error_kind, node_count, max_pos
     _ = b.store(b.constInt(b.i8, 0), output_ptr, 1);
-    // node_count = 0 (offset 16)
-    const nc_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, 16)}, "nc_ptr");
+    const ek_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, @offsetOf(abi.ParseOutput, "error_kind"))}, "ek_ptr");
+    _ = b.store(b.constInt(b.i8, 0), ek_ptr, 1);
+    const nc_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "nc_ptr");
     _ = b.store(b.constInt(b.i32, 0), nc_ptr, 4);
-    // max_pos = 0 (offset 16940)
-    const hwm_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, 16940)}, "hwm_reset_ptr");
+    const hwm_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, abi.OFF_MAX_POS)}, "hwm_reset_ptr");
     _ = b.store(b.constInt(b.i32, 0), hwm_ptr, 4);
 
-    // Set up rule names (only on first call, using a global flag)
-    const names_registered = b.addGlobal("names_registered", b.i8);
-    LB.llvm.LLVMSetInitializer(names_registered, b.constInt(b.i8, 0));
-    LB.llvm.LLVMSetLinkage(names_registered, LB.llvm.LLVMInternalLinkage);
+    // Dispatch to the start rule
+    const bad_rule = try b.newBlock("bad_rule");
+    const dispatched = try b.newBlock("dispatched");
+    const sw = b.@"switch"(start_rule, bad_rule, @intCast(rule_fns.len));
 
-    const flag_val = b.load(b.i8, names_registered, 1, "names_flag");
-    const already_set = b.icmp(.ne, flag_val, b.constInt(b.i8, 0), "names_set");
-    const register_names_block = try b.newBlock("register_names");
-    const after_names_block = try b.newBlock("after_names");
-    _ = b.condBr(already_set, after_names_block, register_names_block);
+    const raw_vals = b.allocator.alloc(LB.Value, rule_fns.len) catch return CodegenError.OutOfMemory;
+    defer b.allocator.free(raw_vals);
+    const pos_vals = b.allocator.alloc(LB.Value, rule_fns.len) catch return CodegenError.OutOfMemory;
+    defer b.allocator.free(pos_vals);
+    const case_blocks = b.allocator.alloc(LB.Block, rule_fns.len) catch return CodegenError.OutOfMemory;
+    defer b.allocator.free(case_blocks);
 
-    b.positionAtEnd(register_names_block);
-    for (grammar.rules, 0..) |rule, i| {
-        const name_global_name = std.fmt.allocPrintSentinel(b.allocator, "rule_name_{d}", .{i}, 0) catch return CodegenError.OutOfMemory;
-        defer b.allocator.free(name_global_name);
-        const rule_name_global = b.addGlobalString(name_global_name, rule.name);
-        const rule_id_val = b.constInt(b.i16, @as(u16, @intCast(i)));
-        const name_len_val = b.constInt(b.i8, @as(u8, @intCast(rule.name.len)));
-
-        _ = b.call(helper_set_rule_name_type, helper_set_rule_name, &.{ output_ptr, rule_id_val, rule_name_global, name_len_val }, "");
-    }
-    _ = b.store(b.constInt(b.i8, 1), names_registered, 1);
-    _ = b.br(after_names_block);
-
-    b.positionAtEnd(after_names_block);
-
-    // Call rule_0(input, len, output, 0)
     const zero_pos = b.constInt(b.i64, 0);
-    const result = b.call(rule_fn_type, rule_0, &.{ input_ptr, input_len, output_ptr, zero_pos }, "result");
+    for (rule_fns, 0..) |rule_fn, i| {
+        const case_block = try b.newBlock("start_rule");
+        b.addCase(sw, b.constInt(b.i32, i), case_block);
+        b.positionAtEnd(case_block);
+        const result = b.call(rule_fn_type, rule_fn, &.{ input_ptr, input_len, output_ptr, zero_pos }, "result");
+        // Only the default start rule may be inlined here: inlining every
+        // rule into the dispatch multiplies code size and compile time.
+        if (i != 0) b.addCallAttr(result, "noinline");
+        // A silent rule packs its child count in the upper 32 bits
+        raw_vals[i] = result;
+        pos_vals[i] = if (silent_flags[i]) b.@"and"(result, b.constInt(b.i64, 0xFFFFFFFF), "root_pos") else result;
+        case_blocks[i] = b.getCurrentBlock();
+        _ = b.br(dispatched);
+    }
 
-    // If root rule is silent, it packs child count in upper 32 bits.
-    // Extract the position from lower 32 bits; -1 check uses slt since
-    // packed values are always non-negative.
-    const result_pos = if (root_is_silent)
-        b.@"and"(result, b.constInt(b.i64, 0xFFFFFFFF), "root_pos")
-    else
-        result;
+    b.positionAtEnd(bad_rule);
+    _ = b.ret(b.constSInt(b.i32, -1));
 
-    // Check result
+    b.positionAtEnd(dispatched);
+    const result = b.phi(b.i64, "raw_result");
+    b.addIncoming(result, raw_vals, case_blocks);
+    const result_pos = b.phi(b.i64, "result_pos");
+    b.addIncoming(result_pos, pos_vals, case_blocks);
+
+    // Failed: -1 (packed silent results are always non-negative)
     const failed = b.icmp(.slt, result, b.constSInt(b.i64, 0), "failed");
-    const check_full = try b.newBlock("check_full");
+    const check_end = try b.newBlock("check_end");
     const parse_failed = try b.newBlock("parse_failed");
-    _ = b.condBr(failed, parse_failed, check_full);
+    _ = b.condBr(failed, parse_failed, check_end);
 
-    // Check full consumption
-    b.positionAtEnd(check_full);
+    // Success needs the whole input consumed, unless FLAG_PREFIX
+    b.positionAtEnd(check_end);
     const fully_consumed = b.icmp(.eq, result_pos, input_len, "full");
+    const prefix_bit = b.@"and"(flags, b.constInt(b.i32, abi.FLAG_PREFIX), "prefix_bit");
+    const is_prefix = b.icmp(.ne, prefix_bit, b.constInt(b.i32, 0), "is_prefix");
+    const accept = b.@"or"(fully_consumed, is_prefix, "accept");
     const success_block = try b.newBlock("success");
     const partial_block = try b.newBlock("partial");
-    _ = b.condBr(fully_consumed, success_block, partial_block);
+    _ = b.condBr(accept, success_block, partial_block);
 
-    // Success: set status = 1, return 0
     b.positionAtEnd(success_block);
+    const end_ptr = b.gep(b.i8, output_ptr, &.{b.constInt(b.i64, abi.OFF_END_POS)}, "end_ptr");
+    _ = b.store(result_pos, end_ptr, 8);
     _ = b.store(b.constInt(b.i8, 1), output_ptr, 1);
     _ = b.ret(b.constInt(b.i32, 0));
 
-    // Partial match: set error
     b.positionAtEnd(partial_block);
-    const partial_msg = "unexpected input after match";
-    const partial_msg_global = b.addGlobalString("partial_err_msg", partial_msg);
-    _ = b.call(helper_set_error_type, helper_set_error, &.{ output_ptr, input_ptr, input_len, result_pos, partial_msg_global, b.constInt(b.i64, partial_msg.len) }, "");
+    _ = b.call(helper_set_error_trailing_type, helper_set_error_trailing, &.{ output_ptr, input_ptr, input_len, result_pos }, "");
     _ = b.ret(b.constInt(b.i32, 0));
 
-    // Parse failed: use high-water mark for error position and rule name
+    // Parse failed: report the high-water mark
     b.positionAtEnd(parse_failed);
     _ = b.call(helper_set_error_at_hwm_type, helper_set_error_at_hwm, &.{ output_ptr, input_ptr, input_len }, "");
     _ = b.ret(b.constInt(b.i32, 0));
+}
+
+/// Save the current rule's direct child count (null when not tracked), to
+/// restore together with node_count when backtracking.
+fn saveChildCount(cg: *Codegen) ?LB.Value {
+    if (cg.child_count_ptr == null) return null;
+    return cg.b.load(cg.b.i32, cg.child_count_ptr, 4, "saved_cc");
+}
+
+/// Roll back node_count and the direct child count to a saved checkpoint.
+fn restoreState(cg: *Codegen, nc_ptr: LB.Value, saved_nc: LB.Value, saved_cc: ?LB.Value) void {
+    _ = cg.b.store(saved_nc, nc_ptr, 4);
+    if (saved_cc) |cc| _ = cg.b.store(cc, cg.child_count_ptr, 4);
+}
+
+/// Which rules can add nodes when called: every non-silent rule, plus silent
+/// rules that (transitively) reference one. Computed as a fixed point.
+fn computeAllocFlags(allocator: Allocator, grammar: *const gp.Grammar, silent_flags: []const bool) CodegenError![]bool {
+    const flags = allocator.alloc(bool, grammar.rules.len) catch return CodegenError.OutOfMemory;
+    for (flags, silent_flags) |*f, silent| f.* = !silent;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (grammar.rules, 0..) |rule, i| {
+            if (flags[i]) continue;
+            if (exprRefsAllocating(grammar, flags, rule.expr)) {
+                flags[i] = true;
+                changed = true;
+            }
+        }
+    }
+    return flags;
+}
+
+fn exprRefsAllocating(grammar: *const gp.Grammar, flags: []const bool, expr: *const gp.Expr) bool {
+    switch (expr.tag) {
+        .literal, .char_class, .any_char => return false,
+        // Predicates restore node_count themselves
+        .not_predicate, .and_predicate => return false,
+        .reference => {
+            const name = expr.ref_name orelse return true;
+            for (grammar.rules, 0..) |rule, i| {
+                if (std.mem.eql(u8, rule.name, name)) return flags[i];
+            }
+            return true;
+        },
+        .sequence, .alternative => {
+            for (expr.children orelse return false) |child| {
+                if (exprRefsAllocating(grammar, flags, child)) return true;
+            }
+            return false;
+        },
+        .repetition => return exprRefsAllocating(grammar, flags, expr.rep_expr orelse return false),
+    }
 }
 
 /// Compute silent rule flags from explicit @silent annotations.

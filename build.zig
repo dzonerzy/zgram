@@ -4,7 +4,6 @@
 //! automatic Python configuration detection.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -13,10 +12,16 @@ pub fn build(b: *std.Build) void {
     // Strip option (can be set via -Dstrip=true or from pyoz CLI)
     const strip = b.option(bool, "strip", "Strip debug symbols from the binary") orelse false;
 
+    // Python Stable ABI (abi3): one wheel for CPython 3.10+. `pyoz build`
+    // enables it from `abi3 = true` in pyproject.toml; with plain
+    // `zig build`, pass -Dabi3=true.
+    const abi3 = b.option(bool, "abi3", "Build for the Python Stable ABI (abi3)") orelse false;
+
     // Get PyOZ dependency
     const pyoz_dep = b.dependency("PyOZ", .{
         .target = target,
         .optimize = optimize,
+        .abi3 = abi3,
     });
 
     // Create the user's lib module (shared between library and stub generator)
@@ -25,6 +30,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = strip,
+        .link_libc = true,
+        .link_libcpp = true,
         .imports = &.{
             .{ .name = "PyOZ", .module = pyoz_dep.module("PyOZ") },
         },
@@ -34,20 +41,19 @@ pub fn build(b: *std.Build) void {
     const target_os = target.result.os.tag;
     const target_arch = target.result.cpu.arch;
 
-    const llvm_dep_name: []const u8 = switch (target_os) {
-        .windows => switch (target_arch) {
-            .x86_64 => "llvm_x86_64_windows",
-            .aarch64 => "llvm_aarch64_windows",
-            else => @panic("unsupported architecture for LLVM libs"),
-        },
-        .macos => "llvm_aarch64_macos",
-        .linux => switch (target_arch) {
-            .x86_64 => "llvm_x86_64_linux",
-            .aarch64 => "llvm_aarch64_linux",
-            else => @panic("unsupported architecture for LLVM libs"),
-        },
-        else => @panic("unsupported OS for LLVM libs"),
-    };
+    // The JIT emits x86 code only: the zgram-llvm packages (including the
+    // aarch64 ones) ship just the X86 backend, and jit_compiler.zig
+    // initializes only that target. Refuse other targets instead of
+    // producing a module that fails at runtime.
+    if (target_arch != .x86_64 or (target_os != .linux and target_os != .windows)) {
+        std.debug.print(
+            "error: zgram supports x86_64 Linux and Windows only (target: {s}-{s}).\n" ++
+                "ARM needs LLVM built with the AArch64 backend.\n",
+            .{ @tagName(target_arch), @tagName(target_os) },
+        );
+        std.process.exit(1);
+    }
+    const llvm_dep_name: []const u8 = if (target_os == .windows) "llvm_x86_64_windows" else "llvm_x86_64_linux";
 
     const llvm_dep = b.lazyDependency(llvm_dep_name, .{}) orelse return;
     const llvm_lib_path = llvm_dep.path("lib");
@@ -100,47 +106,66 @@ pub fn build(b: *std.Build) void {
         user_lib_mod.addObjectFile(llvm_lib_path.path(b, b.fmt("lib{s}.a", .{lib_name})));
     }
 
+    // Single source for the version string returned by zgram.version()
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    user_lib_mod.addOptions("build_options", build_options);
+
     // Build the Python extension as a dynamic library
     const lib = b.addLibrary(.{
         .name = "zgram",
         .linkage = .dynamic,
         .root_module = user_lib_mod,
+        // Debug builds default to Zig's self-hosted linker, which rejects the
+        // relocations in the prebuilt LLVM archives; LLD links them fine.
+        .use_llvm = true,
+        .use_lld = true,
     });
 
     // Export all symbols so LLJIT's dlsym() can find __register_frame etc.
     lib.rdynamic = true;
 
-    // Link libc (required for Python C API)
-    lib.linkLibC();
-    lib.linkLibCpp();
+    // The Python C API comes from the interpreter that loads the extension
+    if (target_os == .macos) lib.linker_allow_shlib_undefined = true;
+
+    // On Windows, link against the Python library.
+    // These options are passed automatically by `pyoz build`.
+    // pkg-config is skipped: on a Linux host it would resolve python3 to the
+    // host's headers and drop the Windows import library.
+    if (b.option([]const u8, "python-lib-dir", "Python library directory")) |lib_dir| {
+        user_lib_mod.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+    if (b.option([]const u8, "python-lib-name", "Python library name")) |lib_name| {
+        user_lib_mod.linkSystemLibrary(lib_name, .{ .use_pkg_config = .no });
+    }
 
     // Platform-specific link dependencies
     switch (target_os) {
         .linux => {
-            user_lib_mod.linkSystemLibrary("rt", .{});
-            user_lib_mod.linkSystemLibrary("dl", .{});
-            user_lib_mod.linkSystemLibrary("m", .{});
-            user_lib_mod.linkSystemLibrary("pthread", .{});
+            user_lib_mod.linkSystemLibrary("rt", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("dl", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("m", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
         },
         .windows => {
-            user_lib_mod.linkSystemLibrary("psapi", .{});
-            user_lib_mod.linkSystemLibrary("ole32", .{});
-            user_lib_mod.linkSystemLibrary("oleaut32", .{});
-            user_lib_mod.linkSystemLibrary("advapi32", .{});
-            user_lib_mod.linkSystemLibrary("shell32", .{});
-            user_lib_mod.linkSystemLibrary("shlwapi", .{});
-            user_lib_mod.linkSystemLibrary("uuid", .{});
-            user_lib_mod.linkSystemLibrary("user32", .{});
+            user_lib_mod.linkSystemLibrary("psapi", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("ole32", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("oleaut32", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("advapi32", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("shell32", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("shlwapi", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("uuid", .{ .use_pkg_config = .no });
+            user_lib_mod.linkSystemLibrary("user32", .{ .use_pkg_config = .no });
         },
         else => {},
     }
 
     // Determine extension based on target OS (.pyd for Windows, .so otherwise)
-    const ext = if (builtin.os.tag == .windows) ".pyd" else ".so";
+    const ext = if (target_os == .windows) ".pyd" else ".so";
 
     // Install the shared library
     const install = b.addInstallArtifact(lib, .{
-        .dest_sub_path = "zgram" ++ ext,
+        .dest_sub_path = b.fmt("zgram{s}", .{ext}),
     });
     b.getInstallStep().dependOn(&install.step);
 
@@ -161,6 +186,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("benchmark/zgram/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
         .imports = &.{
             .{ .name = "zgram_core", .module = core_mod },
         },
@@ -169,27 +196,27 @@ pub fn build(b: *std.Build) void {
     const bench_exe = b.addExecutable(.{
         .name = "zgram_bench",
         .root_module = bench_mod,
+        .use_llvm = true,
+        .use_lld = true,
     });
     bench_exe.rdynamic = true;
-    bench_exe.linkLibC();
-    bench_exe.linkLibCpp();
 
     switch (target_os) {
         .linux => {
-            bench_mod.linkSystemLibrary("rt", .{});
-            bench_mod.linkSystemLibrary("dl", .{});
-            bench_mod.linkSystemLibrary("m", .{});
-            bench_mod.linkSystemLibrary("pthread", .{});
+            bench_mod.linkSystemLibrary("rt", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("dl", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("m", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
         },
         .windows => {
-            bench_mod.linkSystemLibrary("psapi", .{});
-            bench_mod.linkSystemLibrary("ole32", .{});
-            bench_mod.linkSystemLibrary("oleaut32", .{});
-            bench_mod.linkSystemLibrary("advapi32", .{});
-            bench_mod.linkSystemLibrary("shell32", .{});
-            bench_mod.linkSystemLibrary("shlwapi", .{});
-            bench_mod.linkSystemLibrary("uuid", .{});
-            bench_mod.linkSystemLibrary("user32", .{});
+            bench_mod.linkSystemLibrary("psapi", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("ole32", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("oleaut32", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("advapi32", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("shell32", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("shlwapi", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("uuid", .{ .use_pkg_config = .no });
+            bench_mod.linkSystemLibrary("user32", .{ .use_pkg_config = .no });
         },
         else => {},
     }

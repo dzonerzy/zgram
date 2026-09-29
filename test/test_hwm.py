@@ -131,27 +131,27 @@ class TestHWMErrorMessage:
 
 
 class TestHWMWithGetError:
-    """Verify HWM error info is accessible via get_error()."""
+    """Verify HWM error info is accessible via parser.error."""
 
-    def test_get_error_returns_hwm_position(self):
-        """get_error() returns the HWM-based error after a failed parse."""
+    def test_error_property_returns_hwm_position(self):
+        """parser.error returns the HWM-based error after a failed parse."""
         p = zgram.compile(JSON_GRAMMAR)
         try:
             p.parse('{"key": }')
         except Exception:
             pass
-        err = p.get_error()
+        err = p.error
         assert err is not None
         assert err.column() > 1
 
-    def test_get_error_line_col_multiline(self):
-        """get_error() line/col are correct for multiline HWM errors."""
+    def test_error_property_line_col_multiline(self):
+        """parser.error line/col are correct for multiline HWM errors."""
         p = zgram.compile(JSON_GRAMMAR)
         try:
             p.parse('{\n  "key": \n}')
         except Exception:
             pass
-        err = p.get_error()
+        err = p.error
         assert err is not None
         assert err.line() > 1
 
@@ -164,14 +164,14 @@ class TestHWMWithGetError:
             p.parse('{"name": "alice", "age": }')
         except Exception:
             pass
-        err1 = p.get_error()
+        err1 = p.error
 
         # Second: fail early
         try:
             p.parse("!!!")
         except Exception:
             pass
-        err2 = p.get_error()
+        err2 = p.error
 
         assert err1 is not None
         assert err2 is not None
@@ -215,7 +215,7 @@ class TestHWMEdgeCases:
             p.parse(bad_input)
         except Exception:
             pass
-        err = p.get_error()
+        err = p.error
         assert err is not None
         # Error should be deep in the input, not at position 0
         assert err.column() > 10

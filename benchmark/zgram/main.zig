@@ -26,14 +26,12 @@ const JSON_GRAMMAR =
     \\
 ;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     // Parse command line
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         std.debug.print("Usage: zgram_bench <json_file>\n", .{});
@@ -41,7 +39,7 @@ pub fn main() !void {
     }
 
     // Read input file
-    const input = try std.fs.cwd().readFileAlloc(allocator, args[1], 1024 * 1024);
+    const input = try std.Io.Dir.cwd().readFileAlloc(io, args[1], allocator, .limited(1024 * 1024));
     defer allocator.free(input);
 
     // Compile grammar
@@ -56,9 +54,9 @@ pub fn main() !void {
 
     // Verify parse works
     var output: abi.ParseOutput = .{};
-    _ = parse_fn(input.ptr, input.len, &output);
+    _ = parse_fn(input.ptr, input.len, &output, 0, 0);
     if (output.status != 1) {
-        std.debug.print("Parse failed: {s}\n", .{output.error_message[0..output.error_message_len]});
+        std.debug.print("Parse failed at offset {d} (line {d}, col {d})\n", .{ output.error_offset, output.error_line, output.error_col });
         std.process.exit(1);
     }
     std.debug.print("Parse OK ({d} nodes). Benchmarking...\n", .{output.node_count});
@@ -66,12 +64,12 @@ pub fn main() !void {
     // Auto-calibrate: find iteration count that takes >= 2 seconds
     var iters: u64 = 1000;
     while (true) {
-        var timer = try std.time.Timer.start();
+        const timer_start = std.Io.Timestamp.now(io, .awake);
         for (0..iters) |_| {
             output.node_count = 0;
-            _ = parse_fn(input.ptr, input.len, &output);
+            _ = parse_fn(input.ptr, input.len, &output, 0, 0);
         }
-        const elapsed_ns = timer.read();
+        const elapsed_ns = timer_start.untilNow(io, .awake).toNanoseconds();
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
 
         if (elapsed_s >= 2.0) {

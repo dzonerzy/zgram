@@ -763,21 +763,21 @@ class TestErrorReporting:
             p.parse("line1\nline2\nwrong")
         except Exception:
             pass
-        err = p.get_error()
+        err = p.error
         assert err is not None
         assert err.line() >= 1
 
     def test_error_preserves_between_parses(self):
-        """get_error() should reflect the last parse."""
+        """parser.error should reflect the last parse."""
         p = zgram.compile("root = 'ok'\n")
         r = p.parse("ok")
         assert r is not None
-        err = p.get_error()
+        err = p.error
         assert err is None
 
         with pytest.raises(Exception):
             p.parse("bad")
-        err = p.get_error()
+        err = p.error
         assert err is not None
 
 

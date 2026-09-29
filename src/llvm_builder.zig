@@ -289,8 +289,10 @@ pub const Builder = struct {
     }
 
     /// Create a splat vector: all lanes set to the same scalar value.
+    /// `width` is at most 64 (enough for AVX-512 byte vectors).
     pub fn splatVector(_: *const Builder, scalar: Value, width: u32) Value {
-        var vals: [16]Value = undefined;
+        var vals: [64]Value = undefined;
+        std.debug.assert(width <= vals.len);
         for (0..width) |i| vals[i] = scalar;
         return c.LLVMConstVector(&vals, width);
     }
@@ -369,6 +371,41 @@ pub const Builder = struct {
 
     pub fn xor(self: *Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
         return c.LLVMBuildXor(self.b, lhs, rhs, name);
+    }
+
+    // ── Switch ──
+
+    /// Build a switch on `val`; add cases with `addCase`.
+    pub fn @"switch"(self: *Builder, val: Value, else_bb: Block, num_cases: u32) Value {
+        return c.LLVMBuildSwitch(self.b, val, else_bb, num_cases);
+    }
+
+    pub fn addCase(self: *const Builder, switch_inst: Value, on_val: Value, dest: Block) void {
+        _ = self;
+        c.LLVMAddCase(switch_inst, on_val, dest);
+    }
+
+    // ── Attributes ──
+
+    fn enumAttr(self: *const Builder, name: []const u8) c.LLVMAttributeRef {
+        const kind = c.LLVMGetEnumAttributeKindForName(name.ptr, name.len);
+        return c.LLVMCreateEnumAttribute(self.ctx, kind, 0);
+    }
+
+    /// Add a function attribute such as "nounwind".
+    pub fn addFnAttr(self: *const Builder, func: Value, name: []const u8) void {
+        // LLVMAttributeFunctionIndex is (unsigned)-1
+        c.LLVMAddAttributeAtIndex(func, std.math.maxInt(c_uint), self.enumAttr(name));
+    }
+
+    /// Add a function attribute such as "noinline" to one call instruction.
+    pub fn addCallAttr(self: *const Builder, call_inst: Value, name: []const u8) void {
+        c.LLVMAddCallSiteAttribute(call_inst, std.math.maxInt(c_uint), self.enumAttr(name));
+    }
+
+    /// Add an attribute such as "noalias" to parameter `index` (0-based).
+    pub fn addParamAttr(self: *const Builder, func: Value, index: u32, name: []const u8) void {
+        c.LLVMAddAttributeAtIndex(func, index + 1, self.enumAttr(name));
     }
 
     // ── Module Dump ──

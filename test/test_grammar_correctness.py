@@ -27,7 +27,8 @@ def assert_fails(parser, input_str):
 
 class TestJsonGrammar:
     @pytest.fixture(scope="class")
-    def parser(self, json_parser):
+    @classmethod
+    def parser(cls, json_parser):
         return json_parser
 
     @pytest.mark.parametrize(
@@ -61,7 +62,8 @@ class TestJsonGrammar:
 
 class TestArithmeticGrammar:
     @pytest.fixture(scope="class")
-    def parser(self):
+    @classmethod
+    def parser(cls):
         return zgram.compile(
             "expr    = term (('+' | '-') term)*\n"
             "term    = factor (('*' | '/') factor)*\n"
@@ -90,7 +92,8 @@ class TestArithmeticGrammar:
 
 class TestIdentifierGrammar:
     @pytest.fixture(scope="class")
-    def parser(self):
+    @classmethod
+    def parser(cls):
         return zgram.compile(
             "program = stmt*\n"
             "stmt    = ident '=' expr ';'\n"
@@ -117,7 +120,8 @@ class TestIdentifierGrammar:
 
 class TestNestedParensGrammar:
     @pytest.fixture(scope="class")
-    def parser(self):
+    @classmethod
+    def parser(cls):
         return zgram.compile("expr = '(' expr ')' | 'x'\n")
 
     @pytest.mark.parametrize(
@@ -139,7 +143,8 @@ class TestNestedParensGrammar:
 
 class TestStringEscapesGrammar:
     @pytest.fixture(scope="class")
-    def parser(self):
+    @classmethod
+    def parser(cls):
         return zgram.compile(
             "string  = '\"' content '\"'\n"
             "content = (escape | plain)*\n"
@@ -170,7 +175,8 @@ class TestStringEscapesGrammar:
 
 class TestCsvGrammar:
     @pytest.fixture(scope="class")
-    def parser(self):
+    @classmethod
+    def parser(cls):
         return zgram.compile(
             "csv     = row ('\\n' row)*\n"
             "row     = field (',' field)*\n"
@@ -199,7 +205,8 @@ class TestCsvGrammar:
 
 class TestOptionalGrammar:
     @pytest.fixture(scope="class")
-    def parser(self):
+    @classmethod
+    def parser(cls):
         return zgram.compile("start = 'a' opt 'b'\nopt   = 'x'?\n")
 
     @pytest.mark.parametrize(
@@ -245,7 +252,8 @@ class TestNodeTreeStructure:
 
 class TestPredicateGrammar:
     @pytest.fixture(scope="class")
-    def parser(self):
+    @classmethod
+    def parser(cls):
         return zgram.compile(
             "start   = !digit letter+\ndigit   = [0-9]\nletter  = [a-zA-Z]\n"
         )
