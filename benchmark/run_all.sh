@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== zgram vs PEGTL vs cpp-peglib vs pest vs rust-peg — JSON Parse Benchmark ==="
+echo "=== zgram vs PEGTL vs cpp-peglib vs pest vs rust-peg (tree and validate-only) — JSON Parse Benchmark ==="
 echo ""
 
 # Generate test data
@@ -44,6 +44,13 @@ cargo build --release > /dev/null 2>&1
 PEST_BIN="$SCRIPT_DIR/pest/target/release/pest_bench"
 echo ""
 
+# Build rust-peg tree-building benchmark
+echo "Building rust-peg (tree) benchmark..."
+cd "$SCRIPT_DIR/rust-peg-tree"
+cargo build --release > /dev/null 2>&1
+RUSTPEG_TREE_BIN="$SCRIPT_DIR/rust-peg-tree/target/release/rustpeg_tree_bench"
+echo ""
+
 # Build rust-peg benchmark
 echo "Building rust-peg benchmark..."
 cd "$SCRIPT_DIR/rust-peg"
@@ -52,7 +59,7 @@ RUSTPEG_BIN="$SCRIPT_DIR/rust-peg/target/release/rustpeg_bench"
 echo ""
 
 # Run benchmarks
-for size in small medium large; do
+for size in small medium large strings; do
     FILE="$SCRIPT_DIR/data/$size.json"
     BYTES=$(wc -c < "$FILE")
     echo "============================================"
@@ -60,6 +67,10 @@ for size in small medium large; do
     echo "============================================"
     echo ""
     "$ZGRAM_BIN" "$FILE" 2>&1
+    echo ""
+    "$ZGRAM_BIN" "$FILE" --validate 2>&1
+    echo ""
+    "$RUSTPEG_TREE_BIN" "$FILE" 2>&1
     echo ""
     "$PEGTL_BIN" "$FILE" 2>&1
     echo ""

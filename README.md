@@ -26,23 +26,23 @@ zgram compiles PEG grammars into SIMD-accelerated native code via LLVM JIT at ru
 On a JSON parsing benchmark (from Python, including call overhead):
 
 ```
-Small JSON (43 bytes):    0.1us  -  6x faster than json.loads
-Medium JSON (1.2KB):      2.2us  -  2x faster than json.loads
-Large JSON (15KB):       33.0us  -  2x faster than json.loads
+Small JSON (43 bytes):    0.1us  -  8x faster than json.loads
+Medium JSON (1.2KB):      1.3us  -  3x faster than json.loads
+Large JSON (15KB):       21.2us  -  4x faster than json.loads
 ```
 
 Compared to other Python parser generators:
 
 | Parser | Type | Small (43B) | Medium (1.2KB) | Large (15KB) |
 |--------|------|-------------|----------------|--------------|
-| **zgram** | **PEG, LLVM JIT** | **0.1us** | **2.2us** | **33.0us** |
-| json.loads | Hand-tuned C | 0.8us | 3.7us | 75.6us |
-| pe | PEG, C ext | 9.5us (70x) | 199us (90x) | 3,156us (96x) |
-| parsimonious | PEG, pure Python | 75.0us (551x) | 2,766us (1259x) | 39,190us (1188x) |
-| pyparsing | Combinator | 90.1us (662x) | 1,796us (817x) | 37,662us (1142x) |
-| lark | Earley | 527us (3872x) | 13,506us (6147x) | 273,857us (8304x) |
+| **zgram** | **PEG, LLVM JIT** | **0.1us** | **1.3us** | **21.2us** |
+| json.loads | Hand-tuned C | 0.9us | 4.1us | 81.1us |
+| pe | PEG, C ext | 12.4us (107x) | 248us (191x) | 4,069us (192x) |
+| parsimonious | PEG, pure Python | 96.6us (835x) | 3,257us (2507x) | 44,615us (2108x) |
+| pyparsing | Combinator | 102us (879x) | 2,017us (1552x) | 31,566us (1491x) |
+| lark | Earley | 634us (5478x) | 17,231us (13262x) | 373,682us (17653x) |
 
-Against native parser generators (Rust, C++), zgram matches rust-peg on small inputs and beats PEGTL, pest and cpp-peglib while building a full parse tree; see [BENCHMARK.md](https://github.com/dzonerzy/zgram/blob/main/BENCHMARK.md). String-heavy input is where the SIMD code shines: a 74 KB JSON document of long strings parses in 22us (3.4 GB/s).
+Against native parser generators, zgram is the fastest on every input whether or not the others build a tree: building the same tree, rust-peg takes 2.7-9.7x longer and pest 10-96x; doing validation only, rust-peg takes 1.9-12x longer and PEGTL 3.5-48x (see [BENCHMARK.md](https://github.com/dzonerzy/zgram/blob/main/BENCHMARK.md)). String-heavy input is where the SIMD code shines: a 75 KB JSON document of long strings parses in 13us (5.8 GB/s).
 
 > `json.loads` does **more** work (parses + builds Python dicts/lists). zgram returns a zero-copy parse tree.
 
@@ -344,7 +344,7 @@ Grammar string
 Key implementation details:
 
 - **LLVM JIT compilation**: Grammars compile to native x86-64 code in-process via LLVM's ORC LLJIT. No subprocess, no `.so` files, no disk cache. Each grammar gets its own ResourceTracker for independent cleanup.
-- **SIMD character scanning**: Character class repetitions (`[a-z]+`, `[^"\\]*`) scan 16 bytes (SSE2) or 32 bytes (AVX2) per step. Single ranges, small included sets, and small excluded sets are all vectorized, including through `@silent` rules and in loops like JSON's `(escape | plain)*`: when the other branches can't start with a byte of the class, runs of it are vector-scanned and the other branches are tried only where a run stops. String-heavy JSON parses about 3x faster this way.
+- **SIMD character scanning**: Character class repetitions (`[a-z]+`, `[^"\\]*`) test the first 8 bytes one at a time (most runs are a space or a few digits) and continue in an out-of-line 16-byte (SSE2) or 32-byte (AVX2) vector loop only for longer runs. Single ranges, small included sets and small excluded sets are vectorized, including through `@silent` rules and in loops like JSON's `(escape | plain)*`: when the other branches can't start with a byte of the class, runs of it are scanned in bulk and the other branches are tried only where a run stops.
 - **Inline node allocation**: Rule functions reserve nodes via an inlined fast path (compare + increment) with a slow path fallback to `zgram_ensure_capacity`. Node filling is also inlined -- no function call overhead per node.
 - **High-water mark errors**: Every rule failure updates `max_pos = max(max_pos, pos)`. On parse failure, the error is reported at the furthest position reached with `"expected <rule_name>"`.
 - **Flat node tree**: 16-byte `FlatNode` structs in pre-order with subtree sizes. Iterating children steps from sibling to sibling in O(1), and `find()` is a linear scan, because a node's descendants are contiguous.

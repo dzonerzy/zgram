@@ -19,7 +19,7 @@ First release on PyPI, as **`zgram-py`** (`pip install zgram-py`; the module is 
 - **`parser.rules()`** lists the grammar's rule names.
 - **`zgram.ParseError` has `line`, `column`, `offset` and `message` attributes.**
 - **Parallel parsing:** `compile()` releases the GIL, and so do `parse()`/`match()` for inputs of 16 KB or more. A `GrammarParser` can be shared between threads.
-- **Faster generated code:** character-class loops scan 32 bytes per step on AVX2 CPUs, and loops like JSON's `(escape | plain)*` are vectorized through `@silent` rules and alternatives. String-heavy JSON parses about 3x faster.
+- **Faster generated code:** character-class loops test the first 8 bytes inline and hand longer runs to an out-of-line 16/32-byte (SSE2/AVX2) vector loop, and loops like JSON's `(escape | plain)*` are vectorized through `@silent` rules and alternatives. The 15 KB benchmark JSON parses in 20 µs instead of 33 µs, and string-heavy JSON about 5x faster. zgram now beats rust-peg on every benchmark input, whether rust-peg builds a tree or only validates.
 
 ### Changed
 - **`parser.get_error()` is now the property `parser.error`,** which returns a `ParseErrorInfo` (previously a class that shared the name `ParseError` with the exception). PyOZ exposes `get_X` methods as properties.

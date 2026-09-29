@@ -38,6 +38,21 @@ def make_large_json():
     )
 
 
+def make_strings_json():
+    """Log-like records with long string values (deterministic)."""
+    words = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor".split()
+    return json.dumps(
+        [
+            {
+                "id": i,
+                "message": " ".join(words[(i * 7 + k) % len(words)] for k in range(40)),
+                "path": "/var/log/app/" + "segment-" * 8 + str(i),
+            }
+            for i in range(200)
+        ]
+    )
+
+
 if __name__ == "__main__":
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -45,6 +60,7 @@ if __name__ == "__main__":
         ("small", make_small_json),
         ("medium", make_medium_json),
         ("large", make_large_json),
+        ("strings", make_strings_json),
     ]:
         data = gen()
         path = os.path.join(DATA_DIR, f"{name}.json")
