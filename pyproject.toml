@@ -1,24 +1,58 @@
 [build-system]
-requires = ["pyoz"]
+requires = ["pyoz>=0.13.3"]
 build-backend = "pyoz.backend"
 
 [project]
-name = "zgram"
+# "zgram" is taken on PyPI; the import name stays `zgram` (module-name below)
+name = "zgram-py"
 version = "0.1.0"
-description = "A Python extension module built with PyOZ"
-requires-python = ">=3.8"
+description = "JIT-compiled PEG parser generator: grammars compile to native SIMD code via LLVM, in-process."
+requires-python = ">=3.10"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Daniele Linguaglossa" }]
+keywords = ["parser", "peg", "parser-generator", "grammar", "llvm", "jit", "simd"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Text Processing",
+]
+
+[project.urls]
+Homepage = "https://github.com/dzonerzy/zgram"
+Source = "https://github.com/dzonerzy/zgram"
+Issues = "https://github.com/dzonerzy/zgram/issues"
+Changelog = "https://github.com/dzonerzy/zgram/blob/main/CHANGELOG.md"
 
 [tool.pyoz]
 # Path to your Zig source file
 module-path = "src/lib.zig"
 
+# Python import name (the distribution is zgram-py)
+module-name = "zgram"
+
 # Optimization level for release builds: "Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"
 # optimize = "ReleaseFast"
 
 # Strip debug symbols in release builds
-# strip = true
+strip = true
 
-# Linux platform tag for wheel builds (default: "linux_x86_64" or "linux_aarch64")
-# Use manylinux tags only if building in a manylinux container
-# linux-platform-tag = "manylinux_2_17_x86_64"
+# One wheel per platform for CPython 3.10+ (stable ABI)
+abi3 = true
+
+# Linux wheels are portable by default (built against glibc 2.17, tagged
+# manylinux_2_17_*). Set a manylinux tag to pick another glibc baseline, or a
+# linux_* tag for a native, non-portable build.
+# linux-platform-tag = "manylinux_2_28_x86_64"

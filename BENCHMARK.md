@@ -24,11 +24,11 @@ All benchmarks parse the same JSON files in a tight loop, auto-calibrating itera
 
 | Library | Per-parse | Ops/sec | vs zgram |
 |---------|-----------|---------|----------|
-| **zgram JIT** | **0.07us** | **13,388,369** | — |
-| rust-peg | 0.07us | 13,360,492 | 1.00x |
-| PEGTL | 0.19us | 5,373,907 | 0.40x |
-| pest | 0.76us | 1,321,527 | 0.10x |
-| cpp-peglib | 7.25us | 138,023 | 0.01x |
+| **zgram JIT** | **0.06us** | **16,666,667** | — |
+| rust-peg | 0.08us | 12,500,000 | 0.75x |
+| PEGTL | 0.19us | 5,263,158 | 0.32x |
+| pest | 0.78us | 1,282,051 | 0.08x |
+| cpp-peglib | 7.32us | 136,612 | 0.01x |
 
 ### Medium JSON (1,201 bytes)
 
@@ -36,11 +36,11 @@ All benchmarks parse the same JSON files in a tight loop, auto-calibrating itera
 
 | Library | Per-parse | Ops/sec | vs zgram |
 |---------|-----------|---------|----------|
-| rust-peg | 1.87us | 533,511 | 1.12x |
-| **zgram JIT** | **2.10us** | **477,115** | — |
-| PEGTL | 5.47us | 182,918 | 0.38x |
-| pest | 18.65us | 53,609 | 0.11x |
-| cpp-peglib | 240.04us | 4,166 | 0.01x |
+| rust-peg | 1.89us | 529,101 | 1.06x |
+| **zgram JIT** | **2.00us** | **500,000** | — |
+| PEGTL | 5.65us | 176,991 | 0.35x |
+| pest | 19.63us | 50,942 | 0.10x |
+| cpp-peglib | 243.82us | 4,101 | 0.01x |
 
 ### Large JSON (15,241 bytes)
 
@@ -48,11 +48,11 @@ All benchmarks parse the same JSON files in a tight loop, auto-calibrating itera
 
 | Library | Per-parse | Ops/sec | vs zgram |
 |---------|-----------|---------|----------|
-| rust-peg | 22.33us | 44,791 | 1.44x |
-| **zgram JIT** | **32.13us** | **31,128** | — |
-| PEGTL | 44.68us | 22,383 | 0.72x |
-| pest | 172.56us | 5,795 | 0.19x |
-| cpp-peglib | 1,981.44us | 505 | 0.02x |
+| rust-peg | 22.53us | 44,385 | 1.46x |
+| **zgram JIT** | **32.98us** | **30,321** | — |
+| PEGTL | 44.01us | 22,722 | 0.75x |
+| pest | 177.39us | 5,637 | 0.19x |
+| cpp-peglib | 2,013.31us | 497 | 0.02x |
 
 ## Fairness Note
 
@@ -65,11 +65,11 @@ This means zgram is doing strictly more work than rust-peg, PEGTL, and cpp-pegli
 
 ## Analysis
 
-**zgram** and **rust-peg** are the two fastest parsers, effectively tied on small inputs. On larger inputs rust-peg pulls ahead — but rust-peg is doing validation only, while zgram is building a full parse tree with 3,706 nodes. The fact that zgram remains within 1.4x of a validate-only parser while constructing a complete, traversable parse tree is notable.
+**zgram** and **rust-peg** are the two fastest parsers; zgram is slightly ahead on small inputs. On larger inputs rust-peg pulls ahead — but rust-peg is doing validation only, while zgram is building a full parse tree with 3,706 nodes. The fact that zgram remains within 1.5x of a validate-only parser while constructing a complete, traversable parse tree is notable.
 
-Among tree-building parsers, **zgram is ~6x faster than pest** despite pest being compiled at Rust compile time while zgram JIT-compiles the grammar at runtime.
+Among tree-building parsers, **zgram is 5-13x faster than pest** despite pest being compiled at Rust compile time while zgram JIT-compiles the grammar at runtime.
 
-**PEGTL**, a compile-time C++ template approach doing validation only, lands in third place at roughly 2-3x slower than zgram — slower despite doing less work.
+**PEGTL**, a compile-time C++ template approach doing validation only, lands in third place at 1.3-3x slower than zgram — slower despite doing less work.
 
 **pest** builds token pairs like zgram builds nodes, but is significantly slower — likely due to the overhead of its `Rc<Vec<QueueableToken>>` pair architecture vs zgram's contiguous flat array written directly by JIT'd code.
 
@@ -82,12 +82,12 @@ Among tree-building parsers, **zgram is ~6x faster than pest** despite pest bein
 ## Reproducing
 
 ```bash
-# Prerequisites: Zig 0.15+, CMake 3.14+, Rust/Cargo, Python 3
+# Prerequisites: Zig 0.16+, CMake 3.14+, Rust/Cargo, Python 3
 bash benchmark/run_all.sh
 ```
 
 ## Environment
 
-- CPU: AMD Ryzen 9 9950X3D 16-Core Processor (WSL2, Linux 6.6)
-- Zig 0.15.2, GCC 11.4, Rust 1.90.0, CMake 3.22
+- CPU: AMD Ryzen 9 9950X3D 16-Core Processor (WSL2, Linux 6.18)
+- Zig 0.16.0, GCC 11.4, Rust 1.90.0, CMake 3.22
 - All native builds use maximum optimization (`-O3` / `ReleaseFast` / `--release` with LTO)

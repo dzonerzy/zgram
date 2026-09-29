@@ -1,0 +1,73 @@
+name: Release
+
+# Push a tag like v0.1.0 (matching the version in pyproject.toml) to build,
+# test, publish to PyPI and create a GitHub release.
+on:
+    push:
+        tags: ["v*"]
+
+jobs:
+    check-version:
+        name: Check tag matches version
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Compare tag with pyproject.toml and build.zig.zon
+              run: |
+                  TAG="${GITHUB_REF_NAME#v}"
+                  PYPROJECT=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+                  ZON=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' build.zig.zon)
+                  echo "tag=$TAG pyproject=$PYPROJECT build.zig.zon=$ZON"
+                  [ "$TAG" = "$PYPROJECT" ] && [ "$TAG" = "$ZON" ]
+
+    ci:
+        needs: check-version
+        uses: ./.github/workflows/ci.yml
+
+    pypi:
+        name: Publish to PyPI
+        needs: ci
+        runs-on: ubuntu-latest
+        environment: pypi
+        permissions:
+            # Trusted publishing, used when PYPI_API_TOKEN isn't set
+            id-token: write
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: wheel-*
+                  path: dist
+                  merge-multiple: true
+
+            - name: Publish
+              uses: pypa/gh-action-pypi-publish@release/v1
+              with:
+                  password: ${{ secrets.PYPI_API_TOKEN }}
+                  packages-dir: dist/
+
+    github-release:
+        name: GitHub release
+        needs: pypi
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: wheel-*
+                  path: dist
+                  merge-multiple: true
+
+            - name: Create release with this version's changelog
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  VERSION="${GITHUB_REF_NAME#v}"
+                  awk -v v="$VERSION" '
+                      $0 ~ "^## \\[" v "\\]" { found = 1; next }
+                      found && /^## \[/ { exit }
+                      found { print }
+                  ' CHANGELOG.md > notes.md
+                  gh release create "$GITHUB_REF_NAME" dist/*.whl --title "zgram $VERSION" --notes-file notes.md
