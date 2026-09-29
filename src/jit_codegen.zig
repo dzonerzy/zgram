@@ -834,29 +834,141 @@ fn canSimdScan(expr: *const gp.Expr) bool {
     return cls.pattern != .unsupported;
 }
 
-/// Emit a SIMD-accelerated character class scanning loop.
-/// Processes 16 bytes (SSE2) or 32 bytes (AVX2) per iteration.
+/// Bytes tested one at a time before a run switches to vector steps
+const SCALAR_PREFIX = 8;
+
+/// A 256-bit membership bitmap for a character class, as a global constant.
+fn classBitmapGlobal(cg: *Codegen, expr: *const gp.Expr) CodegenError!LB.Value {
+    const b = cg.b;
+    const set = charClassSet(expr);
+    var bitmap_consts: [32]LB.Value = undefined;
+    for (0..32) |i| {
+        var byte: u8 = 0;
+        for (0..8) |bit| {
+            if (set.isSet(i * 8 + bit)) byte |= @as(u8, 1) << @intCast(bit);
+        }
+        bitmap_consts[i] = b.constInt(b.i8, byte);
+    }
+    const name = std.fmt.allocPrintSentinel(b.allocator, "cls_bm_{d}", .{b.block_counter}, 0) catch return CodegenError.OutOfMemory;
+    defer b.allocator.free(name);
+    b.block_counter += 1;
+    return b.addGlobalConstant(name, b.arrayType(b.i8, 32), b.constArray(b.i8, &bitmap_consts));
+}
+
+/// i1: is byte `ch` in the class described by `bitmap_global`?
+fn emitClassTest(cg: *Codegen, bitmap_global: LB.Value, ch: LB.Value) LB.Value {
+    const b = cg.b;
+    const idx = b.zext(b.lshr(b.zext(ch, b.i32, "ch32"), b.constInt(b.i32, 3), "bidx"), b.i64, "bidx64");
+    const bm_byte = b.load(b.i8, b.gep(b.i8, bitmap_global, &.{idx}, "bm_ptr"), 1, "bm_byte");
+    const mask = b.shl(b.constInt(b.i8, 1), b.@"and"(ch, b.constInt(b.i8, 7), "bpos"), "bmask");
+    return b.icmp(.ne, b.@"and"(bm_byte, mask, "tst"), b.constInt(b.i8, 0), "cls_match");
+}
+
+/// Scan a run of `expr`'s character class from start_pos; returns where it ends.
 ///
-/// Generated structure:
-///   vec_check: can we load 16 bytes? if yes → vec_body, else → scalar_loop
-///   vec_body:  load <16 x i8>, vector compare, all match? → vec_check, else → find_end
-///   find_end:  bitcast mismatch mask to i16, cttz to find first mismatch offset
-///   scalar_loop: one byte at a time for tail < 16 bytes
-///   exit: phi merges results from find_end and scalar_loop
+/// Most runs are short (a space, a few digits), where a vector step costs far
+/// more than a byte test. So the first SCALAR_PREFIX bytes are tested inline,
+/// one at a time, and only a longer run continues in an out-of-line vector
+/// function. Keeping the vector loop out of line also keeps rule functions
+/// small enough for LLVM to inline.
 fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fail_block: LB.Block, rep_kind: u8, hwm_chain: []const u16) CodegenError!LB.Value {
     const b = cg.b;
+    const bitmap_global = try classBitmapGlobal(cg, expr);
+    const scan_fn = try simdScanFunction(cg, expr, bitmap_global);
+
+    const pre_header = try b.newBlock("scan_pre");
+    const pre_bounds = try b.newBlock("scan_pre_bounds");
+    const pre_body = try b.newBlock("scan_pre_body");
+    const vec_call = try b.newBlock("scan_vec");
+    const exit = try b.newBlock("scan_exit");
+
+    const entry_block = b.getCurrentBlock();
+    _ = b.br(pre_header);
+
+    b.positionAtEnd(pre_header);
+    const pre_pos = b.phi(b.i64, "pre_pos");
+    const consumed = b.sub(pre_pos, start_pos, "pre_consumed");
+    const go_vec = b.icmp(.uge, consumed, b.constInt(b.i64, SCALAR_PREFIX), "go_vec");
+    _ = b.condBr(go_vec, vec_call, pre_bounds);
+
+    b.positionAtEnd(pre_bounds);
+    const pre_inb = b.icmp(.ult, pre_pos, cg.input_len, "pre_inb");
+    _ = b.condBr(pre_inb, pre_body, exit);
+
+    b.positionAtEnd(pre_body);
+    const pre_ch = b.load(b.i8, b.gep(b.i8, cg.input_ptr, &.{pre_pos}, "pre_ptr"), 1, "pre_ch");
+    const pre_match = emitClassTest(cg, bitmap_global, pre_ch);
+    const pre_next = b.add(pre_pos, b.constInt(b.i64, 1), "pre_next");
+    _ = b.condBr(pre_match, pre_header, exit);
+    b.addIncoming(pre_pos, &.{ start_pos, pre_next }, &.{ entry_block, pre_body });
+
+    b.positionAtEnd(vec_call);
+    const scan_type = b.fnType(b.i64, &.{ b.ptr, b.i64, b.i64 });
+    const vec_end = b.call(scan_type, scan_fn, &.{ cg.input_ptr, cg.input_len, pre_pos }, "vec_end");
+    _ = b.br(exit);
+
+    b.positionAtEnd(exit);
+    const final_pos = b.phi(b.i64, "scan_end");
+    b.addIncoming(final_pos, &.{ vec_end, pre_pos, pre_pos }, &.{ vec_call, pre_bounds, pre_body });
+
+    // The (inlined) silent rules around the class failed at final_pos
+    try emitHwmChain(cg, final_pos, hwm_chain);
+
+    // For '+' repetition, we need at least one match
+    if (rep_kind == '+') {
+        const no_match = b.icmp(.eq, final_pos, start_pos, "no_match");
+        const ok_block = try b.newBlock("scan_ok");
+        _ = b.condBr(no_match, fail_block, ok_block);
+        b.positionAtEnd(ok_block);
+    }
+    return final_pos;
+}
+
+/// Out-of-line vector scan for one character class:
+///   i64 scan(ptr input, i64 len, i64 pos) -> end of the run starting at pos
+/// Processes 16 bytes (SSE2) or 32 bytes (AVX2) per iteration:
+///   vec_check: can we load W bytes? if yes → vec_body, else → scalar_loop
+///   vec_body:  load <W x i8>, vector compare, all match? → vec_check, else → find_end
+///   find_end:  bitcast mismatch mask to iW, cttz to find first mismatch offset
+///   scalar_loop: one byte at a time for the tail (< W bytes)
+fn simdScanFunction(cg: *Codegen, expr: *const gp.Expr, bitmap_global: LB.Value) CodegenError!LB.Value {
+    const b = cg.b;
     const cls = classifySimd(expr);
+
+    // Build the function, then restore the builder to where we were
+    const saved_fn = b.current_fn;
+    const saved_block = b.getCurrentBlock();
+    const saved_input_ptr = cg.input_ptr;
+    const saved_input_len = cg.input_len;
+    defer {
+        b.setCurrentFn(saved_fn);
+        b.positionAtEnd(saved_block);
+        cg.input_ptr = saved_input_ptr;
+        cg.input_len = saved_input_len;
+    }
+
+    const name = std.fmt.allocPrintSentinel(b.allocator, "simd_scan_{d}", .{b.block_counter}, 0) catch return CodegenError.OutOfMemory;
+    defer b.allocator.free(name);
+    b.block_counter += 1;
+    const func = b.addFunction(name, b.fnType(b.i64, &.{ b.ptr, b.i64, b.i64 }));
+    b.setLinkageInternal(func);
+    b.addFnAttr(func, "nounwind");
+    b.addFnAttr(func, "noinline");
+    b.addParamAttr(func, 0, "noalias");
+    b.addParamAttr(func, 0, "readonly");
+    b.setCurrentFn(func);
+    b.positionAtEnd(b.appendBlock("entry"));
+    cg.input_ptr = b.param(func, 0);
+    cg.input_len = b.param(func, 1);
+    const start_pos = b.param(func, 2);
 
     const W = cg.simd_width;
     const vec16i8 = b.vectorType(b.i8, W);
     const vec16i1 = b.vectorType(b.i1, W);
     const mask_int = if (W == 32) b.i32 else b.i16;
-
-    // Look up intrinsics we need
     const cttz_id = b.lookupIntrinsic("llvm.cttz");
     const reduce_and_id = b.lookupIntrinsic("llvm.vector.reduce.and");
 
-    // Blocks
     const vec_check = try b.newBlock("simd_check");
     const vec_body = try b.newBlock("simd_body");
     const find_end = try b.newBlock("simd_find_end");
@@ -958,39 +1070,7 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
     const s_byte_ptr = b.gep(b.i8, cg.input_ptr, &.{scalar_pos_phi}, "s_bptr");
     const s_ch = b.load(b.i8, s_byte_ptr, 1, "s_ch");
 
-    // Build bitmap (same as emitCharClass)
-    const ranges = expr.char_ranges orelse return CodegenError.InvalidGrammar;
-    const negated = expr.char_negated;
-    var bitmap: [32]u8 = [_]u8{0} ** 32;
-    for (ranges) |r| {
-        var cv: u16 = r.start;
-        while (cv <= r.end) : (cv += 1) {
-            bitmap[@as(u8, @truncate(cv)) >> 3] |= @as(u8, 1) << @as(u3, @truncate(@as(u8, @truncate(cv))));
-        }
-    }
-    if (negated) {
-        for (&bitmap) |*bv| bv.* = ~bv.*;
-    }
-
-    var bitmap_consts: [32]LB.Value = undefined;
-    for (bitmap, 0..) |bv, idx| {
-        bitmap_consts[idx] = b.constInt(b.i8, bv);
-    }
-    const bitmap_val = b.constArray(b.i8, &bitmap_consts);
-    const bitmap_ty = b.arrayType(b.i8, 32);
-    const bm_name = std.fmt.allocPrintSentinel(b.allocator, "simd_bm_{d}", .{b.block_counter}, 0) catch return CodegenError.OutOfMemory;
-    defer b.allocator.free(bm_name);
-    const bitmap_global = b.addGlobalConstant(bm_name, bitmap_ty, bitmap_val);
-
-    const s_ch_i32 = b.zext(s_ch, b.i32, "s_ch32");
-    const s_byte_index = b.lshr(s_ch_i32, b.constInt(b.i32, 3), "s_bidx");
-    const s_byte_index_i64 = b.zext(s_byte_index, b.i64, "s_bidx64");
-    const s_bm_ptr = b.gep(b.i8, bitmap_global, &.{s_byte_index_i64}, "s_bm_ptr");
-    const s_bm_byte = b.load(b.i8, s_bm_ptr, 1, "s_bm_byte");
-    const s_bit_pos = b.@"and"(s_ch, b.constInt(b.i8, 7), "s_bpos");
-    const s_bit_mask = b.shl(b.constInt(b.i8, 1), s_bit_pos, "s_bmask");
-    const s_test = b.@"and"(s_bm_byte, s_bit_mask, "s_tst");
-    const s_match = b.icmp(.ne, s_test, b.constInt(b.i8, 0), "s_match");
+    const s_match = emitClassTest(cg, bitmap_global, s_ch);
 
     const scalar_next = b.add(scalar_pos_phi, b.constInt(b.i64, 1), "s_next");
     const scalar_body_end = b.getCurrentBlock();
@@ -1005,26 +1085,12 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
     b.addIncoming(scalar_final, &.{ scalar_pos_phi, scalar_pos_phi }, &.{ scalar_loop, scalar_body_end });
     _ = b.br(exit);
 
-    // ── exit: merge results ──
     b.positionAtEnd(exit);
     const final_pos = b.phi(b.i64, "simd_final");
     b.addIncoming(final_pos, &.{ find_end_pos, scalar_final }, &.{ find_end, scalar_exit });
-
-    // The (inlined) silent rules around the class failed at final_pos
-    try emitHwmChain(cg, final_pos, hwm_chain);
-
-    // For '+' repetition, we need at least one match
-    if (rep_kind == '+') {
-        const no_match = b.icmp(.eq, final_pos, start_pos, "no_match");
-        const ok_block = try b.newBlock("simd_ok");
-        _ = b.condBr(no_match, fail_block, ok_block);
-        b.positionAtEnd(ok_block);
-        return final_pos;
-    }
-
-    return final_pos;
+    _ = b.ret(final_pos);
+    return func;
 }
-
 fn ruleIndex(cg: *const Codegen, name: []const u8) ?usize {
     for (cg.grammar.rules, 0..) |rule, i| {
         if (std.mem.eql(u8, rule.name, name)) return i;
