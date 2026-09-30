@@ -2066,6 +2066,26 @@ const GrammarParser = struct {
         return .{ .value = list };
     }
 
+    /// The `-> name` action of each rule, by rule id (None for a rule without one).
+    pub fn actions(self: *GrammarParser) pyoz.Signature(?*pyoz.PyObject, "list[str | None]") {
+        const compiled = self._compiled orelse {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
+            return .{ .value = null };
+        };
+        const list = py.c.PyList_New(@intCast(compiled.action_names.len)) orelse return .{ .value = null };
+        for (compiled.action_names, 0..) |name, i| {
+            const item = if (name.len == 0) blk: {
+                py.Py_IncRef(py.Py_None());
+                break :blk py.Py_None();
+            } else py.PyUnicode_FromStringAndSize(name.ptr, @intCast(name.len)) orelse {
+                py.Py_DecRef(list);
+                return .{ .value = null };
+            };
+            _ = py.c.PyList_SetItem(list, @intCast(i), item);
+        }
+        return .{ .value = list };
+    }
+
     /// Names of the grammar's labels, in order of first use.
     pub fn fields(self: *GrammarParser) pyoz.Signature(?*pyoz.PyObject, "list[str]") {
         const tbl = self.ruleTable() catch {
@@ -2097,6 +2117,7 @@ const GrammarParser = struct {
     pub const bind__doc__: [*:0]const u8 = "Supply the classes named by `-> Class` actions: a dict, or an object with them as attributes (a module).";
     pub const bind__params__ = "ast";
     pub const parse_ast__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and convert the tree to values as the rules' `-> name` actions say. Objects built by `-> Class` get __zspan__ = (start, end) and __znode__ = the node's index, unless spans=False. Raises ParseError on failure.";
+    pub const actions__doc__: [*:0]const u8 = "The `-> name` action of each rule, by rule id: a built-in, a class name, or None for a rule without an action.";
     pub const fields__doc__: [*:0]const u8 = "Names of the grammar's labels (label:rule), in order of first use.";
     pub const matches__doc__: [*:0]const u8 = "Does the whole input match the grammar? Several times faster than parse(): builds no tree. On False, `error` explains the rejection. start= names the start rule.";
     pub const error__doc__: [*:0]const u8 = "ParseError from the last failed parse (message, line, column, offset), or None.";

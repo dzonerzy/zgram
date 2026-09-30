@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Precise syntax errors:** a missing `;` or `)` is reported where it was expected, as `expected ';'` or `expected ',' or ')'`, instead of at the start of the enclosing rule; a rule that failed where it started is expected by name, the outermost one (`expected expr`). A failed parse is re-run in an interpreter to find the furthest failure; successful parses are unaffected.
 - **Display names:** `expr "expression" = ...` makes error messages say `expected expression` instead of the rule's name.
 - **`-> Name()`** calls a class with no arguments, for rules such as `break_stmt` that carry no information.
+- **`parser.actions()`** lists each rule's `-> name` action.
 - **`compile_async(grammar, ast=None)`** accepts `ast`, like `compile()`.
 - **`examples/tiny`:** a small language (grammar, AST, interpreter, diagnostics) built on the features above.
 - **Up to 4096 rules** per grammar (was 256).

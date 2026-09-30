@@ -444,3 +444,8 @@ class TestDeepAndWide:
     def test_deep(self):
         p = zgram.compile("v = '[' v ']' | num -> first\nnum = [0-9]+ -> int")
         assert p.parse_ast("[" * 500 + "7" + "]" * 500) == 7
+
+
+def test_actions():
+    p = zgram.compile("pair = k:word '=' v:num -> Pair\nword = [a-z]+\nnum = [0-9]+ -> int\n@silent ws = ' '*")
+    assert p.actions() == ["Pair", None, "int", None]
