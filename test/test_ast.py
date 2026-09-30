@@ -449,3 +449,13 @@ class TestDeepAndWide:
 def test_actions():
     p = zgram.compile("pair = k:word '=' v:num -> Pair\nword = [a-z]+\nnum = [0-9]+ -> int\n@silent ws = ' '*")
     assert p.actions() == ["Pair", None, "int", None]
+
+
+def test_literals():
+    # every literal once, in order of first appearance, lookaheads included
+    p = zgram.compile(
+        "stmt = 'let' ws name ws '=' ws num ws ';' | 'if' ws name ws '{' ws stmt* ws '}'\n"
+        "name = !('let' | 'if') [a-z]+\nnum = [0-9]+ ('.' [0-9]+)?\n@silent ws = (' ' | 'é')*"
+    )
+    assert p.literals() == ["let", "=", ";", "if", "{", "}", ".", " ", "é"]
+    assert zgram.compile("a = [a-z]+").literals() == []
