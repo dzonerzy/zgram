@@ -5,7 +5,7 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-09-30
 
 First release on PyPI, as **`zgram-py`** (`pip install zgram-py`; the module is still `import zgram`). Wheels are abi3 (CPython 3.10+) for x86_64 Linux (manylinux_2_17) and x86_64 Windows.
 
