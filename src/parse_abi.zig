@@ -163,6 +163,10 @@ pub const ParseOutput = extern struct {
     /// place outside them: an unclosed `(` in the broken text)
     scan_start: u64 = 0,
     scan_ignoring_opens: bool = false,
+    /// Brackets of each kind ( [ { open in the input before bal_pos (a
+    /// running count, for telling a stray closing bracket)
+    bal_pos: u64 = 0,
+    bal: [3]i32 = .{ 0, 0, 0 },
     /// The furthest place a literal that could be inserted was missing: a
     /// more precise position for an error than the furthest failed rule
     /// (where `=` was missing, rather than where the statement began)
@@ -177,6 +181,20 @@ pub const ParseOutput = extern struct {
     recovered: ?[*]Recovered = null,
     recovered_count: u32 = 0,
     recovered_capacity: u32 = 0,
+    /// Each literal inserted, where: the precise place of the error it was
+    /// inserted for (which may be before the whitespace in front of it). A
+    /// caller-provided buffer, filled while there's room; backtracking may
+    /// drop insertions listed here.
+    inserted: ?[*]Inserted = null,
+    inserted_count: u32 = 0,
+    inserted_capacity: u32 = 0,
+};
+
+/// A literal recovery took as present (zero-width) at `pos`
+pub const Inserted = extern struct {
+    pos: u32,
+    len: u32,
+    text: [*]const u8,
 };
 
 /// An error node's start, and the rule the broken element begins with

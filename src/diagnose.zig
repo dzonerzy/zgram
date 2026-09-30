@@ -55,6 +55,19 @@ pub const Result = struct {
     expected: [MAX_EXPECTED]Expected = undefined,
     count: usize = 0,
 
+    /// Is the literal `lit` among what was expected?
+    pub fn expects(self: *const Result, lit: []const u8) bool {
+        var buf: [48]u8 = undefined;
+        var w = Writer{ .buf = &buf };
+        w.put("'");
+        for (lit) |ch| w.putChar(ch, '\'');
+        w.put("'");
+        for (self.expected[0..self.count]) |*e| {
+            if (e.is_literal and std.mem.eql(u8, e.text(), w.buf[0..w.len])) return true;
+        }
+        return false;
+    }
+
     /// "expected ';'", "expected ',' or ')'", "expected expr, ',' or ';'".
     /// Character classes are left out when a literal or a rule is expected too.
     pub fn message(self: *const Result, buf: []u8) []const u8 {

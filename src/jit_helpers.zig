@@ -93,6 +93,33 @@ pub export fn zgram_recover_error(output: *abi.ParseOutput, start: u64, reach: u
     return known[lo];
 }
 
+/// May a literal missing at `pos` be inserted there? Yes if a known error is
+/// there, or separated from it by whitespace only: the furthest failure is
+/// often just before or after the whitespace in front of the literal (the
+/// space before `->` where `)` is missing). 1 or 0; an insertion is noted
+/// (ParseOutput.inserted) with the literal, `text`.
+pub export fn zgram_insert_here(output: *abi.ParseOutput, input_ptr: [*]const u8, pos: u64, text: [*]const u8, len: u32) callconv(.c) i32 {
+    const known = (output.known_errors orelse return 0)[0..output.known_count];
+    const at = std.sort.lowerBound(u32, known, @as(u32, @intCast(pos)), orderU32);
+    const near = (at < known.len and allSpace(input_ptr[pos..known[at]])) or
+        (at > 0 and allSpace(input_ptr[known[at - 1]..pos]));
+    if (!near) return 0;
+    if (output.inserted) |list| {
+        if (output.inserted_count < output.inserted_capacity) {
+            list[output.inserted_count] = .{ .pos = @intCast(pos), .len = len, .text = text };
+            output.inserted_count += 1;
+        }
+    }
+    return 1;
+}
+
+fn allSpace(text: []const u8) bool {
+    for (text) |ch| {
+        if (ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n') return false;
+    }
+    return true;
+}
+
 fn orderU32(a: u32, b: u32) std.math.Order {
     return std.math.order(a, b);
 }
@@ -103,6 +130,33 @@ fn opens(ch: u8) bool {
 
 fn closes(ch: u8) bool {
     return ch == ')' or ch == ']' or ch == '}';
+}
+
+/// Is the closing bracket at `p` stray: no bracket of its kind open before
+/// it in the input? The construct around a repetition can't be what it
+/// closes, so recovery doesn't stop there. (A running count, from where the
+/// last question was asked: recovery mostly moves forward.)
+fn isStray(output: *abi.ParseOutput, input_ptr: [*]const u8, p: u64) bool {
+    if (p < output.bal_pos) {
+        output.bal_pos = 0;
+        output.bal = .{ 0, 0, 0 };
+    }
+    for (input_ptr[output.bal_pos..p]) |ch| switch (ch) {
+        '(' => output.bal[0] += 1,
+        '[' => output.bal[1] += 1,
+        '{' => output.bal[2] += 1,
+        ')' => output.bal[0] -= 1,
+        ']' => output.bal[1] -= 1,
+        '}' => output.bal[2] -= 1,
+        else => {},
+    };
+    output.bal_pos = p;
+    const kind: usize = switch (input_ptr[p]) {
+        ')' => 0,
+        ']' => 1,
+        else => 2,
+    };
+    return output.bal[kind] <= 0;
 }
 
 /// A letter, digit or `_`: resuming between two of them would split a word
@@ -138,7 +192,8 @@ pub export fn zgram_recover_step(output: *abi.ParseOutput, input_ptr: [*]const u
         while (p < input_len) {
             const ch = input_ptr[p];
             if (depth == 0) {
-                if (closes(ch)) return -@as(i64, @intCast(p)) - 1;
+                // (a stray one, which nothing before it opened, is skipped)
+                if (closes(ch) and !isStray(output, input_ptr, p)) return -@as(i64, @intCast(p)) - 1;
                 output.scan_pos = p + 1;
                 output.scan_depth = if (opens(ch) and !output.scan_ignoring_opens) 1 else 0;
                 // Not in the middle of a word

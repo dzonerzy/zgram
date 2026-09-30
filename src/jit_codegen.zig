@@ -106,6 +106,12 @@ const Codegen = struct {
     vrule_fns: []LB.Value = &.{},
     probe_silent: []const bool = &.{},
     probe_alloc: []const bool = &.{},
+    /// Recover mode: which rules can match without consuming input
+    nullable: []const bool = &.{},
+    /// The body of the `*` / `+` repetition being emitted (emitSequence)
+    rep_body: ?*const gp.Expr = null,
+    helper_insert_here: LB.Value = null,
+    helper_insert_here_type: LB.Type = null,
     helper_recover_error: LB.Value = null,
     helper_recover_error_type: LB.Type = null,
     helper_recover_begin: LB.Value = null,
@@ -237,6 +243,8 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
     const probe_alloc = allocator.alloc(bool, vrule_fns.len) catch return CodegenError.OutOfMemory;
     defer allocator.free(probe_alloc);
     @memset(probe_alloc, false);
+    const nullable: []const bool = if (mode == .recover) try computeNullable(allocator, grammar) else &.{};
+    defer if (mode == .recover) allocator.free(nullable);
     for (vrule_fns, 0..) |*f, i| {
         const name = std.fmt.allocPrintSentinel(allocator, "vrule_{d}", .{i}, 0) catch return CodegenError.OutOfMemory;
         defer allocator.free(name);
@@ -257,16 +265,20 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
     const helper_recover_step_type = b.fnType(b.i64, &.{ b.ptr, b.ptr, b.i64 });
     // i32 zgram_error_node(ptr output, i64 start, i64 end, i32 rule)
     const helper_error_node_type = b.fnType(b.i32, &.{ b.ptr, b.i64, b.i64, b.i32 });
+    // i32 zgram_insert_here(ptr output, ptr input, i64 pos, ptr text, i32 len)
+    const helper_insert_here_type = b.fnType(b.i32, &.{ b.ptr, b.ptr, b.i64, b.ptr, b.i32 });
     var helper_recover_error: LB.Value = null;
     var helper_recover_begin: LB.Value = null;
     var helper_recover_step: LB.Value = null;
     var helper_error_node: LB.Value = null;
+    var helper_insert_here: LB.Value = null;
     if (mode == .recover) {
         helper_recover_error = b.addFunction("zgram_recover_error", helper_recover_error_type);
         helper_recover_begin = b.addFunction("zgram_recover_begin", helper_recover_begin_type);
         helper_recover_step = b.addFunction("zgram_recover_step", helper_recover_step_type);
         helper_error_node = b.addFunction("zgram_error_node", helper_error_node_type);
-        for ([_]LB.Value{ helper_recover_error, helper_recover_begin, helper_recover_step, helper_error_node }) |h| b.addFnAttr(h, "nounwind");
+        helper_insert_here = b.addFunction("zgram_insert_here", helper_insert_here_type);
+        for ([_]LB.Value{ helper_recover_error, helper_recover_begin, helper_recover_step, helper_error_node, helper_insert_here }) |h| b.addFnAttr(h, "nounwind");
     }
 
     // Generate each rule function body (and in recover mode, each validator copy)
@@ -303,6 +315,9 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
             .vrule_fns = vrule_fns,
             .probe_silent = probe_silent,
             .probe_alloc = probe_alloc,
+            .nullable = nullable,
+            .helper_insert_here = helper_insert_here,
+            .helper_insert_here_type = helper_insert_here_type,
             .helper_recover_error = helper_recover_error,
             .helper_recover_error_type = helper_recover_error_type,
             .helper_recover_begin = helper_recover_begin,
@@ -900,19 +915,68 @@ fn emitReference(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
 fn emitSequence(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
     const children = expr.children orelse return CodegenError.InvalidGrammar;
     var cur_pos = pos;
-    for (children, 0..) |child, i| {
+    // Whether an earlier item must have consumed input
+    var started = false;
+    // The items of a list: `(ws ',' ws item)*`
+    const repeated = cg.rep_body == expr;
+    for (children) |child| {
         // Recover mode: a literal after the start of a sequence (a closing
-        // `}`, a `;`, an `=`) that's missing exactly at a known error is
-        // taken as there, zero-width, so what surrounds it keeps its
-        // structure. The first item decides whether the sequence applies at
-        // all, so it is never made up.
-        if (cg.mode == .recover and i > 0 and child.tag == .literal) {
+        // `}`, a `;`, an `=`) that's missing at a known error is taken as
+        // there, zero-width, so what surrounds it keeps its structure. The
+        // first item that consumes input decides whether the sequence
+        // applies at all, so it is never made up: in `(ws ':' ws type)?`
+        // that's the `:`, and inventing it would turn whatever follows into
+        // a type. Except a list's separator, punctuation that starts each
+        // repetition: `f(a 2)` is missing a `,`.
+        // Nor is an opening bracket inserted: `(` would start a construct
+        // that then needs its own closing one (`a 2)` read as a call `a (2)`)
+        const insertable = child.tag == .literal and !opensBracket(child.literal_value orelse "") and
+            (started or (repeated and isPunctuation(child.literal_value orelse "")));
+        if (cg.mode == .recover and insertable) {
             cur_pos = try emitInsertableLiteral(cg, child, cur_pos, fail_block);
         } else {
             cur_pos = try emitExpr(cg, child, cur_pos, fail_block);
         }
+        if (cg.mode == .recover and !started) started = consumes(cg, child);
     }
     return cur_pos;
+}
+
+/// Is `lit` punctuation only (`,`, `;`, `|`), no word?
+fn isPunctuation(lit: []const u8) bool {
+    if (lit.len == 0) return false;
+    for (lit) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80) return false;
+    }
+    return true;
+}
+
+/// Does `lit` open a bracket it doesn't close (`(`, `[`, `{`, `f(`)?
+fn opensBracket(lit: []const u8) bool {
+    var depth: i32 = 0;
+    for (lit) |ch| switch (ch) {
+        '(', '[', '{' => depth += 1,
+        ')', ']', '}' => depth -= 1,
+        else => {},
+    };
+    return depth > 0;
+}
+
+/// Must `expr` consume input to match? (See computeNullable.)
+fn consumes(cg: *const Codegen, expr: *const gp.Expr) bool {
+    return switch (expr.tag) {
+        .literal => if (expr.literal_value) |lit| lit.len != 0 else false,
+        .char_class, .any_char => true,
+        .reference => if (ruleIndex(cg, expr.ref_name orelse "")) |r| !cg.nullable[r] else false,
+        .sequence => for (expr.children orelse &.{}) |child| {
+            if (consumes(cg, child)) break true;
+        } else false,
+        .alternative => for (expr.children orelse &.{}) |child| {
+            if (!consumes(cg, child)) break false;
+        } else true,
+        .repetition => expr.rep_kind == '+' and consumes(cg, expr.rep_expr orelse return false),
+        .not_predicate, .and_predicate => false,
+    };
 }
 
 /// A literal that recovery may insert: see emitSequence.
@@ -939,10 +1003,12 @@ fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail
     const text_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_LIT_TEXT)}, "ins_text_ptr");
     const len_cur = b.load(b.i32, len_ptr, 4, "ins_len_cur");
     const text_cur = b.load(b.ptr, text_ptr, 8, "ins_text_cur");
-    _ = b.store(b.select(further, b.constInt(b.i32, @intCast(text.len)), len_cur, "ins_len_new"), len_ptr, 4);
-    _ = b.store(b.select(further, b.addGlobalString("ins_lit", text), text_cur, "ins_text_new"), text_ptr, 8);
-    const err = b.call(cg.helper_recover_error_type, cg.helper_recover_error, &.{ cg.output_ptr, pos, pos }, "ins_err");
-    _ = b.condBr(b.icmp(.sge, err, b.constSInt(b.i64, 0), "ins_known"), inserted, fail_block);
+    const text_global = b.addGlobalString("ins_lit", text);
+    const text_len = b.constInt(b.i32, @intCast(text.len));
+    _ = b.store(b.select(further, text_len, len_cur, "ins_len_new"), len_ptr, 4);
+    _ = b.store(b.select(further, text_global, text_cur, "ins_text_new"), text_ptr, 8);
+    const here = b.call(cg.helper_insert_here_type, cg.helper_insert_here, &.{ cg.output_ptr, cg.input_ptr, pos, text_global, text_len }, "ins_here");
+    _ = b.condBr(b.icmp(.ne, here, b.constInt(b.i32, 0), "ins_known"), inserted, fail_block);
 
     b.positionAtEnd(inserted);
     _ = b.br(merge);
@@ -1759,6 +1825,10 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
     const needs_nc_save = exprAllocatesNodes(cg, sub);
     const always_consumes = exprAlwaysConsumes(sub);
     const rec = kind != '?' and recovers(cg, sub);
+    // (a list's separator may be inserted: see emitSequence)
+    const saved_rep_body = cg.rep_body;
+    cg.rep_body = if (kind != '?') sub else null;
+    defer cg.rep_body = saved_rep_body;
 
     if (kind == '?') {
         // Optional: try once, succeed either way
@@ -2414,6 +2484,44 @@ fn computeCycleBreakers(allocator: Allocator, grammar: *const gp.Grammar) Codege
         }
     }
     return breakers;
+}
+
+/// Which rules can match without consuming input (whitespace, optional parts).
+fn computeNullable(allocator: Allocator, grammar: *const gp.Grammar) CodegenError![]bool {
+    const nullable = allocator.alloc(bool, grammar.rules.len) catch return CodegenError.OutOfMemory;
+    @memset(nullable, false);
+    var index: std.StringHashMapUnmanaged(usize) = .empty;
+    defer index.deinit(allocator);
+    for (grammar.rules, 0..) |rule, i| index.put(allocator, rule.name, i) catch return CodegenError.OutOfMemory;
+    // Only ever turns false into true: at most one pass per rule
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (grammar.rules, 0..) |rule, i| {
+            if (!nullable[i] and exprNullable(rule.expr, &index, nullable)) {
+                nullable[i] = true;
+                changed = true;
+            }
+        }
+    }
+    return nullable;
+}
+
+/// Can `expr` match without consuming input, given what's known of the rules?
+fn exprNullable(expr: *const gp.Expr, index: *const std.StringHashMapUnmanaged(usize), nullable: []const bool) bool {
+    return switch (expr.tag) {
+        .literal => if (expr.literal_value) |lit| lit.len == 0 else true,
+        .char_class, .any_char => false,
+        .reference => if (index.get(expr.ref_name orelse "")) |r| nullable[r] else false,
+        .sequence => for (expr.children orelse &.{}) |child| {
+            if (!exprNullable(child, index, nullable)) break false;
+        } else true,
+        .alternative => for (expr.children orelse &.{}) |child| {
+            if (exprNullable(child, index, nullable)) break true;
+        } else false,
+        .repetition => expr.rep_kind != '+' or exprNullable(expr.rep_expr orelse return true, index, nullable),
+        .not_predicate, .and_predicate => true,
+    };
 }
 
 /// How big a validator function may get with the rules it uses inlined into

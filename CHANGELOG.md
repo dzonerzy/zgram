@@ -5,6 +5,20 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-10-01
+
+### Fixed
+Error recovery (`recover=True`) made nonsense trees or messages in some cases:
+- **An invented first item.** `let end start.plus(3);`, with the grammar's `(ws ':' ws type)?`, had a `:` inserted (the `ws` before it counted as the sequence's first item), which made `start` a type and broke the rest of the statement. The first item of a sequence that consumes input is now never inserted, except a list's punctuation separator (`f(a 2)` still gets its `,`).
+- **An invented opening bracket.** `f a, 2)` had a `(` inserted after `a`, starting a call that then needed closing. Opening brackets are never inserted.
+- **A missing closer before whitespace.** `fn f(a -> int {`: the furthest failure is at the space before `->`, the `)` is missing after it, and the function fell apart into three errors. A literal is now inserted when a known error is only whitespace away, and the error is reported where the literal is missing.
+- **A stray closing bracket ended recovery.** A `)` that nothing opened stopped skipping and made the rest of the file one error node. Stray closers are now skipped.
+- **Messages.** The error `parse()` raises is now always among the recovered errors, with the same position and message (and `parser.error` is it): it is diagnosed the way `parse()` does, from the start of the input. Errors where a literal was inserted are diagnosed from the node that expected it (a missing `end` says `expected ... or 'end'`, not just what the block inside could contain).
+
+### Performance
+- The recovering parser compiles in about half the time (240 to 120 ms for the benchmark grammar): its probe copies of the rules are no longer forced inline.
+- Recovering from errors now diagnoses the first one from the start of the input, as a failing `parse()` does: about 2 ms for an error 50 KB into a file.
+
 ## [0.3.1] - 2026-10-01
 
 ### Fixed

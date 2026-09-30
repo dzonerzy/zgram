@@ -26,6 +26,7 @@ extern fn zgram_recover_error(output: *abi.ParseOutput, start: u64, reach: u64) 
 extern fn zgram_recover_begin(output: *abi.ParseOutput, input_ptr: [*]const u8, start: u64, err: u64) callconv(.c) void;
 extern fn zgram_recover_step(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: u64) callconv(.c) i64;
 extern fn zgram_error_node(output: *abi.ParseOutput, start: u64, end: u64, rule: u32) callconv(.c) i32;
+extern fn zgram_insert_here(output: *abi.ParseOutput, input_ptr: [*]const u8, pos: u64, text: [*]const u8, len: u32) callconv(.c) i32;
 
 // X86 target init (macro-generated in Target.h, must declare manually)
 extern fn LLVMInitializeX86TargetInfo() void;
@@ -100,7 +101,8 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
     else
         0;
 
-    var syms: [14]c.LLVMOrcCSymbolMapPair = .{
+    var syms: [15]c.LLVMOrcCSymbolMapPair = .{
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_insert_here"), .Sym = .{ .Address = @intFromPtr(&zgram_insert_here), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_recover_error"), .Sym = .{ .Address = @intFromPtr(&zgram_recover_error), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_recover_begin"), .Sym = .{ .Address = @intFromPtr(&zgram_recover_begin), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_recover_step"), .Sym = .{ .Address = @intFromPtr(&zgram_recover_step), .Flags = exported_flags } },

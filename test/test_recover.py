@@ -160,6 +160,122 @@ class TestInsertion:
         t = parser.parse_tree("a = 1;", recover=True)
         assert all(n.rule() != "let_stmt" for n in t.root)
 
+    def test_a_list_separator(self, parser):
+        t = parser.parse_tree("let c = f(a 2);", recover=True)
+        call = t.root[0].get("value")
+        assert [(n.rule(), n.text()) for n in call] == [("ident", "f"), ("ident", "a"), ("num", "2")]
+        assert errors(t) == [(1, 13, "expected binop, ',' or ')'")]
+
+
+# Optional parts that begin with whitespace, a parameter list, a return type
+TYPED = r"""
+program = ws (stmt ws)*
+@silent stmt = let_stmt | fn_def | expr_stmt
+let_stmt = 'let' kw ws name:ident (ws ':' ws type:ident)? (ws '=' ws value:expr)? ws ';'
+fn_def = 'fn' kw ws name:ident ws '(' ws (params:ident (ws ',' ws params:ident)*)? ws ')' (ws '->' ws returns:ident)? ws block
+block = '{' ws (stmt ws)* '}'
+@silent expr_stmt = expr ws ';'
+@left expr = left:atom (ws op:binop ws right:atom)*
+binop = [+*]
+@silent atom = call | num | ident
+call = name:ident '(' ws (args:expr (ws ',' ws args:expr)*)? ws ')'
+num = [0-9]+
+ident = !(('let' | 'fn') kw) [a-z]+
+@silent kw = ![a-z]
+@silent ws = [ \n]*
+"""
+
+
+@pytest.fixture(scope="module")
+def typed():
+    return zgram.compile(TYPED)
+
+
+class TestWhatIsInserted:
+    def test_not_what_begins_an_optional_part(self, typed):
+        # `:` begins the optional type after the whitespace: inventing it
+        # would make `start` a type and leave `.plus` unparseable
+        t = typed.parse_tree("let a = 1;\nlet b start;\nlet c = 3;\n", recover=True)
+        assert [(n.rule(), n.text()) for n in t.root] == [("let_stmt", "let a = 1;"), ("let_stmt", "let b "), ("ident", "start"), ("let_stmt", "let c = 3;")]
+        assert len(t.errors) == 1
+
+    def test_a_closing_bracket_before_whitespace(self, typed):
+        # the furthest failure is at the space before `->`; the `)` is missing after it
+        src = "fn f(a, b -> c {\n  a;\n}\nlet x = 1;\n"
+        t = typed.parse_tree(src, recover=True)
+        fn = t.root[0]
+        assert fn.rule() == "fn_def" and [n.rule() for n in fn] == ["ident", "ident", "ident", "ident", "block"]
+        assert [n.rule() for n in t.root] == ["fn_def", "let_stmt"]
+        assert errors(t) == [(1, 11, "expected ',' or ')'")]
+
+    def test_never_an_opening_bracket(self, typed):
+        # `f a` doesn't become the call `f(a`; the stray `)` is skipped, and
+        # the next statement parses
+        t = typed.parse_tree("let x = f a, 2);\nlet y = 1;\n", recover=True)
+        assert t.root.find("call") == []
+        assert (t.root[-1].rule(), t.root[-1].text()) == ("let_stmt", "let y = 1;")
+
+    def test_a_stray_closing_bracket_doesnt_end_the_file(self, parser):
+        t = parser.parse_tree("let a = 1;\n) }\nlet b = 2;\n", recover=True)
+        assert [(n.rule(), n.text()) for n in t.root] == [("let_stmt", "let a = 1;"), ("<error>", ") }\n"), ("let_stmt", "let b = 2;")]
+
+
+class TestFirstErrorIsTheParseError:
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "let a = ;",
+            "let a = 1\nlet b = 2;",
+            "let a 1;",
+            "if a { let b = 2;\n",
+            "let c = f(a 2);",
+            "let c = f(1, ;\nlet b = 2;",
+            "x = 1;\nlet y = 2;",
+            "let a = (1 + ;\nlet b = 2;\n",
+            "if a {\n  let x = ;\n",
+        ],
+    )
+    def test_same_position_and_message(self, parser, src):
+        with pytest.raises(zgram.ParseError) as raised:
+            parser.parse(src)
+        first = parser.parse_tree(src, recover=True).errors[0]
+        assert (first.line, first.column, first.message) == (raised.value.line, raised.value.column, raised.value.message)
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "fn f(a, b -> c {\n  a;\n}\n",
+            "let b start;\n",
+            "let a: = 1;\n",
+            "fn f(a b) { a; }\n",
+            "fn f(a) -> { a; }\n",
+        ],
+    )
+    def test_same_with_optional_parts(self, typed, src):
+        with pytest.raises(zgram.ParseError) as raised:
+            typed.parse(src)
+        first = typed.parse_tree(src, recover=True).errors[0]
+        assert (first.line, first.column, first.message) == (raised.value.line, raised.value.column, raised.value.message)
+
+    @pytest.mark.parametrize("src", ["do x", "do x y", "do do x end", "do x end end"])
+    def test_same_with_keyword_blocks(self, src):
+        # a missing `end` is expected by the statement it ends, not the block inside
+        p = zgram.compile(
+            r"""
+            chunk = ws block
+            block = (stmt ws)*
+            @silent stmt = do_stmt | name
+            do_stmt = 'do' kw ws block 'end' kw
+            name = !('end' kw | 'do' kw) [a-z]+
+            @silent kw = ![a-z]
+            @silent ws = ' '*
+            """
+        )
+        with pytest.raises(zgram.ParseError) as raised:
+            p.parse(src)
+        first = p.parse_tree(src, recover=True).errors[0]
+        assert (first.line, first.column, first.message) == (raised.value.line, raised.value.column, raised.value.message)
+
 
 class TestSyncAnnotation:
     def test_recover_resumes_after_the_sync_point(self):
