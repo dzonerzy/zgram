@@ -1169,25 +1169,25 @@ pub const Module = pyoz.module(.{
 // Windows: run C++ static constructors
 // ============================================================================
 
-/// On Windows the .pyd's entry point is Zig's _DllMainCRTStartup, which
-/// doesn't run the C++ static constructors of the bundled LLVM libraries
-/// (the MinGW CRT entry point normally would). Without them every LLVM
-/// command-line option keeps a zero value instead of its default, which
-/// among other things makes LLVM loop forever uniquing value names. Zig's
-/// entry point calls root.DllMain, so run the constructors from there.
-pub const DllMain = if (builtin.os.tag == .windows) windows_init.DllMain else {};
+/// On Windows, Zig's own DLL entry point (std.start's _DllMainCRTStartup)
+/// doesn't initialize the C runtime or run C++ static constructors, so the
+/// bundled LLVM libraries would start with every command-line option zeroed
+/// (LLVM then loops forever uniquing value names). Declaring the entry point
+/// here makes Zig skip its own; ours hands over to the MinGW CRT's
+/// DllMainCRTStartup, which initializes the CRT, runs the constructors and
+/// then calls DllMain, as in any MinGW-built DLL.
+pub const _DllMainCRTStartup = if (builtin.os.tag == .windows) windows_entry.start else {};
 
-const windows_init = struct {
+const windows_entry = struct {
     const win = std.os.windows;
-    /// MinGW CRT (crt/gccmain.c): runs the global constructor list once
-    extern fn __main() callconv(.c) void;
+    extern fn DllMainCRTStartup(hinst: win.HINSTANCE, reason: win.DWORD, reserved: win.LPVOID) callconv(.winapi) win.BOOL;
 
-    fn DllMain(hinst: win.HINSTANCE, reason: win.DWORD, reserved: win.LPVOID) callconv(.winapi) win.BOOL {
-        _ = hinst;
-        _ = reserved;
-        const DLL_PROCESS_ATTACH = 1;
-        if (reason == DLL_PROCESS_ATTACH) __main();
-        return .TRUE;
+    fn start(hinst: win.HINSTANCE, reason: win.DWORD, reserved: win.LPVOID) callconv(.winapi) win.BOOL {
+        return DllMainCRTStartup(hinst, reason, reserved);
+    }
+
+    comptime {
+        if (builtin.os.tag == .windows) @export(&start, .{ .name = "_DllMainCRTStartup" });
     }
 };
 
