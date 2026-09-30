@@ -42,7 +42,7 @@ Compared to other Python parser generators:
 | pyparsing | Combinator | 102us (879x) | 2,017us (1552x) | 31,566us (1491x) |
 | lark | Earley | 634us (5478x) | 17,231us (13262x) | 373,682us (17653x) |
 
-Against the fastest parsing libraries in C++ and Rust, zgram builds a full parse tree faster than any of them builds theirs, on every input: Spirit X3 building the same flat node array takes 1.1-1.4x longer (5x on long strings), rust-peg with tree actions and the X3 and lexy typed ASTs 3-5x, and pest and PEGTL 12-19x. For pure validation without a tree, compile-time C++ (lexy, Spirit X3) is 1.1-1.7x faster than zgram on typical JSON; see [BENCHMARK.md](https://github.com/dzonerzy/zgram/blob/main/BENCHMARK.md). String-heavy input is where zgram's SIMD code shines: a 75 KB JSON document of long strings parses in 13us (6 GB/s).
+Against the fastest parsing libraries in C++ and Rust (Spirit X3, lexy, PEGTL, rust-peg, pest), zgram is the fastest in 15 of 16 benchmark comparisons across a JSON and an expression grammar, whether they build a parse tree or only validate: Spirit X3 building the same flat node array takes 1.3-1.7x longer on typical input, rust-peg with tree actions 3-10x, and for validation only (`matches()`) compile-time C++ takes 1.2-2.7x longer. The exception is a deeply nested expression tree, where Spirit X3 is 6% faster. See [BENCHMARK.md](https://github.com/dzonerzy/zgram/blob/main/BENCHMARK.md). String-heavy input is where zgram's SIMD code shines: a 75 KB JSON document of long strings parses in 10us (7.5 GB/s).
 
 > `json.loads` does **more** work (parses + builds Python dicts/lists). zgram returns a zero-copy parse tree.
 
@@ -206,6 +206,7 @@ tree = parser.parse("hello")
 
 - **`parse(input: str | bytes, start: str | None = None) -> Node`** -- Parse the whole input and return the root node. Raises `ParseError` on failure. `start` picks the start rule (default: the first rule). `bytes` input must be UTF-8 if you call `text()`.
 - **`match(input: str | bytes, start: str | None = None) -> Node | None`** -- Match the start rule at the beginning of the input without requiring it to consume everything (like `re.match`). The root node's `end()` is where the match stopped. Returns `None` if it doesn't match.
+- **`matches(input: str | bytes, start: str | None = None) -> bool`** -- Does the whole input match? Runs a separate validation-only parser that builds no tree (about 2x faster than `parse()`). On `False`, `error` explains the rejection. The validator is compiled on the first call (0.1-1 s depending on grammar size) and cached with the grammar.
 - **`rules() -> list[str]`** -- The grammar's rule names, in definition order.
 - **`error -> ParseErrorInfo | None`** -- Property with error details from the last failed `parse()`/`match()`.
 

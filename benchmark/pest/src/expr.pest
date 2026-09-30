@@ -1,0 +1,16 @@
+// Same grammar as zgram's expression benchmark: call is tried before ident.
+// Silent rules (_{ }) produce no pairs, so the pairs are zgram's tree nodes.
+expr    = { ws ~ sum ~ ws }
+text    = _{ SOI ~ expr ~ EOI }
+sum     = { product ~ (ws ~ addop ~ ws ~ product)* }
+product = { power ~ (ws ~ mulop ~ ws ~ power)* }
+power   = { unary ~ (ws ~ "^" ~ ws ~ power)? }
+unary   = { "-" ~ ws ~ unary | primary }
+primary = _{ number | call | ident | "(" ~ ws ~ sum ~ ws ~ ")" }
+call    = { ident ~ ws ~ "(" ~ ws ~ args? ~ ws ~ ")" }
+args    = _{ sum ~ (ws ~ "," ~ ws ~ sum)* }
+number  = { ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
+ident   = { (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+addop   = _{ "+" | "-" }
+mulop   = _{ "*" | "/" | "%" }
+ws      = _{ (" " | "\t" | "\n" | "\r")* }

@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 First release on PyPI, as **`zgram-py`** (`pip install zgram-py`; the module is still `import zgram`). Wheels are abi3 (CPython 3.10+) for x86_64 Linux (manylinux_2_17) and x86_64 Windows.
 
 ### Added
+- **`parser.matches(input, start=None) -> bool`**: validation without building a tree, through a separate parser compiled on first use (no nodes, no error tracking, every rule except one per recursion cycle inlined). About 2x faster than `parse()`, and faster than Spirit X3 and lexy validating the same input in the benchmarks. On rejection, `parser.error` explains why.
+- **Expression grammar benchmark** alongside JSON, and comparisons with Spirit X3, lexy, PEGTL, rust-peg, pest, PackCC and cpp-peglib, building trees and validating (BENCHMARK.md).
 - **`@memo` annotation** for packrat memoization of a rule: each rule runs at most once per input position, turning exponential backtracking into linear time (14 nesting levels of a classic ambiguous expression grammar: 56 ms → 0.014 ms). Results and errors are identical to the unmemoized grammar.
 - `a / b` is accepted as ordered choice, as documented (only `a | b` worked).
 - **`node.to_tuple(spans=False)`** builds the whole subtree as nested `(rule, text, children)` tuples in one native pass, 6-7x faster than walking it through the Node API.

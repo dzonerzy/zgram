@@ -126,3 +126,35 @@ for size in small medium large strings; do
     "$RUSTPEG_BIN" "$FILE" 2>&1
     echo ""
 done
+
+# ── Expression grammar ──
+for size in small medium large deep; do
+    FILE="$SCRIPT_DIR/data/expr_$size.txt"
+    BYTES=$(wc -c < "$FILE")
+    echo "============================================"
+    echo "  expr_$size.txt ($BYTES bytes)"
+    echo "============================================"
+    echo ""
+    "$ZGRAM_BIN" "$FILE" --expr 2>&1
+    echo ""
+    "$ZGRAM_BIN" "$FILE" --expr --validate 2>&1
+    echo ""
+    "$SCRIPT_DIR/rust-peg-tree/target/release/expr" "$FILE" 2>&1
+    echo ""
+    "$SCRIPT_DIR/rust-peg/target/release/expr" "$FILE" 2>&1
+    echo ""
+    "$SCRIPT_DIR/spirit-x3/build/spirit_x3_expr_bench" "$FILE" --tree 2>&1
+    echo ""
+    "$SCRIPT_DIR/spirit-x3/build/spirit_x3_expr_bench" "$FILE" 2>&1
+    echo ""
+    "$SCRIPT_DIR/lexy/build/lexy_expr_bench" "$FILE" --tree 2>&1
+    echo ""
+    "$SCRIPT_DIR/lexy/build/lexy_expr_bench" "$FILE" 2>&1
+    echo ""
+    "$SCRIPT_DIR/pegtl/build/pegtl_expr_bench" "$FILE" --tree 2>&1
+    echo ""
+    "$SCRIPT_DIR/pegtl/build/pegtl_expr_bench" "$FILE" 2>&1
+    echo ""
+    "$SCRIPT_DIR/pest/target/release/expr" "$FILE" 2>&1
+    echo ""
+done

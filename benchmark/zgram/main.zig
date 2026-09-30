@@ -26,6 +26,26 @@ const JSON_GRAMMAR =
     \\
 ;
 
+/// Arithmetic expressions: precedence levels, right-associative ^, unary
+/// minus, function calls. `call` is tried before `ident`, so every plain
+/// identifier is parsed, rejected as a call, and parsed again (backtracking).
+const EXPR_GRAMMAR =
+    \\expr    = ws sum ws
+    \\sum     = product (ws addop ws product)*
+    \\product = power (ws mulop ws power)*
+    \\power   = unary (ws '^' ws power)?
+    \\unary   = '-' ws unary | primary
+    \\@silent primary = number | call | ident | '(' ws sum ws ')'
+    \\call    = ident ws '(' ws args? ws ')'
+    \\@silent args = sum (ws ',' ws sum)*
+    \\number  = [0-9]+ ('.' [0-9]+)? ([eE] [+\-]? [0-9]+)?
+    \\ident   = [a-zA-Z_] [a-zA-Z0-9_]*
+    \\@silent addop = [+\-]
+    \\@silent mulop = [*/%]
+    \\@silent ws    = [ \t\n\r]*
+    \\
+;
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -34,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
-        std.debug.print("Usage: zgram_bench <json_file> [--validate]\n", .{});
+        std.debug.print("Usage: zgram_bench <input_file> [--validate] [--expr]\n", .{});
         std.process.exit(1);
     }
 
@@ -43,11 +63,16 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(input);
 
     // Compile grammar
-    std.debug.print("Compiling JSON grammar...\n", .{});
     // --validate: zgram's accept/reject-only parser (GrammarParser.matches),
     // which builds no tree, like validate-only parsers
-    const validate = args.len > 2 and std.mem.eql(u8, args[2], "--validate");
-    const grammar = try gp.parseGrammar(allocator, JSON_GRAMMAR);
+    var validate = false;
+    var expr = false;
+    for (args[2..]) |a| {
+        if (std.mem.eql(u8, a, "--validate")) validate = true;
+        if (std.mem.eql(u8, a, "--expr")) expr = true;
+    }
+    std.debug.print("Compiling {s} grammar...\n", .{if (expr) "expression" else "JSON"});
+    const grammar = try gp.parseGrammar(allocator, if (expr) EXPR_GRAMMAR else JSON_GRAMMAR);
     defer grammar.deinit(allocator);
 
     const codegen_result = try jc.generateModule(allocator, grammar, if (validate) .validate else .tree);
