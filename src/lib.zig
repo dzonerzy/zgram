@@ -87,6 +87,11 @@ const Compiled = struct {
     name_buf: []u8,
     refs: std.atomic.Value(u32) = .init(1),
 
+    /// Accept/reject-only parser, compiled on first use (see validator())
+    validate_fn: std.atomic.Value(?abi.ParseFn) = .init(null),
+    validate_resource: jit_compiler.ResourceHandle = null,
+    validate_lock: std.atomic.Value(bool) = .init(false),
+
     fn build(grammar_text: []const u8) !*Compiled {
         // Grammar IR and codegen scratch live only for this call
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -113,7 +118,7 @@ const Compiled = struct {
             off += r.name.len;
         }
 
-        const module = jit_codegen.generateModule(alloc, grammar) catch return error.CompilationFailed;
+        const module = jit_codegen.generateModule(alloc, grammar, .tree) catch return error.CompilationFailed;
         const jit = jit_compiler.jitCompile(module.module, module.context) catch return error.CompilationFailed;
 
         self.* = .{
@@ -131,8 +136,29 @@ const Compiled = struct {
         _ = self.refs.fetchAdd(1, .monotonic);
     }
 
+    /// The validator for this grammar, compiled on first call. Doesn't touch
+    /// Python, so it runs with the GIL released.
+    fn validator(self: *Compiled) !abi.ParseFn {
+        if (self.validate_fn.load(.acquire)) |f| return f;
+        while (self.validate_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+        defer self.validate_lock.store(false, .release);
+        if (self.validate_fn.load(.acquire)) |f| return f;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const grammar = try grammar_parser.parseGrammar(arena.allocator(), self.text);
+        const module = jit_codegen.generateModule(arena.allocator(), grammar, .validate) catch return error.CompilationFailed;
+        const jit = jit_compiler.jitCompile(module.module, module.context) catch return error.CompilationFailed;
+        self.validate_resource = jit.resource;
+        self.validate_fn.store(jit.parse_fn, .release);
+        return jit.parse_fn;
+    }
+
     fn release(self: *Compiled) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (self.validate_resource != null) jit_compiler.releaseGrammar(self.validate_resource);
         jit_compiler.releaseGrammar(self.resource);
         allocator.free(self.rule_names);
         allocator.free(self.name_buf);
@@ -927,6 +953,75 @@ const GrammarParser = struct {
         return self.run(args.value.input, args.value.start, abi.FLAG_PREFIX, false);
     }
 
+    /// Does the whole input match? Runs a separate accept/reject-only parser
+    /// (compiled on first use) that builds no tree and tracks no errors; on a
+    /// rejection, the tree parser runs once more to fill in `error`.
+    pub fn matches(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null })) pyoz.Signature(anyerror!?bool, "bool") {
+        return .{ .value = self.runValidate(args.value.input, args.value.start) };
+    }
+
+    fn runValidate(self: *GrammarParser, input: *pyoz.PyObject, start: ?*pyoz.PyObject) !?bool {
+        const compiled = self._compiled orelse return error.ParserNotLoaded;
+
+        var len: py.Py_ssize_t = 0;
+        const ptr: [*]const u8 = blk: {
+            if (py.PyUnicode_Check(input)) {
+                break :blk py.c.PyUnicode_AsUTF8AndSize(input, &len) orelse return null;
+            }
+            if (py.PyBytes_Check(input)) {
+                var p: [*]u8 = undefined;
+                if (py.PyBytes_AsStringAndSize(input, &p, &len) < 0) return null;
+                break :blk p;
+            }
+            py.PyErr_SetString(py.PyExc_TypeError(), "input must be str or bytes");
+            return null;
+        };
+        const input_len: usize = @intCast(len);
+        if (input_len > std.math.maxInt(u32)) return error.InputTooLarge;
+
+        var start_rule: u32 = 0;
+        if (start) |s| {
+            if (s != py.Py_None()) {
+                if (!py.PyUnicode_Check(s)) {
+                    py.PyErr_SetString(py.PyExc_TypeError(), "start must be a rule name (str)");
+                    return null;
+                }
+                var slen: py.Py_ssize_t = 0;
+                const sptr = py.c.PyUnicode_AsUTF8AndSize(s, &slen) orelse return null;
+                start_rule = compiled.ruleId(sptr[0..@intCast(slen)]) orelse {
+                    py.PyErr_SetString(py.PyExc_ValueError(), "unknown start rule");
+                    return null;
+                };
+            }
+        }
+
+        const validate = if (compiled.validate_fn.load(.acquire)) |f| f else try pyoz.allowThreadsTry(Compiled.validator, .{compiled});
+        var output = abi.ParseOutput{};
+        defer jit_helpers.memoFree(&output);
+        const rc = if (input_len >= GIL_RELEASE_BYTES)
+            pyoz.allowThreads(callParse, .{ validate, ptr, input_len, &output, start_rule, 0 })
+        else
+            validate(ptr, input_len, &output, start_rule, 0);
+        if (rc < 0) return error.ParseFailed;
+        if (output.status == 1) {
+            self._last_error = .{};
+            return true;
+        }
+
+        // Rejected: let the tree parser explain why (sets `error`). It
+        // agrees with the validator, so it returns no node; if it ever did,
+        // release the node's reference to its tree.
+        const node = self.run(input, start, 0, false) catch {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        if (node) |n| {
+            var owned = n;
+            owned._tree.clear();
+        }
+        return false;
+    }
+
     /// Exposed to Python as the `error` property (PyOZ maps get_X to property X).
     /// parse() raises automatically; this keeps the structured details around.
     pub fn get_error(self: *const GrammarParser) ?ParseError {
@@ -969,6 +1064,7 @@ const GrammarParser = struct {
     pub const parse__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes), which must match completely. start= names the start rule (default: the first). Returns the root Node, raises ParseError on failure.";
     pub const match__doc__: [*:0]const u8 = "Match the start rule at the beginning of the input without requiring it to consume everything. Returns the root Node (see end()), or None if it doesn't match.";
     pub const rules__doc__: [*:0]const u8 = "Names of the grammar's rules, in definition order.";
+    pub const matches__doc__: [*:0]const u8 = "Does the whole input match the grammar? Several times faster than parse(): builds no tree. On False, `error` explains the rejection. start= names the start rule.";
     pub const error__doc__: [*:0]const u8 = "ParseError from the last failed parse (message, line, column, offset), or None.";
 };
 
@@ -1007,7 +1103,7 @@ fn dumpIr(grammar_text: []const u8) !pyoz.Owned([]const u8) {
     const alloc = arena.allocator();
 
     const grammar = try grammar_parser.parseGrammar(alloc, grammar_text);
-    const result = jit_codegen.generateModule(alloc, grammar) catch return error.CompilationFailed;
+    const result = jit_codegen.generateModule(alloc, grammar, .tree) catch return error.CompilationFailed;
 
     // Print module to string, then dispose the module/context
     const LB = @import("llvm_builder.zig");

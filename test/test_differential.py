@@ -62,6 +62,13 @@ def zgram_result(parser, text):
         raise
 
 
+def error_of(parser):
+    """(offset, rule) or (offset,) for trailing input, from parser.error."""
+    e = parser.error
+    m = re.fullmatch(r"expected (\w+)", e.message())
+    return (e.offset(), m.group(1)) if m else (e.offset(),)
+
+
 def compile_or_skip(source):
     try:
         return zgram.compile(source)
@@ -94,6 +101,10 @@ def test_random_grammars_match_reference(seed):
             if got == ("nonodes",):
                 continue
             assert got == expected, f"grammar:\n{g.text()}input: {text!r}"
+            # The validator must agree, and leave the same error behind
+            assert plain.matches(text) == (expected[0] == "ok"), f"matches() grammar:\n{g.text()}input: {text!r}"
+            if expected[0] != "ok":
+                assert error_of(plain) == expected[1:], f"matches() error, grammar:\n{g.text()}input: {text!r}"
             assert zgram_result(memo, text) == expected, f"@memo grammar:\n{g.text(True)}input: {text!r}"
             compared += 1
     assert compared > 0

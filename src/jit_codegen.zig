@@ -22,6 +22,16 @@ pub const CodegenError = error{
     InvalidGrammar,
 };
 
+/// What the generated parser produces.
+pub const Mode = enum {
+    /// Build the parse tree and track the furthest failure for error messages
+    tree,
+    /// Only accept or reject: no nodes, no child counts, no error tracking
+    /// (callers re-run the tree parser to explain a rejection). Rules that
+    /// aren't part of a recursion cycle are inlined into their callers.
+    validate,
+};
+
 /// Result of code generation — pass both to jit_compiler.jitCompile().
 pub const CodegenResult = struct {
     module: LB.LLVMModuleRef,
@@ -68,11 +78,13 @@ const Codegen = struct {
     // Per rule: can calling it add nodes? True for non-silent rules and for
     // silent rules whose body references node-producing rules.
     alloc_flags: []const bool,
+
+    mode: Mode,
 };
 
 /// Generate an LLVM module from a parsed grammar.
 /// Returns module + context (caller passes to jit_compiler.jitCompile).
-pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenError!CodegenResult {
+pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mode) CodegenError!CodegenResult {
     var b = LB.Builder.init(allocator, "zgram_grammar");
 
     // Rule function type: i64 @rule_N(ptr input, i64 len, ptr output, i64 pos)
@@ -111,9 +123,10 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
         break :blk if (std.mem.indexOf(u8, std.mem.span(feats), "+avx2") != null) 32 else 16;
     };
 
-    // Compute silent flags
+    // Compute silent flags. A validator makes no nodes: every rule is silent.
     const silent_flags = try computeSilentFlags(allocator, grammar);
     defer allocator.free(silent_flags);
+    if (mode == .validate) @memset(silent_flags, true);
     const alloc_flags = try computeAllocFlags(allocator, grammar, silent_flags);
     defer allocator.free(alloc_flags);
 
@@ -155,6 +168,18 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
         }
     }
 
+    // A validator is small enough to inline every rule outside a recursion
+    // cycle into its callers, as compile-time parser generators do.
+    if (mode == .validate) {
+        const recursive = try computeRecursive(allocator, grammar);
+        defer allocator.free(recursive);
+        for (grammar.rules, 0..) |_, i| {
+            if (recursive[i]) continue;
+            b.addFnAttr(rule_fns[i], "alwaysinline");
+            if (body_fns[i] != rule_fns[i]) b.addFnAttr(body_fns[i], "alwaysinline");
+        }
+    }
+
     // Generate each rule function body
     for (grammar.rules, 0..) |rule, i| {
         var cg = Codegen{
@@ -179,6 +204,7 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar) CodegenE
             .child_count_ptr = undefined,
             .simd_width = simd_width,
             .alloc_flags = alloc_flags,
+            .mode = mode,
         };
         try emitRuleFunction(&cg, rule, @intCast(i), body_fns[i]);
     }
@@ -217,7 +243,15 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16, func: LB.V
     const hwm_max_pos_offset = abi.OFF_MAX_POS;
     const hwm_rule_id_offset = abi.OFF_MAX_POS_RULE_ID;
 
-    if (is_silent) {
+    if (cg.mode == .validate) {
+        // Validator: return the end position or -1, nothing else
+        cg.child_count_ptr = null;
+        const fail_block = try b.newBlock("fail");
+        const result_pos = try emitExpr(cg, rule.expr, pos_arg, fail_block);
+        _ = b.ret(result_pos);
+        b.positionAtEnd(fail_block);
+        _ = b.ret(b.constSInt(b.i64, -1));
+    } else if (is_silent) {
         // Silent rule: no node for itself, but track child count so the caller
         // can adopt this rule's non-silent children as its own direct children.
         // Return convention: (child_count << 32) | position on success, -1 on failure.
@@ -482,8 +516,6 @@ fn emitLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB
 /// Emit character class matching using 32-byte bitmap lookup.
 fn emitCharClass(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
     const b = cg.b;
-    const ranges = expr.char_ranges orelse return CodegenError.InvalidGrammar;
-    const negated = expr.char_negated;
 
     // Check: pos < input_len
     const in_bounds = b.icmp(.ult, pos, cg.input_len, "inb");
@@ -496,46 +528,7 @@ fn emitCharClass(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
     const byte_ptr = b.gep(b.i8, cg.input_ptr, &.{pos}, "cc_bptr");
     const ch = b.load(b.i8, byte_ptr, 1, "ch");
 
-    // Build the 32-byte bitmap at compile time
-    var bitmap: [32]u8 = [_]u8{0} ** 32;
-    for (ranges) |r| {
-        var cv: u16 = r.start;
-        while (cv <= r.end) : (cv += 1) {
-            bitmap[@as(u8, @truncate(cv)) >> 3] |= @as(u8, 1) << @as(u3, @truncate(@as(u8, @truncate(cv))));
-        }
-    }
-    if (negated) {
-        for (&bitmap) |*bv| bv.* = ~bv.*;
-    }
-
-    // Create bitmap as a global constant
-    var bitmap_consts: [32]LB.Value = undefined;
-    for (bitmap, 0..) |bv, idx| {
-        bitmap_consts[idx] = b.constInt(b.i8, bv);
-    }
-    const bitmap_val = b.constArray(b.i8, &bitmap_consts);
-    const bitmap_ty = b.arrayType(b.i8, 32);
-
-    const bitmap_name = std.fmt.allocPrintSentinel(b.allocator, "bitmap_{d}", .{b.block_counter}, 0) catch return CodegenError.OutOfMemory;
-    defer b.allocator.free(bitmap_name);
-    const bitmap_global = b.addGlobalConstant(bitmap_name, bitmap_ty, bitmap_val);
-
-    // byte_index = ch >> 3 (zero-extended to i64 for GEP)
-    const ch_i32 = b.zext(ch, b.i32, "ch32");
-    const byte_index = b.lshr(ch_i32, b.constInt(b.i32, 3), "bidx");
-    const byte_index_i64 = b.zext(byte_index, b.i64, "bidx64");
-
-    // GEP into bitmap: &bitmap[byte_index]
-    const bitmap_byte_ptr = b.gep(b.i8, bitmap_global, &.{byte_index_i64}, "bm_ptr");
-    const bitmap_byte = b.load(b.i8, bitmap_byte_ptr, 1, "bm_byte");
-
-    // bit_mask = 1 << (ch & 7)
-    const bit_pos = b.@"and"(ch, b.constInt(b.i8, 7), "bpos");
-    const bit_mask = b.shl(b.constInt(b.i8, 1), bit_pos, "bmask");
-
-    // result = bitmap_byte & bit_mask
-    const test_result = b.@"and"(bitmap_byte, bit_mask, "tst");
-    const is_match = b.icmp(.ne, test_result, b.constInt(b.i8, 0), "cc_match");
+    const is_match = try emitClassMatch(cg, expr, ch);
 
     const ok_block = try b.newBlock("cc_ok");
     _ = b.condBr(is_match, ok_block, fail_block);
@@ -580,6 +573,8 @@ fn emitReference(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
     const ok_block = try b.newBlock("ref_ok");
     _ = b.condBr(failed, fail_block, ok_block);
     b.positionAtEnd(ok_block);
+
+    if (cg.mode == .validate) return result;
 
     if (cg.silent_flags[rule_idx]) {
         // Silent rule packs child count in upper 32 bits: (cc << 32) | pos
@@ -855,6 +850,38 @@ fn classBitmapGlobal(cg: *Codegen, expr: *const gp.Expr) CodegenError!LB.Value {
     return b.addGlobalConstant(name, b.arrayType(b.i8, 32), b.constArray(b.i8, &bitmap_consts));
 }
 
+/// i1: is byte `ch` in `expr`'s character class? Uses the cheapest test for
+/// the class: one range compare for a single range ([0-9]), equality tests
+/// for up to 4 bytes ([ \t\n\r], [^"\\]), a bitmap lookup otherwise.
+fn emitClassMatch(cg: *Codegen, expr: *const gp.Expr, ch: LB.Value) CodegenError!LB.Value {
+    const b = cg.b;
+    const ranges = expr.char_ranges orelse return CodegenError.InvalidGrammar;
+    const negated = expr.char_negated;
+
+    var total: u32 = 0;
+    for (ranges) |r| total += @as(u32, r.end) - @as(u32, r.start) + 1;
+
+    if (ranges.len == 1 and total > 4) {
+        // (ch - lo) <= (hi - lo), unsigned
+        const off = b.sub(ch, b.constInt(b.i8, ranges[0].start), "cls_off");
+        const in_range = b.icmp(.ule, off, b.constInt(b.i8, ranges[0].end - ranges[0].start), "cls_in");
+        return if (negated) b.xor(in_range, b.constInt(b.i1, 1), "cls_not") else in_range;
+    }
+    if (total <= 4) {
+        var any: ?LB.Value = null;
+        for (ranges) |r| {
+            var cv: u16 = r.start;
+            while (cv <= r.end) : (cv += 1) {
+                const eq = b.icmp(.eq, ch, b.constInt(b.i8, cv), "cls_eq");
+                any = if (any) |a| b.@"or"(a, eq, "cls_or") else eq;
+            }
+        }
+        const m = any orelse b.constInt(b.i1, 0);
+        return if (negated) b.xor(m, b.constInt(b.i1, 1), "cls_not") else m;
+    }
+    return emitClassTest(cg, try classBitmapGlobal(cg, expr), ch);
+}
+
 /// i1: is byte `ch` in the class described by `bitmap_global`?
 fn emitClassTest(cg: *Codegen, bitmap_global: LB.Value, ch: LB.Value) LB.Value {
     const b = cg.b;
@@ -873,8 +900,7 @@ fn emitClassTest(cg: *Codegen, bitmap_global: LB.Value, ch: LB.Value) LB.Value {
 /// small enough for LLVM to inline.
 fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fail_block: LB.Block, rep_kind: u8, hwm_chain: []const u16) CodegenError!LB.Value {
     const b = cg.b;
-    const bitmap_global = try classBitmapGlobal(cg, expr);
-    const scan_fn = try simdScanFunction(cg, expr, bitmap_global);
+    const scan_fn = try simdScanFunction(cg, expr);
 
     const pre_header = try b.newBlock("scan_pre");
     const pre_bounds = try b.newBlock("scan_pre_bounds");
@@ -897,7 +923,7 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
 
     b.positionAtEnd(pre_body);
     const pre_ch = b.load(b.i8, b.gep(b.i8, cg.input_ptr, &.{pre_pos}, "pre_ptr"), 1, "pre_ch");
-    const pre_match = emitClassTest(cg, bitmap_global, pre_ch);
+    const pre_match = try emitClassMatch(cg, expr, pre_ch);
     const pre_next = b.add(pre_pos, b.constInt(b.i64, 1), "pre_next");
     _ = b.condBr(pre_match, pre_header, exit);
     b.addIncoming(pre_pos, &.{ start_pos, pre_next }, &.{ entry_block, pre_body });
@@ -931,7 +957,7 @@ fn emitSimdCharScan(cg: *Codegen, expr: *const gp.Expr, start_pos: LB.Value, fai
 ///   vec_body:  load <W x i8>, vector compare, all match? → vec_check, else → find_end
 ///   find_end:  bitcast mismatch mask to iW, cttz to find first mismatch offset
 ///   scalar_loop: one byte at a time for the tail (< W bytes)
-fn simdScanFunction(cg: *Codegen, expr: *const gp.Expr, bitmap_global: LB.Value) CodegenError!LB.Value {
+fn simdScanFunction(cg: *Codegen, expr: *const gp.Expr) CodegenError!LB.Value {
     const b = cg.b;
     const cls = classifySimd(expr);
 
@@ -1070,7 +1096,7 @@ fn simdScanFunction(cg: *Codegen, expr: *const gp.Expr, bitmap_global: LB.Value)
     const s_byte_ptr = b.gep(b.i8, cg.input_ptr, &.{scalar_pos_phi}, "s_bptr");
     const s_ch = b.load(b.i8, s_byte_ptr, 1, "s_ch");
 
-    const s_match = emitClassTest(cg, bitmap_global, s_ch);
+    const s_match = try emitClassMatch(cg, expr, s_ch);
 
     const scalar_next = b.add(scalar_pos_phi, b.constInt(b.i64, 1), "s_next");
     const scalar_body_end = b.getCurrentBlock();
@@ -1117,6 +1143,7 @@ fn resolveSilent(cg: *const Codegen, expr: *const gp.Expr, chain: *[8]u16, chain
 /// Record a failure of `rule_id` at `pos` in the high-water mark, exactly as
 /// the rule's own fail block would.
 fn emitHwmUpdate(cg: *Codegen, pos: LB.Value, rule_id: u16) CodegenError!void {
+    if (cg.mode == .validate) return;
     const b = cg.b;
     const hwm_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_MAX_POS)}, "hwm_ptr");
     const cur = b.load(b.i32, hwm_ptr, 4, "cur_hwm");
@@ -1679,6 +1706,47 @@ fn exprRefsAllocating(grammar: *const gp.Grammar, flags: []const bool, expr: *co
             return false;
         },
         .repetition => return exprRefsAllocating(grammar, flags, expr.rep_expr orelse return false),
+    }
+}
+
+/// Which rules can reach themselves through references (directly or not).
+fn computeRecursive(allocator: Allocator, grammar: *const gp.Grammar) CodegenError![]bool {
+    const n = grammar.rules.len;
+    const result = allocator.alloc(bool, n) catch return CodegenError.OutOfMemory;
+    @memset(result, false);
+    const seen = allocator.alloc(bool, n) catch return CodegenError.OutOfMemory;
+    defer allocator.free(seen);
+    var stack: std.ArrayList(usize) = .empty;
+    defer stack.deinit(allocator);
+    for (0..n) |start| {
+        @memset(seen, false);
+        stack.clearRetainingCapacity();
+        collectRefs(grammar, grammar.rules[start].expr, &stack, allocator) catch return CodegenError.OutOfMemory;
+        while (stack.pop()) |r| {
+            if (r == start) {
+                result[start] = true;
+                break;
+            }
+            if (seen[r]) continue;
+            seen[r] = true;
+            collectRefs(grammar, grammar.rules[r].expr, &stack, allocator) catch return CodegenError.OutOfMemory;
+        }
+    }
+    return result;
+}
+
+fn collectRefs(grammar: *const gp.Grammar, expr: *const gp.Expr, out: *std.ArrayList(usize), allocator: Allocator) !void {
+    switch (expr.tag) {
+        .literal, .char_class, .any_char => {},
+        .reference => {
+            const name = expr.ref_name orelse return;
+            for (grammar.rules, 0..) |rule, i| {
+                if (std.mem.eql(u8, rule.name, name)) return out.append(allocator, i);
+            }
+        },
+        .sequence, .alternative => for (expr.children orelse return) |c| try collectRefs(grammar, c, out, allocator),
+        .repetition => try collectRefs(grammar, expr.rep_expr orelse return, out, allocator),
+        .not_predicate, .and_predicate => try collectRefs(grammar, expr.pred_expr orelse return, out, allocator),
     }
 }
 

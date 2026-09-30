@@ -203,3 +203,50 @@ class TestMemo:
 
     def test_slash_is_ordered_choice(self):
         assert zgram.compile("a = 'x' / 'y'\n").parse("y").text() == "y"
+
+
+class TestMatches:
+    def test_accepts_and_rejects(self, json_parser):
+        assert json_parser.matches('{"a": [1, 2.5, "x", true, null]}') is True
+        assert json_parser.matches('{"a": [1, 2,]}') is False
+        assert json_parser.matches("") is False
+        assert json_parser.matches(b"[1]") is True
+
+    def test_error_after_rejection(self, json_parser):
+        assert json_parser.matches('{"a": }') is False
+        err = json_parser.error
+        assert (err.line(), err.column(), err.message()) == (1, 7, "expected object")
+        assert json_parser.matches("[1]") is True
+        assert json_parser.error is None
+
+    def test_start_rule(self, json_parser):
+        assert json_parser.matches("-12.5e3", start="number") is True
+        assert json_parser.matches("12x", start="number") is False
+        with pytest.raises(ValueError, match="unknown start rule"):
+            json_parser.matches("1", start="nope")
+
+    def test_agrees_with_parse_on_long_input(self, json_parser):
+        doc = json.dumps([{"k": "v" * 100, "n": [1.5] * 50}] * 400)
+        assert len(doc) > 16 * 1024
+        assert json_parser.matches(doc) is True
+        assert json_parser.matches(doc[:-1]) is False
+
+    def test_memo_grammar(self):
+        p = zgram.compile("expr = term '+' expr / term '-' expr / term\n@memo term = '(' expr ')' / 'x'\n")
+        deep = "(" * 300 + "x" + ")" * 300
+        assert p.matches(deep) is True
+        assert p.matches(deep + ")") is False
+
+    def test_threads(self, json_parser):
+        big = json.dumps([{"k": [1, 2, "abc" * 10]}] * 3000)
+        results = [None] * 4
+
+        def work(i):
+            results[i] = json_parser.matches(big)
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [True] * 4

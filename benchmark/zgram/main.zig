@@ -26,20 +26,6 @@ const JSON_GRAMMAR =
     \\
 ;
 
-/// The grammar under a new `root` rule, with every original rule @silent:
-/// the parse produces only the root node, like a validate-only parser.
-fn validateOnly(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(allocator, "root = value\n");
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (line.len > 0 and !std.mem.startsWith(u8, line, "@silent")) try out.appendSlice(allocator, "@silent ");
-        try out.appendSlice(allocator, line);
-        try out.append(allocator, '\n');
-    }
-    return out.items;
-}
-
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -58,14 +44,13 @@ pub fn main(init: std.process.Init) !void {
 
     // Compile grammar
     std.debug.print("Compiling JSON grammar...\n", .{});
-    // --validate: build no tree beyond a root node, which is the work that
-    // validate-only parsers (rust-peg, PEGTL, cpp-peglib here) do
+    // --validate: zgram's accept/reject-only parser (GrammarParser.matches),
+    // which builds no tree, like validate-only parsers
     const validate = args.len > 2 and std.mem.eql(u8, args[2], "--validate");
-    const grammar_text = if (validate) try validateOnly(allocator, JSON_GRAMMAR) else JSON_GRAMMAR;
-    const grammar = try gp.parseGrammar(allocator, grammar_text);
+    const grammar = try gp.parseGrammar(allocator, JSON_GRAMMAR);
     defer grammar.deinit(allocator);
 
-    const codegen_result = try jc.generateModule(allocator, grammar);
+    const codegen_result = try jc.generateModule(allocator, grammar, if (validate) .validate else .tree);
     const jit_result = try jr.jitCompile(codegen_result.module, codegen_result.context);
     const parse_fn = jit_result.parse_fn;
     defer jr.releaseGrammar(jit_result.resource);
