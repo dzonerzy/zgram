@@ -420,6 +420,7 @@ for child in tree:
 ```python
 tree = parser.parse_tree("ab=12")
 tree.root      # the root Node
+tree.node(i)   # the Node at index i of the node array (the inverse of node.index)
 len(tree)      # number of nodes
 tree.nodes     # bytes: a copy of the node array, 16 bytes per node, in pre-order
 tree.input     # bytes: the parsed text as UTF-8 (node offsets index into it)

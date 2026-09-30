@@ -707,6 +707,12 @@ const Tree = struct {
         return self._count;
     }
 
+    /// The node at `index` in the node array (Node.index is the inverse).
+    pub fn node(self: *Tree, index: i64) !Node {
+        if (index < 0 or index >= self._count) return error.IndexOutOfBounds;
+        return makeNode(self, @intCast(index));
+    }
+
     /// A copy of the node array: 16 bytes per node, in pre-order.
     pub fn get_nodes(self: *const Tree) pyoz.Signature(?*pyoz.PyObject, "bytes") {
         const ptr: [*]const u8 = if (self._nodes) |n| @ptrCast(n) else "";
@@ -818,6 +824,8 @@ const Tree = struct {
         return if (rid < rules.bytes.len) rules.bytes[rid] else "";
     }
 
+    pub const node__doc__: [*:0]const u8 = "Return the Node at an index of the node array (the inverse of Node.index). Raises IndexError when out of range.";
+    pub const node__params__ = "index";
     pub const __doc__: [*:0]const u8 = "The result of one parse: the flat node array, the input and the rule and label names. Shared by all its Nodes.";
 };
 

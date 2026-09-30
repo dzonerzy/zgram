@@ -149,3 +149,13 @@ def test_tree_without_labels():
     tree = zgram.compile("w = [a-z]+").parse_tree("abc")
     assert tree.fields == []
     assert view_of(tree.capsule).field_count == 0
+
+
+def test_node_by_index(parser):
+    tree = parser.parse_tree("ab=12")
+    assert [tree.node(i).rule() for i in range(len(tree))] == ["pair", "word", "num"]
+    assert tree.node(2) == tree.root[1]
+    assert tree.node(1).index == 1
+    for bad in (-1, 3):
+        with pytest.raises(IndexError):
+            tree.node(bad)

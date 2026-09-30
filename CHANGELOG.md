@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Display names:** `expr "expression" = ...` makes error messages say `expected expression` instead of the rule's name.
 - **`-> Name()`** calls a class with no arguments, for rules such as `break_stmt` that carry no information.
 - **`parser.actions()`** lists each rule's `-> name` action.
+- **`tree.node(index)`** returns the node at an index of the node array.
 - **`compile_async(grammar, ast=None)`** accepts `ast`, like `compile()`.
 - **`examples/tiny`:** a small language (grammar, AST, interpreter, diagnostics) built on the features above.
 - **Up to 4096 rules** per grammar (was 256).
