@@ -5,6 +5,7 @@
 //! by jit_codegen.zig using the LLVM C API (no bitcode step).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const abi = @import("parse_abi.zig");
 const LB = @import("llvm_builder.zig");
 
@@ -85,7 +86,15 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
     const es = c.LLVMOrcLLJITGetExecutionSession(jit);
     const exported_flags = c.LLVMJITSymbolFlags{ .GenericFlags = c.LLVMJITSymbolGenericFlagsExported | c.LLVMJITSymbolGenericFlagsCallable, .TargetFlags = 0 };
 
-    var syms: [7]c.LLVMOrcCSymbolMapPair = .{
+    // On Windows, functions with large stack frames call the stack probe
+    // ___chkstk_ms; it's in Zig's compiler runtime, linked into this module.
+    const is_windows = builtin.os.tag == .windows;
+    const chkstk: usize = if (is_windows)
+        @intFromPtr(@extern(*const fn () callconv(.naked) void, .{ .name = "___chkstk_ms" }))
+    else
+        0;
+
+    var syms: [8]c.LLVMOrcCSymbolMapPair = .{
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_reserve_node"), .Sym = .{ .Address = @intFromPtr(&zgram_reserve_node), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_fill_node"), .Sym = .{ .Address = @intFromPtr(&zgram_fill_node), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_error_trailing"), .Sym = .{ .Address = @intFromPtr(&zgram_set_error_trailing), .Flags = exported_flags } },
@@ -93,9 +102,10 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_ensure_capacity"), .Sym = .{ .Address = @intFromPtr(&zgram_ensure_capacity), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_memo_lookup"), .Sym = .{ .Address = @intFromPtr(&zgram_memo_lookup), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_memo_store"), .Sym = .{ .Address = @intFromPtr(&zgram_memo_store), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "___chkstk_ms"), .Sym = .{ .Address = chkstk, .Flags = exported_flags } },
     };
 
-    const mu = c.LLVMOrcAbsoluteSymbols(&syms, syms.len);
+    const mu = c.LLVMOrcAbsoluteSymbols(&syms, if (is_windows) syms.len else syms.len - 1);
     try handleError(c.LLVMOrcJITDylibDefine(dylib, mu));
 }
 
