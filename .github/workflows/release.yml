@@ -20,16 +20,51 @@ jobs:
                   echo "tag=$TAG pyproject=$PYPROJECT build.zig.zon=$ZON"
                   [ "$TAG" = "$PYPROJECT" ] && [ "$TAG" = "$ZON" ]
 
-    ci:
+    # The tagged commit was pushed to main too, and CI built and tested it
+    # there: wait for that run and release its wheels instead of building and
+    # testing them all over again. Its failure fails the release.
+    main-ci:
+        name: Wait for CI on the tagged commit
         needs: check-version
+        runs-on: ubuntu-latest
+        permissions:
+            actions: read
+        outputs:
+            run-id: ${{ steps.find.outputs.run-id }}
+        steps:
+            - id: find
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GH_REPO: ${{ github.repository }}
+              run: |
+                  # (the run appears a few seconds after the push)
+                  for i in $(seq 24); do
+                      ID=$(gh run list --workflow ci.yml --event push --commit "$GITHUB_SHA" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+                      [ -n "$ID" ] && break
+                      sleep 5
+                  done
+                  if [ -z "$ID" ]; then
+                      echo "no CI run on main for $GITHUB_SHA: building here"
+                      exit 0
+                  fi
+                  echo "CI run $ID"
+                  gh run watch "$ID" --exit-status --interval 15 > /dev/null
+                  echo "run-id=$ID" >> "$GITHUB_OUTPUT"
+
+    # Only for a tag on a commit CI didn't run on
+    ci:
+        needs: main-ci
+        if: needs.main-ci.outputs.run-id == ''
         uses: ./.github/workflows/ci.yml
 
     pypi:
         name: Publish to PyPI
-        needs: ci
+        needs: [main-ci, ci]
+        if: ${{ !cancelled() && needs.main-ci.result == 'success' && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
         runs-on: ubuntu-latest
         environment: pypi
         permissions:
+            actions: read
             # Trusted publishing, used when PYPI_API_TOKEN isn't set
             id-token: write
         steps:
@@ -38,6 +73,8 @@ jobs:
                   pattern: wheel-*
                   path: dist
                   merge-multiple: true
+                  run-id: ${{ needs.main-ci.outputs.run-id || github.run_id }}
+                  github-token: ${{ github.token }}
 
             - name: Publish
               uses: pypa/gh-action-pypi-publish@release/v1
@@ -47,9 +84,11 @@ jobs:
 
     github-release:
         name: GitHub release
-        needs: pypi
+        needs: [main-ci, pypi]
+        if: ${{ !cancelled() && needs.pypi.result == 'success' }}
         runs-on: ubuntu-latest
         permissions:
+            actions: read
             contents: write
         steps:
             - uses: actions/checkout@v4
@@ -59,6 +98,8 @@ jobs:
                   pattern: wheel-*
                   path: dist
                   merge-multiple: true
+                  run-id: ${{ needs.main-ci.outputs.run-id || github.run_id }}
+                  github-token: ${{ github.token }}
 
             - name: Create release with this version's changelog
               env:

@@ -8,14 +8,21 @@ on:
     workflow_dispatch:
 
 jobs:
-    # One portable abi3 wheel per platform (cp310-abi3: CPython 3.10+)
+    # One portable abi3 wheel per platform (cp310-abi3: CPython 3.10+). Both
+    # are built on Linux: the Windows wheel is cross-compiled, which takes a
+    # minute where a Windows runner took three and a half. The tests below
+    # run each wheel on its own OS.
     build:
-        name: Build wheel (${{ matrix.os }})
-        runs-on: ${{ matrix.os }}
+        name: Build wheel (${{ matrix.platform }})
+        runs-on: ubuntu-latest
         strategy:
             fail-fast: false
             matrix:
-                os: [ubuntu-latest, windows-latest]
+                include:
+                    - platform: Linux
+                      target: ""
+                    - platform: Windows
+                      target: x86_64-windows
         steps:
             - uses: actions/checkout@v4
 
@@ -38,26 +45,25 @@ jobs:
               with:
                   path: |
                       ~/.cache/zig
-                      ~/AppData/Local/zig
                       zig-pkg
-                  key: zig-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
-                  restore-keys: zig-${{ runner.os }}-
+                  key: zig-${{ matrix.platform }}-${{ hashFiles('build.zig.zon') }}
+                  restore-keys: zig-${{ matrix.platform }}-
 
             - name: Install PyOZ
               run: python -m pip install "pyoz>=0.13.7"
 
             - name: Build wheel
-              run: pyoz build --release
+              run: pyoz build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
             - name: Check the extension really uses the Stable ABI
-              if: runner.os == 'Linux'
+              if: matrix.platform == 'Linux'
               run: |
                   unzip -o -q dist/*.whl zgram.so -d /tmp/whl
                   nm -D /tmp/whl/zgram.so | grep -q " U PyType_FromSpec" || { echo "not an abi3 build"; exit 1; }
 
             - uses: actions/upload-artifact@v4
               with:
-                  name: wheel-${{ runner.os }}
+                  name: wheel-${{ matrix.platform }}
                   path: dist/*.whl
                   if-no-files-found: error
 
