@@ -94,6 +94,8 @@ pub const ErrorKind = enum(u8) {
     trailing_input = 2,
     /// Node buffer allocation failed
     out_of_memory = 3,
+    /// The input nests deeper than the native stack allows (ParseOutput.stack_limit)
+    too_deep = 4,
 };
 
 /// Parse flags (zgram_parse `flags` argument)
@@ -129,6 +131,12 @@ pub const ParseOutput = extern struct {
     /// Packrat memo table for @memo rules (jit_helpers.MemoState), created on
     /// first use. The caller frees it with jit_helpers.memoFree() after parsing.
     memo: ?*anyopaque = null,
+
+    /// Set by the caller: the lowest address a rule's frame may be at (0 =
+    /// no limit). A recursive rule entered below it fails the whole parse
+    /// with ErrorKind.too_deep, and sets this to the highest address so that
+    /// every rule entered afterwards fails too.
+    stack_limit: usize = 0,
 };
 
 /// Field offsets used by the code generator
@@ -138,6 +146,8 @@ pub const OFF_NODE_CAPACITY = @offsetOf(ParseOutput, "node_capacity");
 pub const OFF_MAX_POS = @offsetOf(ParseOutput, "max_pos");
 pub const OFF_MAX_POS_RULE_ID = @offsetOf(ParseOutput, "max_pos_rule_id");
 pub const OFF_END_POS = @offsetOf(ParseOutput, "end_pos");
+pub const OFF_ERROR_KIND = @offsetOf(ParseOutput, "error_kind");
+pub const OFF_STACK_LIMIT = @offsetOf(ParseOutput, "stack_limit");
 
 // Compile-time ABI assertions
 comptime {

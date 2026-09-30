@@ -5,6 +5,11 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-30
+
+### Fixed
+- **Deeply nested input no longer crashes the process.** The parser recurses once per level of nesting, and input such as 100,000 open parentheses (or 3,000 on Windows, whose threads have 1 MB stacks) overflowed the native stack. Recursive rules now check their frame against the thread's stack bounds and fail the parse with a `ParseError` ("nested too deeply to parse") at the position reached; `match()` returns `None` and `matches()` `False` with `parser.error` set. The error diagnosis pass stops at the same bound. The check costs 0.5-2% of parse time.
+
 ## [0.2.0] - 2026-09-30
 
 ### Added

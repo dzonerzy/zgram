@@ -8,6 +8,7 @@ const jit_codegen = @import("jit_codegen.zig");
 const jit_compiler = @import("jit_compiler.zig");
 const jit_helpers = @import("jit_helpers.zig");
 const diagnose = @import("diagnose.zig");
+const native_stack = @import("stack.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -1390,6 +1391,7 @@ const GrammarParser = struct {
             .none => "",
             .trailing_input => "unexpected input after match",
             .out_of_memory => "out of memory (parse tree too large)",
+            .too_deep => "nested too deeply to parse (the native stack is not deep enough)",
             .expected_rule => blk: {
                 const compiled = self._compiled orelse break :blk "unexpected input";
                 if (err.rule_id >= compiled.rule_names.len) break :blk "unexpected input";
@@ -1490,6 +1492,8 @@ const GrammarParser = struct {
         output.nodes_ptr = initial.ptr;
         output.node_capacity = initial_cap;
         errdefer if (output.nodes_ptr) |n| allocator.free(n[0..output.node_capacity]);
+        // Input nested deeper than this thread's stack allows is an error, not a crash
+        output.stack_limit = native_stack.limit(@frameAddress());
 
         const rc = if (input_len >= GIL_RELEASE_BYTES)
             pyoz.allowThreads(callParse, .{ compiled.parse_fn, ptr, input_len, &output, start_rule, flags })
@@ -1499,6 +1503,18 @@ const GrammarParser = struct {
             allocator.free(output.nodes_ptr.?[0..output.node_capacity]);
             output.nodes_ptr = null;
             return raise(py.PyExc_ValueError(), "unknown start rule");
+        }
+
+        // Out of stack: whatever the rules above the deepest one made of it
+        // (an optional part may have "matched" nothing), the parse failed
+        const too_deep = output.error_kind == @intFromEnum(abi.ErrorKind.too_deep);
+        if (too_deep and output.status == 1) {
+            output.status = 0;
+            const at = @min(@as(usize, output.max_pos), input_len);
+            const where = abi.lineCol(ptr[0..input_len], at);
+            output.error_offset = @intCast(at);
+            output.error_line = where.line;
+            output.error_col = where.col;
         }
 
         if (output.status == 1) {
@@ -1551,7 +1567,7 @@ const GrammarParser = struct {
             .rule_id = output.error_rule_id,
         };
         if (self._last_error.kind == .out_of_memory) return error.OutOfMemory;
-        self.refineError(compiled, ptr[0..input_len], start_rule);
+        if (!too_deep) self.refineError(compiled, ptr[0..input_len], start_rule);
         if (!raise_on_fail) return null;
 
         var msg_buf: [320]u8 = undefined;
@@ -2040,12 +2056,13 @@ const GrammarParser = struct {
         const validate = if (compiled.validate_fn.load(.acquire)) |f| f else try pyoz.allowThreadsTry(Compiled.validator, .{compiled});
         var output = abi.ParseOutput{};
         defer jit_helpers.memoFree(&output);
+        output.stack_limit = native_stack.limit(@frameAddress());
         const rc = if (input_len >= GIL_RELEASE_BYTES)
             pyoz.allowThreads(callParse, .{ validate, ptr, input_len, &output, start_rule, 0 })
         else
             validate(ptr, input_len, &output, start_rule, 0);
         if (rc < 0) return error.ParseFailed;
-        if (output.status == 1) {
+        if (output.status == 1 and output.error_kind != @intFromEnum(abi.ErrorKind.too_deep)) {
             self._last_error = .{};
             return true;
         }

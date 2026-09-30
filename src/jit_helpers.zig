@@ -273,8 +273,18 @@ pub export fn zgram_fold(output: *abi.ParseOutput, first: u32, rule_id: u32, kin
 
 fn setError(output: *abi.ParseOutput, kind: abi.ErrorKind, input_ptr: [*]const u8, input_len: usize, pos: usize, rule_id: u16) void {
     output.status = 0;
-    // An allocation failure is the real cause; don't mask it with a syntax error
+    // An allocation failure, or running out of stack, is the real cause;
+    // don't mask it with a syntax error
     if (output.error_kind == @intFromEnum(abi.ErrorKind.out_of_memory)) return;
+    if (output.error_kind == @intFromEnum(abi.ErrorKind.too_deep)) {
+        // ... at the furthest position the parse got to
+        const at = @min(@as(usize, output.max_pos), input_len);
+        output.error_offset = @intCast(at);
+        const where = abi.lineCol(input_ptr[0..input_len], at);
+        output.error_line = where.line;
+        output.error_col = where.col;
+        return;
+    }
     output.error_kind = @intFromEnum(kind);
     output.error_offset = @intCast(pos);
     output.error_rule_id = rule_id;
@@ -373,8 +383,9 @@ pub export fn zgram_memo_lookup(output: *abi.ParseOutput, rule_id: u32, pos: u64
     if (e.result < 0 or e.count == 0) return e.result;
 
     // Replay the nodes; if that can't allocate, let the rule run normally
+    const kind_before = output.error_kind;
     if (zgram_ensure_capacity(output, output.node_count + e.count) == 0) {
-        output.error_kind = 0;
+        output.error_kind = kind_before;
         return MEMO_MISS;
     }
     const nodes = output.nodes_ptr.?;

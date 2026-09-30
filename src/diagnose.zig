@@ -155,6 +155,8 @@ const Interp = struct {
     quiet: u32 = 0,
     steps: u64 = 0,
     depth: u32 = 0,
+    /// Lowest address a frame may be at (see stack.zig)
+    stack_limit: usize = 0,
     result: Result = .{},
 
     fn fail(self: *Interp, expr: *const gp.Expr, pos: usize) void {
@@ -218,7 +220,7 @@ const Interp = struct {
 
     fn match(self: *Interp, expr: *const gp.Expr, pos: usize) Abort!?usize {
         self.steps += 1;
-        if (self.steps > MAX_STEPS or self.depth >= MAX_DEPTH) return error.Abort;
+        if (self.steps > MAX_STEPS or self.depth >= MAX_DEPTH or @frameAddress() < self.stack_limit) return error.Abort;
         self.depth += 1;
         defer self.depth -= 1;
 
@@ -333,6 +335,7 @@ pub fn diagnose(allocator: Allocator, grammar: *const gp.Grammar, input: []const
         .input = input,
         .skip = alloc.alloc(bool, n) catch return null,
         .token = alloc.alloc(bool, n) catch return null,
+        .stack_limit = @import("stack.zig").limit(@frameAddress()),
     };
     interp.index.ensureTotalCapacity(alloc, @intCast(n)) catch return null;
     for (grammar.rules, 0..) |r, i| interp.index.putAssumeCapacity(r.name, i);

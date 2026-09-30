@@ -189,9 +189,10 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
 
     // A validator is small enough to inline into its callers every rule
     // except one per recursion cycle (the cycle has to be a real call).
+    // (Those rules are also where the depth of the recursion is checked.)
+    const breakers = try computeCycleBreakers(allocator, grammar);
+    defer allocator.free(breakers);
     if (mode == .validate) {
-        const breakers = try computeCycleBreakers(allocator, grammar);
-        defer allocator.free(breakers);
         for (grammar.rules, 0..) |_, i| {
             if (breakers[i]) continue;
             b.addFnAttr(rule_fns[i], "alwaysinline");
@@ -229,7 +230,7 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
             .alloc_flags = alloc_flags,
             .mode = mode,
         };
-        try emitRuleFunction(&cg, rule, @intCast(i), body_fns[i]);
+        try emitRuleFunction(&cg, rule, @intCast(i), body_fns[i], breakers[i]);
     }
 
     // Wrappers for @memo rules
@@ -247,7 +248,7 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
 }
 
 /// Emit the body of a rule function.
-fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16, func: LB.Value) CodegenError!void {
+fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16, func: LB.Value, check_depth: bool) CodegenError!void {
     const b = cg.b;
     b.setCurrentFn(func);
 
@@ -259,6 +260,28 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16, func: LB.V
     cg.input_len = b.param(func, 1);
     cg.output_ptr = b.param(func, 2);
     const pos_arg = b.param(func, 3);
+
+    // A rule on a recursion cycle: every level of nesting in the input
+    // passes through here, so this is where the stack can run out. Below
+    // the caller's limit the parse is over: say why, and make every rule
+    // entered from now on fail as well (any frame is below the top address).
+    if (check_depth) {
+        const deep_block = try b.newBlock("too_deep");
+        const body_block = try b.newBlock("body");
+        const frame = b.callIntrinsic(b.lookupIntrinsic("llvm.frameaddress"), &.{b.ptr}, &.{b.constInt(b.i32, 0)}, "frame");
+        const frame_addr = LB.llvm.LLVMBuildPtrToInt(b.b, frame, b.i64, "frame_addr");
+        const limit_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_STACK_LIMIT)}, "stack_limit_ptr");
+        const limit = b.load(b.i64, limit_ptr, 8, "stack_limit");
+        _ = b.condBr(b.icmp(.ult, frame_addr, limit, "is_too_deep"), deep_block, body_block);
+
+        b.positionAtEnd(deep_block);
+        const kind_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_ERROR_KIND)}, "error_kind_ptr");
+        _ = b.store(b.constInt(b.i8, @intFromEnum(abi.ErrorKind.too_deep)), kind_ptr, 1);
+        _ = b.store(b.constSInt(b.i64, -1), limit_ptr, 8);
+        _ = b.ret(b.constSInt(b.i64, -1));
+
+        b.positionAtEnd(body_block);
+    }
 
     const is_silent = cg.silent_flags[rule_id];
 
