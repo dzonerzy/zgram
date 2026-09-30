@@ -101,10 +101,12 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
 
 /// Run the full LLVM optimization pipeline on a module.
 /// Uses the new pass manager with O3 + vectorization + loop opts targeting the host CPU.
-fn optimizeModule(module: c.LLVMModuleRef) JitError!void {
-    // Get host target triple, CPU, and features for optimal codegen
-    const triple = c.LLVMGetDefaultTargetTriple();
-    defer c.LLVMDisposeMessage(triple);
+fn optimizeModule(jit: c.LLVMOrcLLJITRef, module: c.LLVMModuleRef) JitError!void {
+    // Target the JIT's own triple (the process it runs in), with the host
+    // CPU and its features. LLVMGetDefaultTargetTriple
+    // is fixed when LLVM is built, and the bundled Windows LLVM was built on
+    // Linux: its default triple is an ELF one, which the Windows JIT rejects.
+    const triple = c.LLVMOrcLLJITGetTripleString(jit);
     const cpu = c.LLVMGetHostCPUName();
     defer c.LLVMDisposeMessage(cpu);
     const features = c.LLVMGetHostCPUFeatures();
@@ -177,7 +179,7 @@ pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!JitRe
 
     // Run the O3 pipeline. The module and context belong to this call, so
     // concurrent compiles optimize in parallel.
-    try optimizeModule(module);
+    try optimizeModule(jit, module);
 
     lockJit();
     defer unlockJit();
