@@ -27,7 +27,7 @@ jobs:
             - uses: actions/checkout@v4
 
             # Downloads from the community mirrors (ziglang.org itself took up
-            # to 7 minutes); our own cache below keeps the build cache
+            # to 7 minutes); our own caches below keep packages and builds
             - name: Setup Zig
               uses: mlugg/setup-zig@v2
               with:
@@ -43,11 +43,20 @@ jobs:
             - name: Cache Zig packages
               uses: actions/cache@v4
               with:
-                  path: |
-                      ~/.cache/zig
-                      zig-pkg
+                  path: zig-pkg
                   key: zig-${{ matrix.platform }}-${{ hashFiles('build.zig.zon') }}
                   restore-keys: zig-${{ matrix.platform }}-
+
+            # setup-zig points Zig's global cache at .zig-cache too, so this
+            # keeps libc++ and compiler-rt built for the target (most of a
+            # cold build: 100 s) and, for unchanged sources, the extension.
+            # Saved per commit; a new commit starts from the latest one.
+            - name: Cache Zig build
+              uses: actions/cache@v4
+              with:
+                  path: .zig-cache
+                  key: zig-build-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**') }}
+                  restore-keys: zig-build-${{ matrix.platform }}-
 
             - name: Install PyOZ
               run: python -m pip install "pyoz>=0.13.7"
