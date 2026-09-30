@@ -1,0 +1,33 @@
+# JSON grammar for PackCC (validation only). Same rules as benchmark/rust-peg.
+%prefix "json"
+%auxil "struct json_input *"
+
+%header {
+struct json_input {
+    const char *data;
+    size_t len;
+    size_t pos;
+    int error;
+};
+}
+
+%source {
+#define PCC_GETCHAR(auxil) ((auxil)->pos < (auxil)->len ? (unsigned char)(auxil)->data[(auxil)->pos++] : -1)
+#define PCC_ERROR(auxil) ((auxil)->error = 1)
+}
+
+json    <- _ value _ !.
+value   <- object / array / string / number / 'true' / 'false' / 'null'
+object  <- '{' _ '}' / '{' _ pair (',' _ pair)* _ '}'
+pair    <- _ string _ ':' _ value _
+array   <- '[' _ ']' / '[' _ value (',' _ value)* _ ']'
+string  <- '"' char* '"'
+char    <- escape / plain
+escape  <- '\\' ["\\/bfnrt] / '\\u' hex hex hex hex
+hex     <- [0-9a-fA-F]
+plain   <- [^"\\]
+number  <- '-'? int frac? exp?
+int     <- '0' / [1-9] [0-9]*
+frac    <- '.' [0-9]+
+exp     <- [eE] [+\-]? [0-9]+
+_       <- [ \t\n\r]*

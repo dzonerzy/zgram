@@ -6,11 +6,26 @@
 
 #include <tao/pegtl.hpp>
 #include <tao/pegtl/contrib/json.hpp>
+#include <tao/pegtl/contrib/parse_tree.hpp>
 
 namespace pegtl = tao::pegtl;
 
 // Full JSON grammar + EOF
 struct json_grammar : pegtl::must<pegtl::json::text, pegtl::eof> {};
+
+// --tree: PEGTL's built-in parse tree, keeping the same node types as zgram's
+// JSON grammar (value, object, pair = member, array, string = string/key, number)
+namespace json = pegtl::json;
+template <typename Rule>
+using tree_selector = pegtl::parse_tree::selector<
+    Rule, pegtl::parse_tree::store_content::on<json::value, json::object, json::member, json::array,
+                                                json::string, json::key, json::number>>;
+
+static size_t count_nodes(const pegtl::parse_tree::node &n) {
+    size_t total = n.is_root() ? 0 : 1;
+    for (const auto &c : n.children) total += count_nodes(*c);
+    return total;
+}
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -29,6 +44,17 @@ int main(int argc, char* argv[]) {
     std::string input(size, '\0');
     file.read(input.data(), size);
 
+    const bool tree = argc > 2 && std::string(argv[2]) == "--tree";
+    if (tree) {
+        pegtl::memory_input in(input, argv[1]);
+        auto root = pegtl::parse_tree::parse<json_grammar, tree_selector>(in);
+        if (!root) {
+            fprintf(stderr, "Parse failed\n");
+            return 1;
+        }
+        fprintf(stderr, "Tree nodes: %zu\n", count_nodes(*root));
+    }
+
     // Verify parse works
     {
         pegtl::memory_input in(input, argv[1]);
@@ -45,7 +71,12 @@ int main(int argc, char* argv[]) {
         auto start = std::chrono::high_resolution_clock::now();
         for (uint64_t i = 0; i < iters; ++i) {
             pegtl::memory_input in(input, argv[1]);
-            pegtl::parse<json_grammar>(in);
+            if (tree) {
+                auto root = pegtl::parse_tree::parse<json_grammar, tree_selector>(in);
+                __asm__ volatile("" : : "r"(root.get()) : "memory");
+            } else {
+                pegtl::parse<json_grammar>(in);
+            }
         }
         auto end = std::chrono::high_resolution_clock::now();
         double elapsed_s = std::chrono::duration<double>(end - start).count();
@@ -54,7 +85,7 @@ int main(int argc, char* argv[]) {
             double per_parse_us = (elapsed_s * 1e6) / iters;
             double ops_per_sec = iters / elapsed_s;
 
-            fprintf(stderr, "\n-- PEGTL (%zu bytes) --\n", input.size());
+            fprintf(stderr, "\n-- PEGTL%s (%zu bytes) --\n", tree ? " tree" : "", input.size());
             fprintf(stderr, "  Iterations:  %lu\n", iters);
             fprintf(stderr, "  Total:       %.4fs\n", elapsed_s);
             fprintf(stderr, "  Per-parse:   %.2fus\n", per_parse_us);

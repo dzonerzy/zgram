@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== zgram vs PEGTL vs cpp-peglib vs pest vs rust-peg (tree and validate-only) — JSON Parse Benchmark ==="
+echo "=== zgram vs rust-peg, Spirit X3, lexy, PEGTL, pest, PackCC, cpp-peglib — JSON Parse Benchmark ==="
 echo ""
 
 # Generate test data
@@ -35,6 +35,35 @@ cd "$SCRIPT_DIR/cpp-peglib/build"
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3" > /dev/null 2>&1
 make -j"$(nproc)" > /dev/null 2>&1
 CPPPEG_BIN="$SCRIPT_DIR/cpp-peglib/build/cpppeg_bench"
+echo ""
+
+# Build lexy benchmarks (generic tree + typed AST)
+echo "Building lexy benchmarks..."
+mkdir -p "$SCRIPT_DIR/lexy/build"
+cd "$SCRIPT_DIR/lexy/build"
+cmake .. -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
+make -j"$(nproc)" > /dev/null 2>&1
+LEXY_BIN="$SCRIPT_DIR/lexy/build/lexy_bench"
+LEXY_AST_BIN="$SCRIPT_DIR/lexy/build/lexy_ast_bench"
+echo ""
+
+# Build Boost.Spirit X3 benchmarks (flat tree + typed AST)
+echo "Building Spirit X3 benchmarks..."
+mkdir -p "$SCRIPT_DIR/spirit-x3/build"
+cd "$SCRIPT_DIR/spirit-x3/build"
+cmake .. -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
+make -j"$(nproc)" > /dev/null 2>&1
+X3_BIN="$SCRIPT_DIR/spirit-x3/build/spirit_x3_bench"
+X3_AST_BIN="$SCRIPT_DIR/spirit-x3/build/spirit_x3_ast_bench"
+echo ""
+
+# Build PackCC benchmark
+echo "Building PackCC benchmark..."
+mkdir -p "$SCRIPT_DIR/packcc/build"
+cd "$SCRIPT_DIR/packcc/build"
+cmake .. -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
+make -j"$(nproc)" > /dev/null 2>&1
+PACKCC_BIN="$SCRIPT_DIR/packcc/build/packcc_bench"
 echo ""
 
 # Build pest benchmark
@@ -71,6 +100,22 @@ for size in small medium large strings; do
     "$ZGRAM_BIN" "$FILE" --validate 2>&1
     echo ""
     "$RUSTPEG_TREE_BIN" "$FILE" 2>&1
+    echo ""
+    "$X3_BIN" "$FILE" --tree 2>&1
+    echo ""
+    "$X3_BIN" "$FILE" 2>&1
+    echo ""
+    "$X3_AST_BIN" "$FILE" 2>&1
+    echo ""
+    "$LEXY_BIN" "$FILE" --tree 2>&1
+    echo ""
+    "$LEXY_BIN" "$FILE" 2>&1
+    echo ""
+    "$LEXY_AST_BIN" "$FILE" 2>&1
+    echo ""
+    "$PEGTL_BIN" "$FILE" --tree 2>&1
+    echo ""
+    "$PACKCC_BIN" "$FILE" 2>&1
     echo ""
     "$PEGTL_BIN" "$FILE" 2>&1
     echo ""

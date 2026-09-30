@@ -1,82 +1,83 @@
 # zgram Benchmark — JSON Parse Performance
 
-Comparison of **zgram** against established PEG parser generators in Rust and C++, on four JSON inputs.
+zgram against the fastest PEG and parser-combinator libraries in C, C++ and Rust, parsing four JSON inputs.
 
-All benchmarks parse the same JSON files in a tight loop, auto-calibrating the iteration count until total time exceeds 2 seconds, and report wall-clock time per parse. Every library parses JSON with an equivalent grammar.
+Every benchmark parses the same file in a tight loop, auto-calibrating the iteration count until a batch takes at least 2 seconds, and reports wall-clock time per parse. All libraries use an equivalent JSON grammar and reject invalid JSON. The whole suite runs pinned to one CPU core.
 
-## Two fair comparisons
+## What is compared
 
-Parsers differ in how much work a parse does, so the results are split in two:
+zgram always builds a parse tree: a node per rule match with the rule, byte span, children and subtree size. So the main comparison is **building a tree**, with every library producing the tree it's designed to produce:
 
-- **Building a parse tree.** zgram always records a node per rule match (rule, byte span, children, subtree size): 13 / 286 / 3,706 / 2,802 nodes for the four inputs. rust-peg builds the *same* tree here through rule actions (identical node counts), and pest builds its token-pair queue.
-- **Validation only.** rust-peg's default benchmark, PEGTL and cpp-peglib only check that the input matches; they build nothing. zgram's `--validate` mode wraps the grammar in a `root = value` rule and makes every other rule `@silent`, so it also builds nothing beyond one root node.
+- **The same tree as zgram.** Spirit X3 (through a small custom directive that builds a flat node array, rolled back on backtracking: zgram's own design), rust-peg (tree built by rule actions) and PEGTL (its built-in `parse_tree`, with a selector for the same rules) all produce exactly zgram's nodes: 13 / 286 / 3,706 / 2,802 for the four inputs.
+- **Their idiomatic typed AST.** Spirit X3 parsing into `x3::variant` / `std::vector` / `std::map` through attributes, and lexy's official JSON example parsing into its AST types. These build values rather than generic nodes, but they're what users of these libraries write.
+- **Other built-in trees.** pest's token pair queue, and lexy's `parse_as_tree`, which also records every token (about 3x more nodes).
 
-In both groups zgram also tracks the furthest failure position for error messages ("line L, col C: expected X").
-
-## Libraries Under Test
-
-| Library | Language | Strategy | Output |
-|---------|----------|----------|--------|
-| [zgram](https://github.com/dzonerzy/zgram) | Zig | Runtime JIT: grammar compiled to native code via LLVM at runtime | Flat node array (or validation only with `--validate`) |
-| [rust-peg](https://github.com/kevinmehall/rust-peg) (tree actions) | Rust | Compile time: `peg::parser!` macro generates parser code | Tree of `Node { rule, start, end, children }` built by actions |
-| [pest](https://pest.rs/) | Rust | Compile time: derive macro generates parser from a `.pest` grammar | Token pair queue (start/end pairs per rule) |
-| [rust-peg](https://github.com/kevinmehall/rust-peg) | Rust | Compile time, as above | Validation only (rules return `()`) |
-| [PEGTL](https://github.com/taocpp/PEGTL) | C++ | Compile time: header-only template metaprogramming | Validation only |
-| [cpp-peglib](https://github.com/yhirose/cpp-peglib) | C++ | Runtime interpreter: grammar parsed and interpreted at runtime | Validation only |
+A second table compares **validation only** (build nothing, just accept or reject), where zgram runs in `--validate` mode: the grammar wrapped in a `root = value` rule with every other rule `@silent`.
 
 ## Inputs
 
 - **Small** (43 bytes): `{"name": "John", "age": 30, "active": true}`
 - **Medium** (1,201 bytes): 20 user objects with id, name and email.
 - **Large** (15,241 bytes): 100 user objects with id, name, a 10-number scores array and a flag.
-- **Strings** (74,903 bytes): 200 log-like records with a 40-word message and a long path, typical of string-heavy payloads.
+- **Strings** (74,903 bytes): 200 log-like records with a 40-word message and a long path.
 
 ## Results
 
-Time per parse; in parentheses, how many times slower than zgram.
+Time per parse; in parentheses, how many times longer than zgram.
 
 ### Building a parse tree
 
-| Library | Small (43 B) | Medium (1.2 KB) | Large (15 KB) | Strings (75 KB) |
-|---|---|---|---|---|
-| **zgram** | **0.06us** | **1.22us** | **20.20us** | **13.02us** |
-| rust-peg (tree actions) | 0.16us (2.7x) | 4.37us (3.6x) | 79.78us (3.9x) | 126us (9.7x) |
-| pest | 0.90us (15.0x) | 22.78us (18.7x) | 202us (10.0x) | 1,249us (95.9x) |
+| Library | Output | Small (43 B) | Medium (1.2 KB) | Large (15 KB) | Strings (75 KB) |
+|---|---|---|---|---|---|
+| **zgram** | flat node array | **0.05us** | **1.05us** | **18.65us** | **12.53us** |
+| Spirit X3 | flat node array (custom directive, zgram's design) | 0.07us (1.4x) | 1.41us (1.3x) | 21.17us (1.1x) | 64.94us (5.2x) |
+| rust-peg | tree via actions (`Vec` of children per node) | 0.14us (2.8x) | 3.74us (3.6x) | 69.09us (3.7x) | 118us (9.4x) |
+| Spirit X3 | typed AST (`variant` / `vector` / `map`) | 0.15us (3.0x) | 4.40us (4.2x) | 84.19us (4.5x) | 110us (8.8x) |
+| lexy | typed AST (official JSON example) | 0.19us (3.8x) | 5.37us (5.1x) | 75.34us (4.0x) | 105us (8.3x) |
+| pest | token pair queue | 0.77us (15.4x) | 19.79us (18.8x) | 223us (12.0x) | 1,045us (83.4x) |
+| PEGTL | built-in `parse_tree` | 0.78us (15.6x) | 17.47us (16.6x) | 243us (13.0x) | 606us (48.4x) |
+| lexy | built-in `parse_as_tree` (tokens included) | 0.28us (5.6x) | 19.85us (18.9x) | 358us (19.2x) | 326us (26.0x) |
 
 ### Validation only
 
-| Library | Small (43 B) | Medium (1.2 KB) | Large (15 KB) | Strings (75 KB) |
-|---|---|---|---|---|
-| **zgram** (validate-only mode) | **0.04us** | **0.85us** | **13.13us** | **9.36us** |
-| rust-peg | 0.09us (2.2x) | 2.25us (2.6x) | 24.66us (1.9x) | 112us (12.0x) |
-| PEGTL | 0.19us (4.8x) | 5.73us (6.7x) | 46.58us (3.5x) | 447us (47.8x) |
-| cpp-peglib | 8.72us (218.0x) | 291us (342.7x) | 2,388us (181.8x) | 18,251us (1949.9x) |
+| Library | Output | Small (43 B) | Medium (1.2 KB) | Large (15 KB) | Strings (75 KB) |
+|---|---|---|---|---|---|
+| **zgram** | `--validate` mode | **0.03us** | **0.80us** | **15.40us** | **10.43us** |
+| lexy | `lexy::match` | 0.03us (1.0x) | 0.65us (0.8x) | 10.39us (0.7x) | 33.22us (3.2x) |
+| Spirit X3 | parse without attribute | 0.03us (1.0x) | 0.74us (0.9x) | 9.04us (0.6x) | 42.24us (4.0x) |
+| rust-peg | rules return `()` | 0.08us (2.7x) | 1.92us (2.4x) | 22.85us (1.5x) | 95.55us (9.2x) |
+| PEGTL | `parse` without actions | 0.19us (6.3x) | 5.61us (7.0x) | 47.20us (3.1x) | 440us (42.2x) |
+| PackCC | generated C parser | 2.60us (86.7x) | 75.18us (94.0x) | 694us (45.1x) | 15,264us (1463.4x) |
+| cpp-peglib | runtime interpreter | 7.43us (247.7x) | 244us (305.4x) | 2,069us (134.4x) | 15,764us (1511.4x) |
 
 ## Analysis
 
-**zgram is the fastest in both groups on every input.** Building the same 3,706-node tree for the large input, rust-peg with tree actions takes 3.9x longer than zgram, and pest 10x longer. Doing validation only, rust-peg takes 1.9-2.6x longer on the regular inputs, and PEGTL, a compile-time C++ template parser, 3.5-6.7x.
+**Building a tree, zgram is the fastest library on every input.** The closest competitor is Spirit X3 building the same flat node array as zgram, through a custom directive written for this benchmark: zgram is 1.1-1.4x faster on the regular inputs and 5x faster on long strings. Built the way these libraries are normally used, the trees cost far more: rust-peg with tree actions and the X3 and lexy typed ASTs take 3-5x longer than zgram on the regular inputs, and pest, PEGTL's and lexy's built-in trees 5-20x longer.
 
-**Why zgram is fast:**
+**Validating only, compile-time C++ is faster on medium and large inputs.** lexy and Spirit X3 inline the whole grammar into a few functions and do no bookkeeping, and they validate the medium and large inputs 1.1-1.7x faster than zgram's validate mode. zgram matches them on small input, is 3-4x faster on long strings, and is faster than rust-peg, PEGTL, PackCC and cpp-peglib throughout. zgram's validate mode is a benchmark mode, though, not what zgram is for: it keeps tracking child counts and the furthest failure position, and building its full tree costs little more.
+
+**Why zgram's trees are cheap:**
 
 - The grammar is JIT-compiled with LLVM for the exact CPU it runs on, with each rule a native function and node allocation inlined.
-- Nodes go into one flat, contiguous array (16 bytes per node); there is no allocation per node. That's most of the gap to rust-peg's tree variant, which allocates a `Vec` of children per node.
-- Character-class loops test the first 8 bytes one at a time and switch to 16/32-byte SIMD only for longer runs. Most runs in JSON are short (a space, a few digits), where a vector step costs more than it saves; long runs, like the strings input, are where SIMD pays off: zgram is 9.7x faster than tree-building rust-peg there and 12x faster than validation-only rust-peg.
+- Nodes go into one flat, contiguous array (16 bytes per node), with no allocation per node. That's the main gap to rust-peg's tree actions and the typed ASTs, which allocate vectors, strings and maps per node.
+- Character-class loops test the first 8 bytes one at a time and switch to 16/32-byte SIMD only for longer runs. Most runs in JSON are short (a space, a few digits), where a vector step costs more than it saves; long runs, like the strings input, are where SIMD pays off.
 
-**cpp-peglib** is the slowest by a wide margin: as a runtime *interpreter* (walking the grammar), it pays heavy per-character overhead. zgram is also a runtime approach, but it compiles to machine code instead of interpreting.
+**Compiler matters for the C++ libraries.** They are built with GCC, which is 1.6-3x faster than Clang for lexy and Spirit X3 on these inputs. zgram generates its code with LLVM.
 
 ### Key Takeaway
 
-> zgram compiles a grammar at runtime into a parser that beats compile-time parser generators in Rust and C++, whether or not they build a tree -- and zgram builds one.
+> zgram compiles a grammar at runtime into a parser that builds a full parse tree faster than the fastest compile-time parser generators in C++ and Rust build theirs.
 
 ## Reproducing
 
 ```bash
-# Prerequisites: Zig 0.16+, CMake 3.14+, Rust/Cargo, Python 3
+# Prerequisites: Zig 0.16+, CMake 3.14+, a C++20 compiler, Boost 1.70+ (Spirit X3), Rust/Cargo, Python 3
 bash benchmark/run_all.sh
 ```
 
 ## Environment
 
 - CPU: AMD Ryzen 9 9950X3D 16-Core Processor (WSL2, Linux 6.18), run pinned to one core
-- Zig 0.16.0, GCC 11.4, Rust 1.90.0, CMake 3.22
+- Zig 0.16.0, GCC 11.4 (C/C++), Rust 1.90.0, CMake 3.30, Boost 1.74
+- Library versions: lexy c1358c4, Spirit X3 (Boost 1.74), PackCC 3.1.0, PEGTL 3.2.8, pest 2.7, rust-peg 0.8, cpp-peglib 1.9.1
 - All native builds use maximum optimization (`-O3` / `ReleaseFast` / `--release` with LTO)
