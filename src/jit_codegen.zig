@@ -168,13 +168,13 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
         }
     }
 
-    // A validator is small enough to inline every rule outside a recursion
-    // cycle into its callers, as compile-time parser generators do.
+    // A validator is small enough to inline into its callers every rule
+    // except one per recursion cycle (the cycle has to be a real call).
     if (mode == .validate) {
-        const recursive = try computeRecursive(allocator, grammar);
-        defer allocator.free(recursive);
+        const breakers = try computeCycleBreakers(allocator, grammar);
+        defer allocator.free(breakers);
         for (grammar.rules, 0..) |_, i| {
-            if (recursive[i]) continue;
+            if (breakers[i]) continue;
             b.addFnAttr(rule_fns[i], "alwaysinline");
             if (body_fns[i] != rule_fns[i]) b.addFnAttr(body_fns[i], "alwaysinline");
         }
@@ -1707,6 +1707,58 @@ fn exprRefsAllocating(grammar: *const gp.Grammar, flags: []const bool, expr: *co
         },
         .repetition => return exprRefsAllocating(grammar, flags, expr.rep_expr orelse return false),
     }
+}
+
+/// Rules that must stay real functions so the rest can be inlined: the
+/// targets of back edges in a depth-first walk of the reference graph, which
+/// together break every cycle.
+fn computeCycleBreakers(allocator: Allocator, grammar: *const gp.Grammar) CodegenError![]bool {
+    const n = grammar.rules.len;
+    const breakers = allocator.alloc(bool, n) catch return CodegenError.OutOfMemory;
+    @memset(breakers, false);
+    // 0 = unvisited, 1 = on the DFS path, 2 = done
+    const state = allocator.alloc(u8, n) catch return CodegenError.OutOfMemory;
+    defer allocator.free(state);
+    @memset(state, 0);
+
+    const Frame = struct { rule: usize, refs: []usize, next: usize };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer {
+        for (stack.items) |f| allocator.free(f.refs);
+        stack.deinit(allocator);
+    }
+
+    for (0..n) |root| {
+        if (state[root] != 0) continue;
+        state[root] = 1;
+        stack.append(allocator, .{ .rule = root, .refs = try refsOf(allocator, grammar, root), .next = 0 }) catch return CodegenError.OutOfMemory;
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            if (top.next == top.refs.len) {
+                state[top.rule] = 2;
+                allocator.free(top.refs);
+                _ = stack.pop();
+                continue;
+            }
+            const r = top.refs[top.next];
+            top.next += 1;
+            switch (state[r]) {
+                0 => {
+                    state[r] = 1;
+                    stack.append(allocator, .{ .rule = r, .refs = try refsOf(allocator, grammar, r), .next = 0 }) catch return CodegenError.OutOfMemory;
+                },
+                1 => breakers[r] = true, // back edge: r closes a cycle
+                else => {},
+            }
+        }
+    }
+    return breakers;
+}
+
+fn refsOf(allocator: Allocator, grammar: *const gp.Grammar, rule: usize) CodegenError![]usize {
+    var refs: std.ArrayList(usize) = .empty;
+    collectRefs(grammar, grammar.rules[rule].expr, &refs, allocator) catch return CodegenError.OutOfMemory;
+    return refs.toOwnedSlice(allocator) catch return CodegenError.OutOfMemory;
 }
 
 /// Which rules can reach themselves through references (directly or not).
