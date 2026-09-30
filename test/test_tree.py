@@ -159,3 +159,22 @@ def test_node_by_index(parser):
     for bad in (-1, 3):
         with pytest.raises(IndexError):
             tree.node(bad)
+
+
+def test_parent():
+    p = zgram.compile("s = '(' (s | word)* ')'\nword = [a-z]+ ' '?")
+    root = p.parse("(a (b (c d) e) f)")
+    assert root.parent() is None
+
+    def check(node):
+        for child in node:
+            assert child.parent() == node
+            check(child)
+
+    check(root)
+    deepest = [n for n in root.find("word") if n.text().strip() == "c"][0]
+    chain = []
+    while deepest is not None:
+        chain.append(deepest.rule())
+        deepest = deepest.parent()
+    assert chain == ["word", "s", "s", "s"]

@@ -1029,6 +1029,25 @@ const Node = struct {
         return self._idx;
     }
 
+    /// The node this one is a child of, or None for the root. Nodes don't
+    /// store their parent: it is found by descending from the root through
+    /// the subtrees that contain this node.
+    pub fn parent(self: *const Node) ?Node {
+        const t = self._t orelse return null;
+        if (self._idx == 0 or self._idx >= t._count) return null;
+        var current: u32 = 0;
+        while (true) {
+            var kid = current + 1;
+            const stop = t.skip(current);
+            while (kid < stop) : (kid = t.skip(kid)) {
+                if (kid == self._idx) return makeNode(t, current);
+                if (self._idx < t.skip(kid)) break;
+            }
+            if (kid >= stop) return null;
+            current = kid;
+        }
+    }
+
     /// The label this node was matched under in its parent rule, or None.
     pub fn field(self: *const Node) pyoz.Signature(?*pyoz.PyObject, "str | None") {
         const none = py.Py_None();
@@ -1206,6 +1225,7 @@ const Node = struct {
     pub const children__doc__: [*:0]const u8 = "Return all children as a list of Node.";
     pub const find__doc__: [*:0]const u8 = "Search this node and its descendants for nodes matching a rule name. Returns a list.";
     pub const find__params__ = "rule_name";
+    pub const parent__doc__: [*:0]const u8 = "Return the node this one is a child of, or None for the root.";
     pub const field__doc__: [*:0]const u8 = "Return the label this node was matched under in its parent rule (label:rule in the grammar), or None.";
     pub const get__doc__: [*:0]const u8 = "Return the first child matched under a label, or None.";
     pub const get__params__ = "name";

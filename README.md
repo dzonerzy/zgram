@@ -358,6 +358,7 @@ node.child_count() # Number of direct children: 2
 node.child(i)      # Get child by index, or None
 node.children()    # All children as a list[Node]
 node.find("name")  # This node and its descendants matching a rule -> list[Node]
+node.parent()      # The node this one is a child of, or None for the root
 node.tree          # The Tree this node belongs to (property)
 node.index         # Index of this node in the tree's node array (property)
 node.field()       # Label this node was matched under ('cond'), or None
