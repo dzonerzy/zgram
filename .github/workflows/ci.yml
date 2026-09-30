@@ -61,6 +61,7 @@ jobs:
         name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
         needs: build
         runs-on: ${{ matrix.os }}
+        timeout-minutes: 30
         strategy:
             fail-fast: false
             matrix:
@@ -81,7 +82,24 @@ jobs:
 
             - name: Install wheel
               shell: bash
-              run: python -m pip install dist/*.whl pytest
+              run: python -m pip install dist/*.whl pytest pytest-timeout
+
+            # Each stage prints before the next, so a hang shows where it is
+            - name: Smoke test
+              timeout-minutes: 5
+              shell: bash
+              run: |
+                  python -X faulthandler - <<'PY'
+                  import faulthandler, sys
+                  faulthandler.dump_traceback_later(120, exit=True)
+                  print("importing", flush=True)
+                  import zgram
+                  print("imported", zgram.__file__, zgram.version(), flush=True)
+                  p = zgram.compile("a = 'x'+\n")
+                  print("compiled", p, flush=True)
+                  print("parsed", p.parse("xxx").to_tuple(), flush=True)
+                  PY
 
             - name: Run tests
-              run: python -m pytest test -q
+              timeout-minutes: 20
+              run: python -m pytest test -v -o faulthandler_timeout=120 --timeout=300
