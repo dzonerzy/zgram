@@ -5,6 +5,11 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-01
+
+### Fixed
+- **`matches()` and `recover=True` never finished compiling on some large grammars.** The validator inlined every rule except one per recursion cycle into its callers, which grows exponentially when rules share sub-rules the way precedence levels do (`and_exp = cmp_exp ('and' cmp_exp)*`): with a Lua grammar, LLVM spent minutes optimizing, and the recovering parser, which carries validator copies of the rules, inherited the problem. Rules are now inlined smallest first, each only if no function grows past a size limit. The Lua grammar's validator compiles in 0.56 s and its recovering parser in 0.96 s; grammars under the limit, such as the benchmark's JSON and expression grammars, compile to the same code as before and validate at the same speed.
+
 ## [0.3.0] - 2026-09-30
 
 ### Added

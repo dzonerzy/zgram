@@ -4,6 +4,7 @@ to_tuple(), parallel parsing and the vectorized loops in generated code."""
 import asyncio
 import json
 import threading
+import time
 
 import pytest
 import zgram
@@ -327,6 +328,21 @@ class TestMatches:
         assert len(doc) > 16 * 1024
         assert json_parser.matches(doc) is True
         assert json_parser.matches(doc[:-1]) is False
+
+    def test_many_precedence_levels_compile_quickly(self):
+        # Each level uses the next twice: inlining every rule into its callers
+        # doubles the code per level (2^20 copies of the innermost rule here),
+        # which LLVM never finished optimizing
+        levels = 20
+        rules = [f"l{i} = l{i + 1} (ws op{i} ws l{i + 1})*\nop{i} = '{chr(0x41 + i)}'" for i in range(levels)]
+        grammar = "\n".join(rules) + f"\nl{levels} = [0-9]+ / '(' ws l0 ws ')'\n@silent ws = ' '*\n"
+        p = zgram.compile(grammar)
+        start = time.perf_counter()
+        assert p.matches("1 A (2 T 3) B 4") is True
+        assert p.matches("1 A") is False
+        tree = p.parse_tree("1 A (2 T) B 4", recover=True)
+        assert len(tree.errors) == 1
+        assert time.perf_counter() - start < 20
 
     def test_memo_grammar(self):
         p = zgram.compile("expr = term '+' expr / term '-' expr / term\n@memo term = '(' expr ')' / 'x'\n")

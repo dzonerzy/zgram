@@ -211,13 +211,16 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
     }
 
     // A validator is small enough to inline into its callers every rule
-    // except one per recursion cycle (the cycle has to be a real call).
-    // (Those rules are also where the depth of the recursion is checked.)
+    // except one per recursion cycle (the cycle has to be a real call), and
+    // those that would grow too big with everything they use inlined.
+    // (The cycle breakers are also where the depth of the recursion is checked.)
     const breakers = try computeCycleBreakers(allocator, grammar);
     defer allocator.free(breakers);
     if (mode == .validate) {
+        const inlined = try computeInlined(allocator, grammar, breakers);
+        defer allocator.free(inlined);
         for (grammar.rules, 0..) |_, i| {
-            if (breakers[i]) continue;
+            if (!inlined[i]) continue;
             b.addFnAttr(rule_fns[i], "alwaysinline");
             if (body_fns[i] != rule_fns[i]) b.addFnAttr(body_fns[i], "alwaysinline");
         }
@@ -243,7 +246,6 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
         b.addParamAttr(f.*, 0, "noalias");
         b.addParamAttr(f.*, 0, "readonly");
         b.addParamAttr(f.*, 2, "noalias");
-        if (!breakers[i]) b.addFnAttr(f.*, "alwaysinline");
     }
 
     // Recovery helpers (jit_helpers.zig)
@@ -2413,6 +2415,109 @@ fn computeCycleBreakers(allocator: Allocator, grammar: *const gp.Grammar) Codege
     }
     return breakers;
 }
+
+/// How big a validator function may get with the rules it uses inlined into
+/// it, in grammar expressions. Inlining every rule is exponential on some
+/// grammars: precedence levels that each use the next one twice (`and_exp =
+/// cmp_exp ('and' cmp_exp)*`) double per level, Lua's `exp` expanded to
+/// 94,000 expressions, and LLVM's optimizer, superlinear in a function's
+/// size, took minutes. JSON's and the expression benchmark's largest
+/// functions (123 and 235) are inlined completely.
+const INLINE_MAX_FUNCTION = 400;
+
+/// Which validator rules to always inline: never the cycle breakers; the
+/// others smallest first, each unless it would make a function bigger than
+/// INLINE_MAX_FUNCTION.
+fn computeInlined(allocator: Allocator, grammar: *const gp.Grammar, breakers: []const bool) CodegenError![]bool {
+    const n = grammar.rules.len;
+    var sizer = Sizer{
+        .grammar = grammar,
+        .expand = allocator.alloc(bool, n) catch return CodegenError.OutOfMemory,
+        .sizes = allocator.alloc(usize, n) catch return CodegenError.OutOfMemory,
+    };
+    defer allocator.free(sizer.sizes);
+    errdefer allocator.free(sizer.expand);
+    defer sizer.index.deinit(allocator);
+    for (grammar.rules, 0..) |rule, i| sizer.index.put(allocator, rule.name, i) catch return CodegenError.OutOfMemory;
+
+    // Smallest first, by size with everything that can be inlined inlined
+    for (sizer.expand, breakers) |*e, b| e.* = !b;
+    sizer.reset(std.math.maxInt(usize) / 2);
+    const Candidate = struct { rule: usize, size: usize };
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer candidates.deinit(allocator);
+    for (0..n) |i| {
+        if (!breakers[i]) candidates.append(allocator, .{ .rule = i, .size = sizer.ruleSize(i) }) catch return CodegenError.OutOfMemory;
+    }
+    std.sort.pdq(Candidate, candidates.items, {}, struct {
+        fn lt(_: void, a: Candidate, b: Candidate) bool {
+            return if (a.size != b.size) a.size < b.size else a.rule < b.rule;
+        }
+    }.lt);
+
+    @memset(sizer.expand, false);
+    for (candidates.items) |c| {
+        if (c.size > INLINE_MAX_FUNCTION) break;
+        sizer.expand[c.rule] = true;
+        sizer.reset(INLINE_MAX_FUNCTION);
+        if (sizer.largest() > INLINE_MAX_FUNCTION) sizer.expand[c.rule] = false;
+    }
+    return sizer.expand;
+}
+
+/// Sizes of validator rules, in grammar expressions, with the rules in
+/// `expand` inlined where they're referenced (a reference to any other rule
+/// is a call: size 1). Saturates just past `cap`.
+const Sizer = struct {
+    grammar: *const gp.Grammar,
+    index: std.StringHashMapUnmanaged(usize) = .empty,
+    expand: []bool,
+    /// Per rule, 0 = not computed yet (a size is at least 1)
+    sizes: []usize,
+    cap: usize = 0,
+
+    fn reset(self: *Sizer, cap: usize) void {
+        @memset(self.sizes, 0);
+        self.cap = cap;
+    }
+
+    /// The size of the biggest function: every rule not inlined is one
+    fn largest(self: *Sizer) usize {
+        var max: usize = 0;
+        for (0..self.sizes.len) |i| {
+            if (!self.expand[i]) max = @max(max, self.ruleSize(i));
+        }
+        return max;
+    }
+
+    /// (The expanded references form no cycle: only rules that aren't cycle
+    /// breakers are ever expanded, and the breakers cut every cycle.)
+    fn ruleSize(self: *Sizer, rule: usize) usize {
+        if (self.sizes[rule] == 0) self.sizes[rule] = self.exprSize(self.grammar.rules[rule].expr);
+        return self.sizes[rule];
+    }
+
+    fn exprSize(self: *Sizer, expr: *const gp.Expr) usize {
+        var size: usize = 1;
+        switch (expr.tag) {
+            .reference => if (self.index.get(expr.ref_name orelse "")) |r| {
+                if (self.expand[r]) size += self.ruleSize(r);
+            },
+            .sequence, .alternative => for (expr.children orelse &.{}) |child| {
+                size += self.exprSize(child);
+                if (size > self.cap) break;
+            },
+            .repetition => if (expr.rep_expr) |sub| {
+                size += self.exprSize(sub);
+            },
+            .not_predicate, .and_predicate => if (expr.pred_expr) |sub| {
+                size += self.exprSize(sub);
+            },
+            else => {},
+        }
+        return @min(size, self.cap + 1);
+    }
+};
 
 fn refsOf(allocator: Allocator, grammar: *const gp.Grammar, rule: usize) CodegenError![]usize {
     var refs: std.ArrayList(usize) = .empty;

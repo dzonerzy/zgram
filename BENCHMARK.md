@@ -12,7 +12,7 @@ zgram builds a parse tree: a node per rule match with the rule, byte span, child
 - **Their idiomatic typed AST** (JSON): Spirit X3 parsing into `x3::variant` / `std::vector` / `std::map` through attributes, and lexy's official JSON example parsing into its AST types. These build values rather than generic nodes, but they're what users of these libraries write.
 - **Other built-in trees.** pest's token pair queue (JSON), and lexy's `parse_as_tree`, which also records every token.
 
-The second comparison is **validation only**: accept or reject, build nothing. zgram's is `GrammarParser.matches()`, a separate parser zgram compiles for validation: no nodes, no error tracking, every rule except one per recursion cycle inlined. (When it rejects input, zgram runs the tree parser once more to explain why; that isn't timed here.)
+The second comparison is **validation only**: accept or reject, build nothing. zgram's is `GrammarParser.matches()`, a separate parser zgram compiles for validation: no nodes, no error tracking, every rule except one per recursion cycle inlined (for both grammars here; on large grammars, only as long as no function grows past a size limit). (When it rejects input, zgram runs the tree parser once more to explain why; that isn't timed here.)
 
 ## JSON
 
@@ -108,7 +108,7 @@ Tree nodes: 27 / 907 / 10,849 / 1,281.
 - The grammar is JIT-compiled with LLVM for the exact CPU it runs on.
 - Trees go into one flat, contiguous array (16 bytes per node), with no allocation per node. That's the main gap to rust-peg's tree actions and the typed ASTs, which allocate vectors, strings and maps per node.
 - Character classes are tested with a range compare or a few equality tests where possible, and loops over them test the first 8 bytes one at a time before switching to 16/32-byte SIMD. Most runs in real input are short (a space, a few digits); long ones, like the strings input, are where SIMD pays off.
-- The validator drops all tree and error bookkeeping and inlines everything except one rule per recursion cycle, as compile-time parser generators do.
+- The validator drops all tree and error bookkeeping and inlines everything except one rule per recursion cycle, as compile-time parser generators do (up to a size limit per function, which these grammars stay well under).
 
 **Compile time is not included.** zgram compiles a grammar at runtime: about 90 ms for these grammars (cached afterwards), plus about 0.1 s for the validator on first use of `matches()`. The other libraries compile ahead of time.
 
