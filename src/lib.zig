@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const pyoz = @import("PyOZ");
 const py = pyoz.py;
 const abi = @import("parse_abi.zig");
@@ -1163,6 +1164,32 @@ pub const Module = pyoz.module(.{
         pyoz.mapError("CompilationFailed", .RuntimeError),
     },
 });
+
+// ============================================================================
+// Windows: run C++ static constructors
+// ============================================================================
+
+/// On Windows the .pyd's entry point is Zig's _DllMainCRTStartup, which
+/// doesn't run the C++ static constructors of the bundled LLVM libraries
+/// (the MinGW CRT entry point normally would). Without them every LLVM
+/// command-line option keeps a zero value instead of its default, which
+/// among other things makes LLVM loop forever uniquing value names. Zig's
+/// entry point calls root.DllMain, so run the constructors from there.
+pub const DllMain = if (builtin.os.tag == .windows) windows_init.DllMain else {};
+
+const windows_init = struct {
+    const win = std.os.windows;
+    /// MinGW CRT (crt/gccmain.c): runs the global constructor list once
+    extern fn __main() callconv(.c) void;
+
+    fn DllMain(hinst: win.HINSTANCE, reason: win.DWORD, reserved: win.LPVOID) callconv(.winapi) win.BOOL {
+        _ = hinst;
+        _ = reserved;
+        const DLL_PROCESS_ATTACH = 1;
+        if (reason == DLL_PROCESS_ATTACH) __main();
+        return .TRUE;
+    }
+};
 
 // Required: forces analysis of all pub decls so PyInit_ is exported.
 comptime {
