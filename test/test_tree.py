@@ -162,7 +162,7 @@ def test_node_by_index(parser):
 
 
 def test_parent():
-    p = zgram.compile("s = '(' (s | word)* ')'\nword = [a-z]+ ' '?")
+    p = zgram.compile("s = '(' (s | word)* ')' ' '?\nword = [a-z]+ ' '?")
     root = p.parse("(a (b (c d) e) f)")
     assert root.parent() is None
 
