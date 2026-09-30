@@ -57,6 +57,17 @@ const Codegen = struct {
     helper_set_error_trailing: LB.Value,
     helper_set_error_at_hwm: LB.Value,
     helper_ensure_capacity: LB.Value,
+    helper_tag_field: LB.Value,
+    helper_tag_field_type: LB.Type,
+    helper_fold: LB.Value,
+    helper_fold_type: LB.Type,
+    /// In a @left/@right/@postfix rule: the trailing repetition whose
+    /// iterations get folded (see emitFoldRepetition)
+    fold_rep: ?*const gp.Expr = null,
+    /// ... the alloca i32 counting its marked iterations, and the one
+    /// holding the node index where the last of them starts
+    fold_count_ptr: LB.Value = null,
+    fold_iter_ptr: LB.Value = null,
 
     // Helper function types
     helper_reserve_node_type: LB.Type,
@@ -111,8 +122,16 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
     const helper_ensure_capacity_type = b.fnType(b.i32, &.{ b.ptr, b.i32 });
     const helper_ensure_capacity = b.addFunction("zgram_ensure_capacity", helper_ensure_capacity_type);
 
+    // void zgram_tag_field(ptr output, i32 from, i32 field)
+    const helper_tag_field_type = b.fnType(b.void, &.{ b.ptr, b.i32, b.i32 });
+    const helper_tag_field = b.addFunction("zgram_tag_field", helper_tag_field_type);
+
+    // i32 zgram_fold(ptr output, i32 first, i32 rule_id, i32 kind, i32 k, i32 start, i32 end)
+    const helper_fold_type = b.fnType(b.i32, &.{ b.ptr, b.i32, b.i32, b.i32, b.i32, b.i32, b.i32 });
+    const helper_fold = b.addFunction("zgram_fold", helper_fold_type);
+
     // None of the helpers unwind
-    for ([_]LB.Value{ helper_reserve_node, helper_fill_node, helper_set_error_trailing, helper_set_error_at_hwm, helper_ensure_capacity }) |h| {
+    for ([_]LB.Value{ helper_reserve_node, helper_fill_node, helper_set_error_trailing, helper_set_error_at_hwm, helper_ensure_capacity, helper_tag_field, helper_fold }) |h| {
         b.addFnAttr(h, "nounwind");
     }
 
@@ -194,6 +213,10 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
             .helper_set_error_trailing = helper_set_error_trailing,
             .helper_set_error_at_hwm = helper_set_error_at_hwm,
             .helper_ensure_capacity = helper_ensure_capacity,
+            .helper_tag_field = helper_tag_field,
+            .helper_tag_field_type = helper_tag_field_type,
+            .helper_fold = helper_fold,
+            .helper_fold_type = helper_fold_type,
             .helper_reserve_node_type = helper_reserve_node_type,
             .helper_fill_node_type = helper_fill_node_type,
             .helper_set_error_trailing_type = helper_set_error_trailing_type,
@@ -250,6 +273,138 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16, func: LB.V
         const result_pos = try emitExpr(cg, rule.expr, pos_arg, fail_block);
         _ = b.ret(result_pos);
         b.positionAtEnd(fail_block);
+        _ = b.ret(b.constSInt(b.i64, -1));
+    } else if (rule.fold != .none) {
+        // Folded rule: reserves no node. Its nodes pile up from `first`, the
+        // trailing repetition marks where each iteration starts, and
+        // zgram_fold nests them on success. Exactly one node results, so
+        // callers treat it like any node-producing rule.
+        const fail_block = try b.newBlock("fail");
+        const nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "nc_ptr");
+        const first = b.load(b.i32, nc_ptr, 4, "fold_first");
+
+        // Top-level nodes produced so far (the children of a wrapper over them)
+        cg.child_count_ptr = LB.llvm.LLVMBuildAlloca(b.b, b.i32, "fold_cc");
+        _ = b.store(b.constInt(b.i32, 0), cg.child_count_ptr, 4);
+        const seq = rule.expr.children orelse return CodegenError.InvalidGrammar;
+        cg.fold_rep = seq[seq.len - 1];
+        cg.fold_count_ptr = LB.llvm.LLVMBuildAlloca(b.b, b.i32, "fold_count");
+        _ = b.store(b.constInt(b.i32, 0), cg.fold_count_ptr, 4);
+        cg.fold_iter_ptr = LB.llvm.LLVMBuildAlloca(b.b, b.i32, "fold_last_iter");
+        _ = b.store(b.constInt(b.i32, 0), cg.fold_iter_ptr, 4);
+        const result_pos = try emitExpr(cg, rule.expr, pos_arg, fail_block);
+        cg.fold_rep = null;
+
+        const reps = b.load(b.i32, cg.fold_count_ptr, 4, "fold_reps");
+        const children = b.load(b.i32, cg.child_count_ptr, 4, "fold_children");
+        const nc = b.load(b.i32, nc_ptr, 4, "fold_nc");
+        const nodes_pp = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODES_PTR)}, "fold_nodes_pp");
+        const first64 = b.zext(first, b.i64, "fold_first64");
+
+        const no_reps_block = try b.newBlock("fold_no_reps");
+        const some_reps_block = try b.newBlock("fold_some_reps");
+        const single_block = try b.newBlock("fold_single");
+        const one_rep_block = try b.newBlock("fold_one_rep");
+        const fold_block = try b.newBlock("fold");
+        const done_block = try b.newBlock("fold_done");
+        const oom_block = try b.newBlock("fold_oom");
+        _ = b.condBr(b.icmp(.eq, reps, b.constInt(b.i32, 0), "fold_is_no_reps"), no_reps_block, some_reps_block);
+
+        // No repetition and a single operand node: it stands in for this rule
+        b.positionAtEnd(no_reps_block);
+        _ = b.condBr(b.icmp(.eq, children, b.constInt(b.i32, 1), "fold_is_single"), single_block, fold_block);
+
+        // ... without its label, which named its place in this rule's node
+        b.positionAtEnd(single_block);
+        {
+            const nodes_base = b.load(b.ptr, nodes_pp, 8, "fold_nodes");
+            const meta_off = b.add(b.shl(first64, b.constInt(b.i64, 4), "fold_off"), b.constInt(b.i64, @offsetOf(abi.FlatNode, "meta")), "fold_meta_off");
+            const meta_ptr = b.gep(b.i8, nodes_base, &.{meta_off}, "fold_meta_ptr");
+            const meta = b.load(b.i32, meta_ptr, 4, "fold_meta");
+            _ = b.store(b.@"and"(meta, b.constInt(b.i32, (1 << abi.FIELD_SHIFT) - 1), "fold_unlabelled"), meta_ptr, 4);
+            _ = b.br(done_block);
+        }
+
+        // One repetition (`a + b`), by far the most common fold, is done
+        // inline: one header over everything, which moves up one slot.
+        // Left and right folds agree on it; a @postfix one may not add a node.
+        b.positionAtEnd(some_reps_block);
+        const inline_one = b.icmp(.eq, reps, b.constInt(b.i32, 1), "fold_is_one_rep");
+        _ = b.condBr(inline_one, if (rule.fold == .postfix) fold_block else one_rep_block, fold_block);
+
+        b.positionAtEnd(one_rep_block);
+        {
+            const grow_block = try b.newBlock("fold_grow");
+            const shift_block = try b.newBlock("fold_shift");
+            const loop_block = try b.newBlock("fold_shift_loop");
+            const body_block = try b.newBlock("fold_shift_body");
+            const header_block = try b.newBlock("fold_header_fill");
+
+            const cap_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_CAPACITY)}, "fold_cap_ptr");
+            const cap = b.load(b.i32, cap_ptr, 4, "fold_cap");
+            _ = b.condBr(b.icmp(.ult, nc, cap, "fold_has_room"), shift_block, grow_block);
+
+            b.positionAtEnd(grow_block);
+            const grown = b.call(cg.helper_ensure_capacity_type, cg.helper_ensure_capacity, &.{ cg.output_ptr, b.add(nc, b.constInt(b.i32, 1), "fold_needed") }, "fold_grown");
+            _ = b.condBr(b.icmp(.eq, grown, b.constInt(b.i32, 0), "fold_grow_failed"), oom_block, shift_block);
+
+            // nodes[first + 1 .. nc + 1] = nodes[first .. nc], from the top down
+            b.positionAtEnd(shift_block);
+            const nodes_base = b.load(b.ptr, nodes_pp, 8, "fold_nodes1");
+            const nc64 = b.zext(nc, b.i64, "fold_nc64");
+            _ = b.br(loop_block);
+
+            b.positionAtEnd(loop_block);
+            const idx = b.phi(b.i64, "fold_shift_i");
+            _ = b.condBr(b.icmp(.ugt, idx, first64, "fold_shift_more"), body_block, header_block);
+
+            b.positionAtEnd(body_block);
+            const below = b.sub(idx, b.constInt(b.i64, 1), "fold_shift_below");
+            const src = b.gep(b.i8, nodes_base, &.{b.shl(below, b.constInt(b.i64, 4), "fold_src_off")}, "fold_src");
+            const lo = b.load(b.i64, src, 4, "fold_lo");
+            const hi = b.load(b.i64, b.gep(b.i8, src, &.{b.constInt(b.i64, 8)}, "fold_src_hi"), 4, "fold_hi");
+            _ = b.store(lo, b.gep(b.i8, src, &.{b.constInt(b.i64, 16)}, "fold_dst"), 4);
+            _ = b.store(hi, b.gep(b.i8, src, &.{b.constInt(b.i64, 24)}, "fold_dst_hi"), 4);
+            _ = b.br(loop_block);
+            b.addIncoming(idx, &.{ nc64, below }, &.{ shift_block, body_block });
+
+            b.positionAtEnd(header_block);
+            // The repetition's first node (now one slot up) loses its mark
+            const last_iter = b.zext(b.load(b.i32, cg.fold_iter_ptr, 4, "fold_last_iter_v"), b.i64, "fold_last_iter64");
+            const marked_off = b.add(b.shl(last_iter, b.constInt(b.i64, 4), "fold_marked_off"), b.constInt(b.i64, 16 + @offsetOf(abi.FlatNode, "subtree_size")), "fold_marked_size_off");
+            const marked_ptr = b.gep(b.i8, nodes_base, &.{marked_off}, "fold_marked_ptr");
+            const marked_size = b.load(b.i32, marked_ptr, 4, "fold_marked_size");
+            _ = b.store(b.@"and"(marked_size, b.constInt(b.i32, 0x7FFFFFFF), "fold_unmarked"), marked_ptr, 4);
+
+            const header = b.gep(b.i8, nodes_base, &.{b.shl(first64, b.constInt(b.i64, 4), "fold_header_off")}, "fold_header");
+            _ = b.store(b.trunc(pos_arg, b.i32, "fold_hs"), header, 4);
+            _ = b.store(b.trunc(result_pos, b.i32, "fold_he"), b.gep(b.i8, header, &.{b.constInt(b.i64, 4)}, "fold_h1"), 4);
+            _ = b.store(b.sub(nc, first, "fold_subtree"), b.gep(b.i8, header, &.{b.constInt(b.i64, 8)}, "fold_h2"), 4);
+            const stored_cc = b.callIntrinsic(b.lookupIntrinsic("llvm.umin"), &.{b.i32}, &.{ children, b.constInt(b.i32, abi.CHILD_COUNT_MANY) }, "fold_cc_sat");
+            const header_meta = b.@"or"(b.constInt(b.i32, @as(u32, rule_id) << abi.RULE_SHIFT), stored_cc, "fold_header_meta");
+            _ = b.store(header_meta, b.gep(b.i8, header, &.{b.constInt(b.i64, 12)}, "fold_h3"), 4);
+            _ = b.store(b.add(nc, b.constInt(b.i32, 1), "fold_nc1"), nc_ptr, 4);
+            _ = b.br(done_block);
+        }
+
+        b.positionAtEnd(fold_block);
+        const ok = b.call(cg.helper_fold_type, cg.helper_fold, &.{
+            cg.output_ptr,                     first,
+            b.constInt(b.i32, rule_id),        b.constInt(b.i32, @intFromEnum(rule.fold)),
+            reps,                              b.trunc(pos_arg, b.i32, "fold_s"),
+            b.trunc(result_pos, b.i32, "fold_e"),
+        }, "fold_ok");
+        _ = b.condBr(b.icmp(.eq, ok, b.constInt(b.i32, 0), "fold_failed"), oom_block, done_block);
+
+        b.positionAtEnd(done_block);
+        _ = b.ret(result_pos);
+
+        b.positionAtEnd(oom_block);
+        _ = b.ret(b.constSInt(b.i64, -1));
+
+        b.positionAtEnd(fail_block);
+        _ = b.store(first, nc_ptr, 4);
+        try emitHwmUpdate(cg, pos_arg, rule_id);
         _ = b.ret(b.constSInt(b.i64, -1));
     } else if (is_silent) {
         // Silent rule: no node for itself, but track child count so the caller
@@ -348,9 +503,12 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16, func: LB.V
         const start_i32 = b.trunc(pos_arg, b.i32, "start_i32");
         const end_i32 = b.trunc(result_pos, b.i32, "end_i32");
 
-        // child_count_and_rule = (rule_id << 16) | child_count
-        const child_count = b.load(b.i32, cg.child_count_ptr, 4, "cc");
-        const rule_shifted = b.constInt(b.i32, @as(u32, rule_id) << 16);
+        // meta = (rule_id << RULE_SHIFT) | child_count; the field id stays 0
+        // until a labelled reference in the parent sets it. The count
+        // saturates at CHILD_COUNT_MANY; readers then count the children.
+        const raw_child_count = b.load(b.i32, cg.child_count_ptr, 4, "cc_raw");
+        const child_count = b.callIntrinsic(b.lookupIntrinsic("llvm.umin"), &.{b.i32}, &.{ raw_child_count, b.constInt(b.i32, abi.CHILD_COUNT_MANY) }, "cc");
+        const rule_shifted = b.constInt(b.i32, @as(u32, rule_id) << abi.RULE_SHIFT);
         const rule_field = b.@"or"(rule_shifted, child_count, "cc_rule");
 
         // Store 4 u32 fields
@@ -565,6 +723,11 @@ fn emitReference(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
     }
     if (!found) return CodegenError.InvalidGrammar;
 
+    // A labelled reference tags the nodes the call adds, which start here
+    const field_id = if (cg.mode == .tree and cg.alloc_flags[rule_idx]) expr.field_id else 0;
+    const nc_ptr = if (field_id != 0) b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "lbl_nc_ptr") else undefined;
+    const first_node = if (field_id != 0) b.load(b.i32, nc_ptr, 4, "lbl_first") else undefined;
+
     // Call rule function
     const result = b.call(cg.rule_fn_type, cg.rule_fns[rule_idx], &.{ cg.input_ptr, cg.input_len, cg.output_ptr, pos }, "ref_result");
 
@@ -575,6 +738,24 @@ fn emitReference(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
     b.positionAtEnd(ok_block);
 
     if (cg.mode == .validate) return result;
+
+    if (field_id != 0) {
+        if (cg.silent_flags[rule_idx]) {
+            // Any number of top-level nodes
+            _ = b.call(cg.helper_tag_field_type, cg.helper_tag_field, &.{ cg.output_ptr, first_node, b.constInt(b.i32, field_id) }, "");
+        } else {
+            // Exactly one node, at first_node, whose field id is still 0 (a
+            // rule fills its node without one, and @memo caches it before
+            // the caller gets here): nodes[first_node].meta |= field << FIELD_SHIFT
+            const nodes_pp = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODES_PTR)}, "lbl_nodes_pp");
+            const nodes_base = b.load(b.ptr, nodes_pp, 8, "lbl_nodes");
+            const off = b.add(b.shl(b.zext(first_node, b.i64, "lbl_idx64"), b.constInt(b.i64, 4), "lbl_off"), b.constInt(b.i64, @offsetOf(abi.FlatNode, "meta")), "lbl_meta_off");
+            const meta_ptr = b.gep(b.i8, nodes_base, &.{off}, "lbl_meta_ptr");
+            const meta = b.load(b.i32, meta_ptr, 4, "lbl_meta");
+            const tagged = b.@"or"(meta, b.constInt(b.i32, @as(u32, field_id) << abi.FIELD_SHIFT), "lbl_tagged");
+            _ = b.store(tagged, meta_ptr, 4);
+        }
+    }
 
     if (cg.silent_flags[rule_idx]) {
         // Silent rule packs child count in upper 32 bits: (cc << 32) | pos
@@ -1313,8 +1494,87 @@ fn emitSimdAltLoop(cg: *Codegen, alt: *const gp.Expr, pos: LB.Value, outer_chain
     return run_end;
 }
 
+/// Flag the node at `iter_start` (if the iteration produced one) as the start
+/// of a repetition, and count it.
+fn emitFoldMark(cg: *Codegen, nc_ptr: LB.Value, iter_start: LB.Value) CodegenError!void {
+    const b = cg.b;
+    const mark = try b.newBlock("fold_mark");
+    const after = try b.newBlock("fold_mark_done");
+    const nc = b.load(b.i32, nc_ptr, 4, "fold_mark_nc");
+    _ = b.condBr(b.icmp(.ugt, nc, iter_start, "fold_has_nodes"), mark, after);
+
+    b.positionAtEnd(mark);
+    const nodes_pp = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODES_PTR)}, "fold_mark_pp");
+    const nodes_base = b.load(b.ptr, nodes_pp, 8, "fold_mark_nodes");
+    const off = b.add(b.shl(b.zext(iter_start, b.i64, "fold_mark_idx"), b.constInt(b.i64, 4), "fold_mark_off"), b.constInt(b.i64, @offsetOf(abi.FlatNode, "subtree_size")), "fold_mark_size_off");
+    const size_ptr = b.gep(b.i8, nodes_base, &.{off}, "fold_mark_ptr");
+    const size = b.load(b.i32, size_ptr, 4, "fold_mark_size");
+    _ = b.store(b.@"or"(size, b.constInt(b.i32, 1 << 31), "fold_marked_size"), size_ptr, 4);
+    const reps = b.load(b.i32, cg.fold_count_ptr, 4, "fold_reps_so_far");
+    _ = b.store(b.add(reps, b.constInt(b.i32, 1), "fold_reps_next"), cg.fold_count_ptr, 4);
+    _ = b.store(iter_start, cg.fold_iter_ptr, 4);
+    _ = b.br(after);
+
+    b.positionAtEnd(after);
+}
+
+/// The trailing repetition of a @left/@right/@postfix rule: a plain loop that
+/// marks the first node of every iteration for zgram_fold. An iteration that
+/// fails or matches nothing leaves no nodes.
+fn emitFoldRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
+    const b = cg.b;
+    const sub = expr.rep_expr orelse return CodegenError.InvalidGrammar;
+    const kind = expr.rep_kind;
+    const nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "fold_nc_ptr");
+
+    var start_pos = pos;
+    if (kind == '+') {
+        const first_start = b.load(b.i32, nc_ptr, 4, "fold_iter0");
+        start_pos = try emitExpr(cg, sub, pos, fail_block);
+        try emitFoldMark(cg, nc_ptr, first_start);
+    }
+    const entry_block = b.getCurrentBlock();
+
+    const header = try b.newBlock("fold_header");
+    const iter_fail = try b.newBlock("fold_iter_fail");
+    const marked = try b.newBlock("fold_marked");
+    const exit = try b.newBlock("fold_exit");
+    _ = b.br(header);
+
+    b.positionAtEnd(header);
+    const pos_phi = b.phi(b.i64, "fold_pos");
+    const iter_start = b.load(b.i32, nc_ptr, 4, "fold_iter");
+    const iter_cc = saveChildCount(cg);
+    const iter_pos = try emitExpr(cg, sub, pos_phi, iter_fail);
+    const no_progress = b.icmp(.eq, iter_pos, pos_phi, "fold_no_prog");
+    _ = b.condBr(no_progress, iter_fail, marked);
+
+    b.positionAtEnd(marked);
+    try emitFoldMark(cg, nc_ptr, iter_start);
+    const marked_block = b.getCurrentBlock();
+    _ = b.br(if (kind == '?') exit else header);
+
+    b.positionAtEnd(iter_fail);
+    restoreState(cg, nc_ptr, iter_start, iter_cc);
+    _ = b.br(exit);
+
+    if (kind == '?') {
+        b.addIncoming(pos_phi, &.{start_pos}, &.{entry_block});
+    } else {
+        b.addIncoming(pos_phi, &.{ start_pos, iter_pos }, &.{ entry_block, marked_block });
+    }
+
+    b.positionAtEnd(exit);
+    if (kind != '?') return pos_phi;
+    const exit_phi = b.phi(b.i64, "fold_exit_pos");
+    b.addIncoming(exit_phi, &.{ pos_phi, iter_pos }, &.{ iter_fail, marked_block });
+    return exit_phi;
+}
+
 /// Emit repetition: *, +, ?
 fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
+    if (cg.fold_rep == expr) return emitFoldRepetition(cg, expr, pos, fail_block);
+
     const b = cg.b;
     const sub = expr.rep_expr orelse return CodegenError.InvalidGrammar;
     const kind = expr.rep_kind;
@@ -1329,7 +1589,9 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         if (canSimdScan(resolved)) {
             return emitSimdCharScan(cg, resolved, pos, fail_block, kind, chain[0..chain_len]);
         }
-        if (kind == '*' and resolved.tag == .alternative) {
+        // Inlining the silent rule would drop the label on the reference to it
+        const labelled = sub.tag == .reference and sub.field_id != 0;
+        if (kind == '*' and resolved.tag == .alternative and !labelled) {
             if (try emitSimdAltLoop(cg, resolved, pos, chain[0..chain_len])) |end| return end;
         }
     }

@@ -1,12 +1,12 @@
 .{
     .name = .zgram,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0xcb213bf46558da2a,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .PyOZ = .{
-            .url = "https://github.com/pyozig/PyOZ/archive/refs/tags/v0.13.3.tar.gz",
-            .hash = "PyOZ-0.13.3-ntlpPs16FAAu8c8Jgvvl9j2oe7zWNQvEcp3SRy5xdY6b",
+            .url = "https://github.com/pyozig/PyOZ/archive/refs/tags/v0.13.7.tar.gz",
+            .hash = "PyOZ-0.13.7-ntlpPsAZFQC7KgaLCHdY1Lg3wtMevglufs5ZoJmaw55B",
         },
         .llvm_x86_64_linux = .{
             .url = "https://github.com/dzonerzy/zgram-llvm/releases/download/v21.1.8/llvm-21.1.8-x86_64-linux.tar.xz",

@@ -10,10 +10,20 @@
 
 const std = @import("std");
 
-/// Maximum number of rules in a grammar
-pub const MAX_RULES = 256;
+/// Maximum number of rules in a grammar (rule ids have RULE_MASK's 12 bits)
+pub const MAX_RULES = 4096;
 /// Maximum rule name length
 pub const MAX_RULE_NAME = 64;
+
+/// Maximum number of distinct field names (labels) in a grammar; id 0 = no field
+pub const MAX_FIELDS = 255;
+
+/// Layout of FlatNode.meta: child count (12 bits) | rule id (12) | field id (8)
+pub const RULE_SHIFT = 12;
+pub const RULE_MASK = 0xFFF;
+pub const FIELD_SHIFT = 24;
+/// Stored child count of a node with this many children or more
+pub const CHILD_COUNT_MANY = 0xFFF;
 
 /// A flat node in the parse result (C ABI compatible, 16 bytes)
 pub const FlatNode = extern struct {
@@ -23,20 +33,56 @@ pub const FlatNode = extern struct {
     text_end: u32 = 0,
     /// Total number of descendant nodes in this node's subtree (0 = leaf)
     subtree_size: u32 = 0,
-    /// Number of direct children (lower 16 bits) + rule ID (upper 16 bits)
-    child_count_and_rule: u32 = 0,
+    /// Child count, rule id and field id (see RULE_SHIFT, FIELD_SHIFT).
+    /// A count of CHILD_COUNT_MANY means "that many or more": count them by
+    /// stepping through the subtree.
+    meta: u32 = 0,
 
+    /// The stored count, saturated at CHILD_COUNT_MANY.
     pub inline fn child_count(self: FlatNode) u16 {
-        return @truncate(self.child_count_and_rule & 0xFFFF);
+        return @truncate(self.meta & CHILD_COUNT_MANY);
     }
 
     pub inline fn rule_id(self: FlatNode) u16 {
-        return @truncate(self.child_count_and_rule >> 16);
+        return @truncate((self.meta >> RULE_SHIFT) & RULE_MASK);
     }
 
-    pub inline fn setChildCountAndRule(child_cnt: u16, rid: u16) u32 {
-        return @as(u32, child_cnt) | (@as(u32, rid) << 16);
+    /// Id of the label this node was matched under in its parent (0 = none)
+    pub inline fn field_id(self: FlatNode) u8 {
+        return @truncate(self.meta >> FIELD_SHIFT);
     }
+
+    pub inline fn packMeta(child_cnt: u32, rid: u16) u32 {
+        return @min(child_cnt, CHILD_COUNT_MANY) | (@as(u32, rid) << RULE_SHIFT);
+    }
+};
+
+/// Version of the tree interface below (FlatNode's layout and TreeView),
+/// bumped on any incompatible change.
+pub const TREE_ABI: u32 = 1;
+
+/// A string in a TreeView: not NUL-terminated
+pub const Str = extern struct {
+    ptr: [*]const u8,
+    len: usize,
+};
+
+/// What the `zgram.tree.v1` capsule (Tree.capsule) points to: a finished
+/// parse tree, for native code in other packages. Everything it points to
+/// stays valid while the capsule is referenced. Check `abi` before use.
+pub const TreeView = extern struct {
+    abi: u32 = TREE_ABI,
+    /// Number of nodes; node 0 is the root, the rest follow in pre-order
+    node_count: u32 = 0,
+    nodes: ?[*]const FlatNode = null,
+    /// The parsed text, UTF-8; node offsets index into it
+    input: ?[*]const u8 = null,
+    input_len: usize = 0,
+    rule_count: u32 = 0,
+    /// A node's field id is an index into field_names plus one; 0 = no label
+    field_count: u32 = 0,
+    rule_names: ?[*]const Str = null,
+    field_names: ?[*]const Str = null,
 };
 
 /// Why a parse failed (ParseOutput.error_kind)

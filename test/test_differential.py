@@ -6,7 +6,6 @@ named in "expected <rule>" messages.
 """
 
 import random
-import re
 
 import pytest
 import zgram
@@ -45,28 +44,35 @@ def random_grammar(rnd):
         silent = i > 0 and rnd.random() < 0.3
         memo = rnd.random() < 0.3
         rules.append((name, random_expr(rnd, names, 3), silent, memo))
-    return Grammar(rules)
+    g = Grammar(rules)
+    for name in names:
+        if rnd.random() < 0.2:
+            g.display[name] = f"a {name} thing"
+    return g
 
 
 def zgram_result(parser, text):
     try:
         return ("ok", parser.parse(text).to_tuple(spans=True))
     except zgram.ParseError as e:
-        if e.message == "unexpected input after match":
-            return ("trailing", e.offset)
-        m = re.fullmatch(r"expected (\w+)", e.message)
-        return ("expected", e.offset, m.group(1) if m else e.message)
+        return classify(e.message, e.offset)
     except ValueError as e:
         if "produced no nodes" in str(e):
             return ("nonodes",)
         raise
 
 
+def classify(message, offset):
+    """An error in the reference's terms: trailing input, or what was expected."""
+    if message == "unexpected input after match":
+        return ("trailing", offset)
+    return ("terminal", offset, message)
+
+
 def error_of(parser):
-    """(offset, rule) or (offset,) for trailing input, from parser.error."""
+    """The error left in parser.error, as classify() describes it."""
     e = parser.error
-    m = re.fullmatch(r"expected (\w+)", e.message())
-    return (e.offset(), m.group(1)) if m else (e.offset(),)
+    return classify(e.message(), e.offset())
 
 
 def compile_or_skip(source):
@@ -104,7 +110,7 @@ def test_random_grammars_match_reference(seed):
             # The validator must agree, and leave the same error behind
             assert plain.matches(text) == (expected[0] == "ok"), f"matches() grammar:\n{g.text()}input: {text!r}"
             if expected[0] != "ok":
-                assert error_of(plain) == expected[1:], f"matches() error, grammar:\n{g.text()}input: {text!r}"
+                assert error_of(plain) == expected, f"matches() error, grammar:\n{g.text()}input: {text!r}"
             assert zgram_result(memo, text) == expected, f"@memo grammar:\n{g.text(True)}input: {text!r}"
             compared += 1
     assert compared > 0

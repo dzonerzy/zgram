@@ -220,11 +220,20 @@ class TestHWMEdgeCases:
         # Error should be deep in the input, not at position 0
         assert err.column() > 10
 
-    def test_partial_match_still_uses_hwm_for_position(self):
-        """Partial match error uses result position, not HWM."""
+    def test_partial_match_without_a_further_failure(self):
+        """Nothing failed beyond the end of the match: report trailing input there."""
         p = zgram.compile(JSON_GRAMMAR)
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(zgram.ParseError) as exc_info:
             p.parse('"hello" EXTRA')
-        err = str(exc_info.value)
-        # Partial match error is different from total failure
-        assert "unexpected input after match" in err
+        assert exc_info.value.message == "unexpected input after match"
+        assert exc_info.value.offset == 8
+
+    def test_partial_match_reports_the_failure_beyond_it(self):
+        """The start rule matched a prefix because a rule failed further on:
+        that failure is the error, not the end of the prefix."""
+        p = zgram.compile("prog = (stmt ws)*\nstmt = 'let ' name ' = ' num ';'\nname = [a-z]+\nnum = [0-9]+\n@silent ws = [ \n]*")
+        with pytest.raises(zgram.ParseError) as exc_info:
+            p.parse("let a = 1;\nlet b = ;")
+        e = exc_info.value
+        assert (e.message, e.line, e.column, e.offset) == ("expected num", 2, 9, 19)
+        assert p.match("let a = 1;\nlet b = ;").end() == 11

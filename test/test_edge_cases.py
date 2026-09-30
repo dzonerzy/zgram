@@ -974,3 +974,68 @@ class TestDumpIR:
         ir = zgram.dump_ir("root = ws [a-z]+\n@silent ws = [ ]*\n")
         assert isinstance(ir, str)
         assert "zgram_parse" in ir
+
+
+class TestManyChildren:
+    """Nodes with more children than the stored (saturating) count can hold."""
+
+    GRAMMAR = "arr = '[' (num (',' num)*)? ']'\nnum = [0-9]+\n"
+
+    @pytest.mark.parametrize("n", [4094, 4095, 4096, 5000, 65535, 65536, 70000, 200000])
+    def test_child_count_and_rule(self, n):
+        root = zgram.compile(self.GRAMMAR).parse("[" + ",".join(["1"] * n) + "]")
+        assert root.rule() == "arr"
+        assert len(root) == n
+        assert root.child_count() == n
+        assert sum(1 for _ in root) == n
+        assert len(root.children()) == n
+        assert root[n - 1].rule() == "num"
+        assert root[-1] == root[n - 1]
+        assert root.child(n) is None
+        assert len(root.to_tuple()[2]) == n
+        assert len(root.find("num")) == n
+
+    def test_indexing_many_children_is_linear(self):
+        n = 70000
+        root = zgram.compile(self.GRAMMAR).parse("[" + ",".join(["1"] * n) + "]")
+        assert all(root[i].text() == "1" for i in range(n))
+
+    def test_nested_many_children(self):
+        p = zgram.compile("outer = arr (';' arr)*\n" + self.GRAMMAR)
+        inner = "[" + ",".join(["1"] * 70000) + "]"
+        root = p.parse(inner + ";[2]" + ";" + inner)
+        assert [len(c) for c in root] == [70000, 1, 70000]
+        assert [c.rule() for c in root] == ["arr"] * 3
+
+
+class TestRuleLimits:
+    @staticmethod
+    def grammar(n):
+        """A root choosing between n - 1 rules, each matching its own number."""
+        names = [f"r{i}" for i in range(n - 1)]
+        return "root = (" + " | ".join(names) + ")+\n" + "".join(f"{name} = '<{i}>'\n" for i, name in enumerate(names))
+
+    def test_more_than_256_rules(self):
+        p = zgram.compile(self.grammar(600))
+        assert len(p.rules()) == 600
+        root = p.parse("<0><255><256><598>")
+        assert [c.rule() for c in root] == ["r0", "r255", "r256", "r598"]
+        assert root.rule() == "root"
+
+    def test_error_names_a_high_rule(self):
+        p = zgram.compile("root = " + " ".join(f"r{i}" for i in range(400)) + "\n" + "".join(f"r{i} = 'a'\n" for i in range(400)))
+        with pytest.raises(zgram.ParseError, match="expected r300"):
+            p.parse("a" * 300)
+
+    def test_too_many_rules(self):
+        with pytest.raises(ValueError):
+            zgram.compile("".join(f"r{i} = 'a'\n" for i in range(4097)))
+
+    def test_left_recursion_through_a_late_alternative(self):
+        """Detected even when the recursive branch is past the 64th alternative."""
+        names = [f"r{i}" for i in range(80)]
+        grammar = "root = " + " | ".join(names) + "\n"
+        grammar += "".join(f"{n} = '{chr(97 + i % 26)}' 'x'\n" for i, n in enumerate(names[:-1]))
+        grammar += "r79 = root 'y'\n"
+        with pytest.raises(ValueError):
+            zgram.compile(grammar)

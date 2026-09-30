@@ -5,6 +5,34 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Labels:** `label:rule` names a child. The label is stored in the node: `node.field()`, `node.get(label)`, `node.get_all(label)`, `parser.fields()`.
+- **Chain folding:** `@left`, `@right` and `@postfix` on a rule `head (group)*` make the parser produce nested nodes (`1+2-3` → `sum(sum(1 + 2) - 3)`), and no node at all when nothing repeats. `@postfix` lets each suffix node (call, index, member access) adopt what is on its left.
+- **AST mapping:** `-> name` after a rule and `parser.parse_ast(text)` convert the tree to values in one native pass: built-ins `str`, `int`, `float`, `True`, `False`, `None`, `list`, `tuple`, `dict`, `first`, `drop`, or any class/callable supplied with `zgram.compile(grammar, ast=...)` or `parser.bind(ast)`. Labelled children become keyword arguments; built objects get `__zspan__ = (start, end)` and `__znode__` (their node's index). `node.to_ast()` converts a subtree of an existing tree. `-> unquote` turns a quoted string literal into its text, replacing backslash escapes.
+- **Precise syntax errors:** a missing `;` or `)` is reported where it was expected, as `expected ';'` or `expected ',' or ')'`, instead of at the start of the enclosing rule; a rule that failed where it started is expected by name, the outermost one (`expected expr`). A failed parse is re-run in an interpreter to find the furthest failure; successful parses are unaffected.
+- **Display names:** `expr "expression" = ...` makes error messages say `expected expression` instead of the rule's name.
+- **`-> Name()`** calls a class with no arguments, for rules such as `break_stmt` that carry no information.
+- **`compile_async(grammar, ast=None)`** accepts `ast`, like `compile()`.
+- **`examples/tiny`:** a small language (grammar, AST, interpreter, diagnostics) built on the features above.
+- **Up to 4096 rules** per grammar (was 256).
+
+- **`parser.parse_tree(text)`, `Tree`, `node.tree`, `node.index`:** the whole result of a parse (`root`, `nodes`, `input`, `rules`, `fields`), and `tree.capsule`, a `zgram.tree.v1` PyCapsule that lets native code in other packages read the tree in place. `zgram.TREE_ABI` versions the layout.
+- **`zgram.Diagnostic`:** an error, warning or note with a code, a span, notes and `render(source, filename)`; `ParseError.diagnostic` is the syntax error as one.
+
+### Changed
+- **"expected" messages** list everything expected at the furthest failure rather than the first rule that failed there: `{"a": }` with the README's JSON grammar now says `expected value`, not `expected object`.
+- **Errors when the start rule matches only part of the input** now report the furthest failure beyond the match, if there is one: `let b = ;` gives `expected num` at the `;` instead of `unexpected input after match` at the start of the statement.
+- **Node layout:** the last word of a node now holds the child count in 12 bits (saturating), the rule id in 12 bits and the label's field id in 8 bits. Only native code reading the node array directly is affected.
+- `-> name` after a rule, which was parsed and ignored, now has a meaning for `parse_ast()`. `parse()` is unaffected.
+
+### Fixed
+- **Nodes with more than 65,535 children** reported a wrong `len()`, stopped iterating early, and could report the wrong `rule()`: the child count overflowed its 16 bits into the rule id. The stored count now saturates, and larger nodes are counted by stepping through their children.
+- **Left recursion through the 65th or later alternative** of a rule went undetected, and the compiled parser would overflow the stack.
+- `parser.error.message()` returned NUL bytes for "unexpected input after match".
+- Formatting an "expected <rule>" error copied a buffer onto itself, which aborted debug builds of zgram.
+
 ## [0.1.0] - 2026-09-30
 
 First release on PyPI, as **`zgram-py`** (`pip install zgram-py`; the module is still `import zgram`). Wheels are abi3 (CPython 3.10+) for x86_64 Linux (manylinux_2_17) and x86_64 Windows.

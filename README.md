@@ -26,25 +26,38 @@ zgram compiles PEG grammars into SIMD-accelerated native code via LLVM JIT at ru
 On a JSON parsing benchmark (from Python, including call overhead):
 
 ```
-Small JSON (43 bytes):    0.1us  -  8x faster than json.loads
-Medium JSON (1.2KB):      1.3us  -  3x faster than json.loads
-Large JSON (15KB):       21.2us  -  4x faster than json.loads
+Small JSON (43 bytes):    0.1us  -  6x faster than json.loads
+Medium JSON (1.2KB):      1.0us  -  4x faster than json.loads
+Large JSON (15KB):       16.1us  -  5x faster than json.loads
 ```
 
 Compared to other Python parser generators:
 
 | Parser | Type | Small (43B) | Medium (1.2KB) | Large (15KB) |
 |--------|------|-------------|----------------|--------------|
-| **zgram** | **PEG, LLVM JIT** | **0.1us** | **1.3us** | **21.2us** |
-| json.loads | Hand-tuned C | 0.9us | 4.1us | 81.1us |
-| pe | PEG, C ext | 12.4us (107x) | 248us (191x) | 4,069us (192x) |
-| parsimonious | PEG, pure Python | 96.6us (835x) | 3,257us (2507x) | 44,615us (2108x) |
-| pyparsing | Combinator | 102us (879x) | 2,017us (1552x) | 31,566us (1491x) |
-| lark | Earley | 634us (5478x) | 17,231us (13262x) | 373,682us (17653x) |
+| **zgram** | **PEG, LLVM JIT** | **0.1us** | **1.0us** | **16.1us** |
+| json.loads | Hand-tuned C | 0.8us | 3.7us | 74.2us |
+| pe | PEG, C ext | 9.2us (77x) | 199us (192x) | 3,218us (200x) |
+| parsimonious | PEG, pure Python | 69.7us (582x) | 2,340us (2259x) | 31,672us (1966x) |
+| pyparsing | Combinator | 87.1us (727x) | 1,494us (1442x) | 25,041us (1554x) |
+| lark | Earley | 511us (4269x) | 12,696us (12253x) | 261,962us (16257x) |
 
-Against the fastest parsing libraries in C++ and Rust (Spirit X3, lexy, PEGTL, rust-peg, pest), zgram is the fastest in 15 of 16 benchmark comparisons across a JSON and an expression grammar, whether they build a parse tree or only validate: Spirit X3 building the same flat node array takes 1.3-1.7x longer on typical input, rust-peg with tree actions 3-10x, and for validation only (`matches()`) compile-time C++ takes 1.2-2.7x longer. The exception is a deeply nested expression tree, where Spirit X3 is 6% faster. See [BENCHMARK.md](https://github.com/dzonerzy/zgram/blob/main/BENCHMARK.md). String-heavy input is where zgram's SIMD code shines: a 75 KB JSON document of long strings parses in 10us (7.5 GB/s).
+Against the fastest parsing libraries in C++ and Rust (Spirit X3, lexy, PEGTL, rust-peg, pest), zgram is the fastest in 15 of 16 benchmark comparisons across a JSON and an expression grammar, whether they build a parse tree or only validate: Spirit X3 building the same flat node array takes 1.3-1.7x longer on typical input, rust-peg with tree actions 3-10x, and for validation only (`matches()`) compile-time C++ takes 1.2-2.7x longer. The exception is a deeply nested expression tree, where Spirit X3 is 9% faster. See [BENCHMARK.md](https://github.com/dzonerzy/zgram/blob/main/BENCHMARK.md). String-heavy input is where zgram's SIMD code shines: a 75 KB JSON document of long strings parses in 10us (7.5 GB/s).
 
 > `json.loads` does **more** work (parses + builds Python dicts/lists). zgram returns a zero-copy parse tree.
+
+### A small language
+
+[examples/tiny](https://github.com/dzonerzy/zgram/tree/main/examples/tiny) is a complete language in about 300 lines: functions, `if`/`while`/`break`/`return`, variables and expressions. The grammar builds the AST directly (labels, `@left` folding, `-> Class` actions), a tree-walking interpreter runs it, and syntax and runtime errors come out as the same kind of diagnostic:
+
+```
+program.tiny:1:13: error: expected expression [syntax]
+    1 | let x = 1 + ;
+      |             ^
+program.tiny:2:7: error: undefined name 'y' [undefined-name]
+    2 | print(y);
+      |       ^
+```
 
 ### SQL-to-MongoDB Converter
 
@@ -140,8 +153,12 @@ rule_name = expression
 | `&e` | Positive lookahead (and predicate) |
 | `@silent` | Annotation: suppress node in parse tree |
 | `@memo` | Annotation: cache the rule's result per position (packrat) |
+| `label:rule` | Label a child: `node.get("label")`, and a keyword argument in `parse_ast()` |
+| `@left`, `@right`, `@postfix` | Annotation: fold a chain `head (group)*` into nested nodes |
+| `-> name` | After a rule: what `parse_ast()` converts its node to |
+| `name "display name" = ...` | What error messages call the rule (`expected expression`) |
 
-The first rule is the start rule.
+The first rule is the start rule. A grammar can have up to 4096 rules.
 
 ### `@silent` Annotation
 
@@ -168,19 +185,112 @@ expr = term '+' expr / term '-' expr / term
 
 Predicates (`!e`, `&e`) are composable: `!!e`, `!&e`, `&!e` all work as expected.
 
+### Labels
+
+`label:rule` on a rule reference names that child. The label is stored in the child's node:
+
+```
+if_stmt = 'if' ws cond:expr ws then:block (ws 'else' ws else_:block)?
+```
+
+```python
+node.get("cond")      # the child labelled cond, or None
+node.get_all("body")   # all children with that label (labels inside * or +)
+child.field()         # 'cond', or None for an unlabelled node
+parser.fields()       # every label of the grammar
+```
+
+Only rule references can be labelled. A label on a `@silent` rule applies to every node that rule produces. A grammar can use up to 255 distinct labels. Labels cost one extra write per labelled child; a grammar without labels compiles to the same code as before.
+
+### Folding chains: `@left`, `@right`, `@postfix`
+
+PEG has no left recursion, so `1 + 2 - 3` is written `product (addop product)*` and parses to a flat node `sum[1, +, 2, -, 3]`, with a `sum` wrapper around every lone operand. The fold annotations make the parser produce the nested tree instead:
+
+```
+@left sum     = left:product (ws op:addop ws right:product)*
+@left product = left:atom (ws op:mulop ws right:atom)*
+```
+
+| Input | `@left` | `@right` |
+|-------|---------|----------|
+| `7` | `7` (no `sum` node: the operand stands in) | `7` |
+| `1+2` | `sum(1 + 2)` | `sum(1 + 2)` |
+| `1+2-3` | `sum(sum(1 + 2) - 3)` | `sum(1 + sum(2 - 3))` |
+
+`@postfix` is for suffix chains where each suffix is its own kind of node: the suffix node adopts everything to its left as its first child, under the head's label.
+
+```
+@postfix post = target:primary (call | index | member)*
+call   = '(' args:arglist? ')'
+index  = '[' index:expr ']'
+member = '.' name:ident
+```
+
+`a.b(c)[d]` becomes `index(target=call(target=member(target=a, name=b), args=c), index=d)`.
+
+A folded rule must have the form `head (group)*` (the group may also use `?` or `+`) and can't be `@silent`. If the head isn't exactly one node, or a `@postfix` repetition isn't, the rule's own node is used as the wrapper. Folding happens during the parse, in place. Compared with the flat grammar, a folded one takes the same time or less where no operator matches, about 1.3x on input made only of single operators (`a + b`), and about 1.6x on input made only of longer chains.
+
+### Building an AST: `-> name` and `parse_ast()`
+
+`-> name` after a rule says what its node becomes. `parser.parse_ast(text)` parses, then converts the tree bottom-up in one native pass:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class BinOp:
+    left: object
+    op: str
+    right: object
+
+@dataclass
+class Number:
+    text: str
+
+parser = zgram.compile("""
+    @left sum = left:number (op:addop right:number)*   -> BinOp
+    number    = [0-9]+                                 -> Number
+    addop     = [+\-]                                  -> str
+""", ast={"BinOp": BinOp, "Number": Number})
+
+parser.parse_ast("1+2-3")
+# BinOp(left=BinOp(left=Number(text='1'), op='+', right=Number(text='2')), op='-', right=Number(text='3'))
+```
+
+| Action | Value |
+|--------|-------|
+| `-> str`, `-> int`, `-> float` | The matched text, converted |
+| `-> unquote` | A quoted string literal's text: without its first and last character, with backslash escapes replaced (`\n \t \r \b \f \0 \xHH \uHHHH`; any other escaped character stands for itself) |
+| `-> True`, `-> False`, `-> None` | That constant |
+| `-> list`, `-> tuple` | The children's values |
+| `-> dict` | A dict from children that are `(key, value)` tuples |
+| `-> first` | The first child's value (`None` without children) |
+| `-> drop` | No value: left out of the parent's children |
+| `-> Name` | `Name(...)` called with the node's children, `Name` being a class or any callable from `ast` |
+| `-> Name()` | `Name()` called with no arguments (`break_stmt = 'break' ';' -> Break()`) |
+| (none) | A leaf's text; an only child's value; otherwise a list of the children's values |
+
+For `-> Name`, labelled children become keyword arguments: a label inside `*`/`+` (or used twice) is always a list, any other label is the value or `None` when absent. Unlabelled children are not passed. A rule without labels passes its children's values positionally, or its matched text if it can't have children (`Number(text='1')` above).
+
+`ast` is a dict or any object with the names as attributes (a module); `parser.bind(ast)` sets it after compiling. Objects built by `-> Name` get two attributes, unless they can't take attributes (or `parse_ast(text, spans=False)`): `__zspan__ = (start, end)`, their byte offsets, and `__znode__`, the index of their node in the tree.
+
+`parse_ast(text)` is `parse(text).to_ast()`. Use the two-step form to keep the tree as well: `node.to_ast()` converts any subtree, and `__znode__` then identifies each object's node in `node.tree`.
+
+A JSON grammar with `-> dict`, `-> list`, `-> float` and `-> unquote` converts the 16 KB benchmark document in about 1.5x the time of `json.loads` (85 us against 55 us).
+
 ## API Reference
 
 ### Module Functions
 
 ```python
-zgram.compile(grammar: str) -> GrammarParser
+zgram.compile(grammar: str, ast=None) -> GrammarParser
 ```
-Compile a PEG grammar string into a native parser via LLVM JIT. Compilation happens in-process -- no subprocess, no disk I/O -- and releases the GIL. The 16 most recently compiled grammars are cached, so compiling the same grammar again returns in microseconds.
+Compile a PEG grammar string into a native parser via LLVM JIT. `ast` supplies the classes named by `-> Name` actions (see [Building an AST](#building-an-ast---name-and-parse_ast)). Compilation happens in-process -- no subprocess, no disk I/O -- and releases the GIL. The 16 most recently compiled grammars are cached, so compiling the same grammar again returns in microseconds.
 
 ```python
-await zgram.compile_async(grammar: str) -> GrammarParser
+await zgram.compile_async(grammar: str, ast=None) -> GrammarParser
 ```
-Compile on a worker thread without blocking the event loop (a cold compile takes ~100 ms of LLVM work).
+Compile on a worker thread without blocking the event loop (a cold compile takes ~100 ms of LLVM work). `ast` is bound when the compile finishes, as in `compile()`; a missing class raises `ValueError` from the `await`. `grammar` is positional-only here.
 
 ```python
 zgram.clear_cache() -> None
@@ -207,7 +317,11 @@ tree = parser.parse("hello")
 - **`parse(input: str | bytes, start: str | None = None) -> Node`** -- Parse the whole input and return the root node. Raises `ParseError` on failure. `start` picks the start rule (default: the first rule). `bytes` input must be UTF-8 if you call `text()`.
 - **`match(input: str | bytes, start: str | None = None) -> Node | None`** -- Match the start rule at the beginning of the input without requiring it to consume everything (like `re.match`). The root node's `end()` is where the match stopped. Returns `None` if it doesn't match.
 - **`matches(input: str | bytes, start: str | None = None) -> bool`** -- Does the whole input match? Runs a separate validation-only parser that builds no tree (about 2x faster than `parse()`). On `False`, `error` explains the rejection. The validator is compiled on the first call (0.1-1 s depending on grammar size) and cached with the grammar.
+- **`parse_ast(input: str | bytes, start: str | None = None, spans: bool = True) -> object`** -- Parse the whole input and convert the tree to values as the rules' `-> name` actions say. Raises `ParseError` on failure.
+- **`parse_tree(input: str | bytes, start: str | None = None) -> Tree`** -- Parse the whole input and return the `Tree` (see [Tree](#tree)).
+- **`bind(ast) -> None`** -- Supply (or replace) the classes named by `-> Name` actions.
 - **`rules() -> list[str]`** -- The grammar's rule names, in definition order.
+- **`fields() -> list[str]`** -- The grammar's labels, in order of first use.
 - **`error -> ParseErrorInfo | None`** -- Property with error details from the last failed `parse()`/`match()`.
 
 ```python
@@ -243,7 +357,13 @@ node.child_count() # Number of direct children: 2
 node.child(i)      # Get child by index, or None
 node.children()    # All children as a list[Node]
 node.find("name")  # This node and its descendants matching a rule -> list[Node]
+node.tree          # The Tree this node belongs to (property)
+node.index         # Index of this node in the tree's node array (property)
+node.field()       # Label this node was matched under ('cond'), or None
+node.get("cond")   # First child with that label, or None
+node.get_all("arg") # All children with that label -> list[Node]
 node.to_tuple()    # Whole subtree as nested tuples, built natively (see below)
+node.to_ast()      # Subtree converted by the rules' -> actions (see parse_ast)
 ```
 
 `start()` and `end()` are byte offsets into the UTF-8 encoded input. They equal string indices only for ASCII input; for other text, use `text()` or slice `input.encode()`.
@@ -292,9 +412,76 @@ for child in tree:
         print(grandchild.rule(), grandchild.text())
 ```
 
+### Tree
+
+`parser.parse_tree(text)` (or `node.tree`) gives the whole result of a parse, for code that reads the node array itself:
+
+```python
+tree = parser.parse_tree("ab=12")
+tree.root      # the root Node
+len(tree)      # number of nodes
+tree.nodes     # bytes: a copy of the node array, 16 bytes per node, in pre-order
+tree.input     # bytes: the parsed text as UTF-8 (node offsets index into it)
+tree.rules     # rule names by rule id
+tree.fields    # label names by field id - 1
+tree.capsule   # PyCapsule "zgram.tree.v1" for native code
+```
+
+Each node is four little-endian `uint32`: `text_start`, `text_end`, `subtree_size` (number of descendants, which follow the node directly) and `meta` = child count (bits 0-11, 4095 meaning "4095 or more") | rule id (bits 12-23) | field id (bits 24-31, 0 = unlabelled).
+
+The capsule points to this C struct (`TreeView` in `src/parse_abi.zig`), which reads the nodes and input in place, without copying. The capsule keeps the tree alive. `zgram.TREE_ABI` (currently `1`) is the struct's `abi` field; native code should check it before reading anything else.
+
+```c
+typedef struct { const char *ptr; size_t len; } zgram_str;   /* not NUL-terminated */
+typedef struct { uint32_t text_start, text_end, subtree_size, meta; } zgram_node;
+typedef struct {
+    uint32_t abi;               /* zgram.TREE_ABI */
+    uint32_t node_count;
+    const zgram_node *nodes;    /* node 0 is the root */
+    const char *input;
+    size_t input_len;
+    uint32_t rule_count;
+    uint32_t field_count;
+    const zgram_str *rule_names;
+    const zgram_str *field_names;
+} zgram_tree_v1;
+```
+
+### Diagnostic
+
+`zgram.Diagnostic` is one error, warning or note about a source text. zgram reports syntax errors with it, and it is meant to be shared by everything built on top (semantic checks, runtime errors, editor tooling), so a language's errors look the same whichever stage finds them.
+
+```python
+d = zgram.Diagnostic("error", "break-outside-loop", "'break' outside loop", (30, 35))
+print(d.render(source, "program.z"))
+# program.z:4:5: error: 'break' outside loop [break-outside-loop]
+#     4 |     break;
+#       |     ^^^^^
+```
+
+`Diagnostic(severity, code, message, span, line=0, column=0, notes=())`: `severity` is `"error"`, `"warning"` or `"note"`; `span` is `(start, end)` in bytes of the UTF-8 source; `line` and `column` are 1-based (`0` = let `render()` work them out from the source); `notes` are further `Diagnostic`s rendered after it ("previous definition is here"). The same names are read-only properties, and diagnostics compare equal by value.
+
 ### ParseError
 
-Raised when parsing fails. Error position uses high-water mark tracking -- it points to the furthest position the parser reached, not just position 0.
+Raised when parsing fails. The error points to the furthest position the parser reached, and says what was expected there:
+
+| Input | Error |
+|-------|-------|
+| `let a = 1` | `line 1, col 10: expected ';'` |
+| `f(1 2);` | `line 1, col 5: expected ',' or ')'` |
+| `let a = ;` | `line 1, col 9: expected expr` |
+| `let = 1;` | `line 1, col 5: expected name` |
+| `let a = 1; ?` | `line 1, col 12: unexpected input after match` |
+
+What is expected is worked out as follows:
+
+- **Literals and character classes** that failed at the furthest position are listed (`expected ',' or ')'`). Character classes are left out when a literal or a rule is expected too.
+- **A rule name** replaces them when a rule that makes a node failed right where it started: `let a = ;` expects `expr`, not everything an expression can begin with. The outermost such rule is named, so errors read the way the grammar names its rules.
+- **Display names** say it better than rule names: with `expr "expression" = ...` and `addop "operator" = ...` the messages are `expected expression` and `expected operator or ';'`. Rules sharing a display name are listed once.
+- **Never reported:** failures inside predicates, inside `@silent` rules that can match nothing (whitespace, comments), and what could have made a matched token longer (another digit after `1`).
+- **`unexpected input after match`**: the start rule matched part of the input and nothing failed beyond it.
+
+The generated parser only tracks which rule failed furthest; the detail comes from re-running a failed parse in an interpreter (`src/diagnose.zig`). Successful parses pay nothing; a failing parse takes about 40x a successful one (0.8 ms for 16 KB). On very deep nesting or pathological backtracking the interpreter gives up and the rule-level error (`expected <rule>`) is reported.
 
 `zgram.ParseError` is a `ValueError` subclass whose message includes the location:
 
@@ -302,17 +489,18 @@ Raised when parsing fails. Error position uses high-water mark tracking -- it po
 try:
     tree = parser.parse('{"name": }')
 except zgram.ParseError as e:
-    print(e)  # "line 1, col 10: expected object"
+    print(e)  # "line 1, col 9: expected value"
 ```
 
 The exception also carries the details as attributes:
 
 ```python
 except zgram.ParseError as e:
-    print(e.message)  # "expected object"
+    print(e.message)  # "expected value"
     print(e.line)     # 1
-    print(e.column)   # 10 (1-based, in bytes)
-    print(e.offset)   # 9 (byte offset)
+    print(e.column)   # 9 (1-based, in bytes)
+    print(e.offset)   # 8 (byte offset)
+    print(e.diagnostic.render(source))   # the same error as a Diagnostic
 ```
 
 The same details stay available from the `parser.error` property (a `ParseErrorInfo`) after a failed parse:
@@ -348,7 +536,7 @@ Key implementation details:
 - **SIMD character scanning**: Character class repetitions (`[a-z]+`, `[^"\\]*`) test the first 8 bytes one at a time (most runs are a space or a few digits) and continue in an out-of-line 16-byte (SSE2) or 32-byte (AVX2) vector loop only for longer runs. Single ranges, small included sets and small excluded sets are vectorized, including through `@silent` rules and in loops like JSON's `(escape | plain)*`: when the other branches can't start with a byte of the class, runs of it are scanned in bulk and the other branches are tried only where a run stops.
 - **Inline node allocation**: Rule functions reserve nodes via an inlined fast path (compare + increment) with a slow path fallback to `zgram_ensure_capacity`. Node filling is also inlined -- no function call overhead per node.
 - **High-water mark errors**: Every rule failure updates `max_pos = max(max_pos, pos)`. On parse failure, the error is reported at the furthest position reached with `"expected <rule_name>"`.
-- **Flat node tree**: 16-byte `FlatNode` structs in pre-order with subtree sizes. Iterating children steps from sibling to sibling in O(1), and `find()` is a linear scan, because a node's descendants are contiguous.
+- **Flat node tree**: 16-byte `FlatNode` structs in pre-order with subtree sizes; the last word packs the child count (12 bits, saturating: larger nodes are counted by stepping through their children), the rule id (12 bits) and the label's field id (8 bits). Iterating children steps from sibling to sibling in O(1), and `find()` is a linear scan, because a node's descendants are contiguous.
 - **Per-parse trees**: each parse writes into its own node buffer, which becomes a tree object holding a reference to the input `str`/`bytes`. Parsing reads the string's own UTF-8 buffer (no input copy), and `text()` slices it without copying. Nodes are small (tree reference + index) and reference the tree, so they stay valid across later parses.
 - **Compile cache**: compiled grammars are shared and reference-counted; the 16 most recent stay cached.
 
@@ -374,6 +562,7 @@ src/
   jit_helpers.zig       # Runtime helpers called by JIT code (node alloc, errors)
   llvm_builder.zig      # Ergonomic wrapper over LLVM C API
   parse_abi.zig         # FlatNode/ParseOutput C ABI structs (16 bytes per node)
+  diagnose.zig          # PEG interpreter that re-runs failed parses for precise errors
 test/
   conftest.py                  # Shared fixtures (JSON/list grammars)
   test_node_api.py             # Node/GrammarParser Python API tests
@@ -384,10 +573,20 @@ test/
   test_json_parsing.py         # JSON parsing: values, structures, errors
   test_edge_cases.py           # 115 edge case tests (@silent, backtracking, GC, etc.)
   test_hwm.py                  # High-water mark error position tests
+  test_labels.py               # label:rule, Node.field/get/get_all
+  test_fold.py                 # @left / @right / @postfix chain folding
+  test_ast.py                  # -> actions and parse_ast()
+  test_tree.py                 # parse_tree(), Tree, the zgram.tree.v1 capsule
+  test_diagnostic.py           # Diagnostic, ParseError.diagnostic
+  test_error_messages.py       # "expected ';'" errors from the diagnosis pass
+  test_example_tiny.py         # The tiny example language
   test_benchmark_json.py       # Multi-parser comparative benchmark
   test_benchmark_sql2mongo.py  # SQL-to-MongoDB latency benchmark
 examples/sql2mongo/
   sql2mongo.py          # SQL SELECT -> MongoDB query converter example
+examples/tiny/
+  tiny.py               # A small language: grammar -> AST -> interpreter, with diagnostics
+  fib.tiny              # A program in it
 build.zig               # Zig build configuration
 pyproject.toml          # Python package configuration
 ```

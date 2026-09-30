@@ -1,12 +1,12 @@
 //! Grammar string parser: converts PEG-like grammar text into a runtime IR.
 //!
 //! Grammar syntax:
-//!     rule_name = expression
+//!     rule_name = expression                     # or: rule_name "display name" = expression
 //!     expression = sequence (('|' | '/') sequence)*   # ordered choice
 //!     sequence   = prefix+
 //!     prefix     = ('!' | '&')? suffix           # predicates
 //!     suffix     = primary ('*' | '+' | '?')?    # repetition
-//!     primary    = reference | literal | char_class | '(' expression ')' | '.'
+//!     primary    = (label ':')? reference | literal | char_class | '(' expression ')' | '.'
 //!     literal    = "'" [^']* "'" | '"' [^"]* '"'
 //!     char_class = '[' '^'? (range | char)+ ']'
 
@@ -46,6 +46,9 @@ pub const Expr = struct {
 
     // reference
     ref_name: ?[]const u8 = null,
+    /// Id of the label on this reference (`label:rule`), an index into
+    /// Grammar.fields plus one; 0 = unlabelled
+    field_id: u8 = 0,
 
     // sequence / alternative
     children: ?[]const *Expr = null,
@@ -58,23 +61,46 @@ pub const Expr = struct {
     pred_expr: ?*Expr = null,
 };
 
+/// How a rule's chain `head (group)*` is folded into nested nodes.
+pub const Fold = enum(u8) {
+    none = 0,
+    /// @left: each repetition wraps everything before it: ((a op b) op c)
+    left = 1,
+    /// @right: each repetition wraps everything after it: (a op (b op c))
+    right = 2,
+    /// @postfix: each repeated node adopts everything before it as its first child
+    postfix = 3,
+};
+
 pub const Rule = struct {
     name: []const u8,
+    /// What error messages call the rule (`name "display name" = ...`)
+    display: ?[]const u8 = null,
     expr: *Expr,
     action: ?[]const u8 = null,
+    /// `-> Name()`: call the class with no arguments
+    action_no_args: bool = false,
     /// Explicit @silent annotation — forces rule to be silent (no parse tree node).
     silent: bool = false,
     /// @memo annotation — cache the rule's result per input position (packrat).
     memo: bool = false,
+    /// @left / @right / @postfix annotation. With no repetition matched the
+    /// rule produces no node of its own: its operand stands in for it.
+    fold: Fold = .none,
 };
 
 pub const Grammar = struct {
     rules: []const *Rule,
+    /// Label names; a node's field id is the index here plus one
+    fields: []const []const u8 = &.{},
 
     pub fn deinit(self: *const Grammar, allocator: Allocator) void {
+        for (self.fields) |f| allocator.free(f);
+        allocator.free(self.fields);
         for (self.rules) |rule| {
             freeExpr(allocator, rule.expr);
             if (rule.action) |a| allocator.free(a);
+            if (rule.display) |d| allocator.free(d);
             allocator.free(rule.name);
             allocator.destroy(rule);
         }
@@ -139,6 +165,9 @@ const ParseErr = error{
     TooManyRules,
     LeftRecursion,
     UnknownAnnotation,
+    ExpectedRuleAfterLabel,
+    InvalidFoldRule,
+    TooManyFields,
 };
 
 const MAX_NESTING_DEPTH = 128;
@@ -150,6 +179,7 @@ const GrammarParserImpl = struct {
     col: usize,
     depth: usize,
     allocator: Allocator,
+    fields: std.ArrayList([]const u8) = .empty,
 
     fn init(allocator: Allocator, text: []const u8) GrammarParserImpl {
         return .{
@@ -199,6 +229,7 @@ const GrammarParserImpl = struct {
         const grammar = try self.allocator.create(Grammar);
         grammar.* = .{
             .rules = try self.allocator.dupe(*Rule, rules_list.items),
+            .fields = try self.fields.toOwnedSlice(self.allocator),
         };
         return grammar;
     }
@@ -243,9 +274,10 @@ const GrammarParserImpl = struct {
             return self.parseRule();
         }
 
-        // Annotations: @silent, @memo (any order, each at most once)
+        // Annotations: @silent, @memo, @left / @right / @postfix (any order)
         var is_silent = false;
         var is_memo = false;
+        var fold: Fold = .none;
         while (self.peek() == '@') {
             self.advance(); // skip '@'
             const annotation = self.parseIdentifier() orelse return error.UnknownAnnotation;
@@ -253,6 +285,9 @@ const GrammarParserImpl = struct {
                 is_silent = true;
             } else if (std.mem.eql(u8, annotation, "memo")) {
                 is_memo = true;
+            } else if (std.meta.stringToEnum(Fold, annotation)) |f| {
+                if (f == .none or fold != .none) return error.UnknownAnnotation;
+                fold = f;
             } else {
                 return error.UnknownAnnotation;
             }
@@ -265,6 +300,17 @@ const GrammarParserImpl = struct {
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
 
+        // Optional display name for error messages: name "display name" = ...
+        self.skipWs();
+        var display: ?[]const u8 = null;
+        errdefer if (display) |d| self.allocator.free(d);
+        if (self.peek() == '"' or self.peek() == '\'') {
+            const lit = try self.parseLiteral();
+            display = lit.literal_value;
+            self.allocator.destroy(lit);
+            if (display.?.len > abi.MAX_RULE_NAME) return error.RuleNameTooLong;
+        }
+
         self.skipWs();
         if (!self.match('=')) {
             return error.ExpectedEquals;
@@ -276,6 +322,7 @@ const GrammarParserImpl = struct {
 
         // Optional semantic action
         var action: ?[]const u8 = null;
+        var no_args = false;
         self.skipWs();
         if (self.matchStr("->")) {
             self.skipWs();
@@ -283,6 +330,13 @@ const GrammarParserImpl = struct {
                 return error.ExpectedActionName;
             };
             action = try self.allocator.dupe(u8, action_name);
+            no_args = self.matchStr("()");
+        }
+
+        // A folded rule is `head (group)*`: a sequence ending in a repetition
+        if (fold != .none) {
+            const seq = if (expr.tag == .sequence) expr.children.? else return error.InvalidFoldRule;
+            if (is_silent or seq[seq.len - 1].tag != .repetition) return error.InvalidFoldRule;
         }
 
         const rule = try self.allocator.create(Rule);
@@ -292,6 +346,9 @@ const GrammarParserImpl = struct {
             .action = action,
             .silent = is_silent,
             .memo = is_memo,
+            .fold = fold,
+            .display = display,
+            .action_no_args = no_args,
         };
         return rule;
     }
@@ -367,6 +424,17 @@ const GrammarParserImpl = struct {
 
             const ident = self.parseIdentifier();
             self.skipWs();
+            // ... or by a display name and =
+            const quote = self.peek();
+            if (quote == '"' or quote == '\'') {
+                self.advance();
+                while (self.pos < self.text.len and self.peek() != quote) {
+                    if (self.peek() == '\\') self.advance();
+                    self.advance();
+                }
+                self.advance();
+                self.skipWs();
+            }
             const is_rule = (self.pos < self.text.len and self.peek() == '=' and !self.peekStr("=="));
 
             // Restore position
@@ -463,19 +531,38 @@ const GrammarParserImpl = struct {
             return expr;
         }
 
-        // Reference
+        // Reference, optionally labelled: label:rule
         if (std.ascii.isAlphabetic(c) or c == '_') {
-            const name = self.parseIdentifier() orelse return null;
+            var name = self.parseIdentifier() orelse return null;
+            var field_id: u8 = 0;
+            if (self.peek() == ':') {
+                self.advance();
+                field_id = try self.fieldId(name);
+                name = self.parseIdentifier() orelse return error.ExpectedRuleAfterLabel;
+            }
             const owned = try self.allocator.dupe(u8, name);
             const expr = try self.allocator.create(Expr);
             expr.* = .{
                 .tag = .reference,
                 .ref_name = owned,
+                .field_id = field_id,
             };
             return expr;
         }
 
         return null;
+    }
+
+    /// Id of the label `name`, registering it on first use.
+    fn fieldId(self: *GrammarParserImpl, name: []const u8) ParseErr!u8 {
+        for (self.fields.items, 1..) |f, id| {
+            if (std.mem.eql(u8, f, name)) return @intCast(id);
+        }
+        if (self.fields.items.len >= abi.MAX_FIELDS) return error.TooManyFields;
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.fields.append(self.allocator, owned);
+        return @intCast(self.fields.items.len);
     }
 
     fn parseLiteral(self: *GrammarParserImpl) ParseErr!*Expr {
@@ -689,92 +776,66 @@ fn detectLeftRecursion(allocator: Allocator, rules: []const *Rule) ParseErr!void
     const n = rules.len;
     if (n == 0) return;
 
-    // Build "can-start-with" adjacency: edges[i] contains rule indices
-    // that rule i can invoke at first position without consuming input.
-    const max_edges = 64;
-    const edges = allocator.alloc([max_edges]usize, n) catch return error.OutOfMemory;
-    defer allocator.free(edges);
-    const edge_counts = allocator.alloc(usize, n) catch return error.OutOfMemory;
-    defer allocator.free(edge_counts);
-    @memset(edge_counts, 0);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
-    for (rules, 0..) |rule, i| {
-        collectFirstRefs(rule.expr, rules, &edges[i], &edge_counts[i]);
+    var index: std.StringHashMapUnmanaged(usize) = .empty;
+    try index.ensureTotalCapacity(alloc, @intCast(n));
+    for (rules, 0..) |rule, i| index.putAssumeCapacity(rule.name, i);
+
+    // "Can start with" adjacency: edges[i] holds the rules that rule i can
+    // invoke at first position without consuming input.
+    const edges = try alloc.alloc(std.ArrayList(usize), n);
+    for (rules, edges) |rule, *list| {
+        list.* = .empty;
+        try collectFirstRefs(alloc, rule.expr, &index, list);
     }
 
-    // DFS cycle detection: for each rule, check if it can reach itself
-    // through first-position references.
-    const state = allocator.alloc(Color, n) catch return error.OutOfMemory;
-    defer allocator.free(state);
+    // DFS cycle detection: can a rule reach itself through those edges?
+    const state = try alloc.alloc(Color, n);
     @memset(state, .white);
-
     for (0..n) |i| {
-        if (state[i] == .white) {
-            if (hasCycle(edges, edge_counts, state, i))
-                return error.LeftRecursion;
-        }
+        if (state[i] == .white and hasCycle(edges, state, i)) return error.LeftRecursion;
     }
 }
 
 const Color = enum { white, gray, black };
 
 /// DFS cycle detection. Returns true if a cycle is found from node `u`.
-fn hasCycle(
-    edges: [][64]usize,
-    edge_counts: []const usize,
-    state: []Color,
-    u: usize,
-) bool {
+fn hasCycle(edges: []const std.ArrayList(usize), state: []Color, u: usize) bool {
     state[u] = .gray;
-    for (edges[u][0..edge_counts[u]]) |v| {
+    for (edges[u].items) |v| {
         if (state[v] == .gray) return true; // back edge → cycle
-        if (state[v] == .white and hasCycle(edges, edge_counts, state, v)) return true;
+        if (state[v] == .white and hasCycle(edges, state, v)) return true;
     }
     state[u] = .black;
     return false;
 }
 
-/// Collect rule indices that `expr` can invoke at first position
-/// (before consuming any input).
-fn collectFirstRefs(expr: *const Expr, rules: []const *Rule, out: *[64]usize, count: *usize) void {
+/// Collect the rules that `expr` can invoke at first position (before
+/// consuming any input).
+fn collectFirstRefs(allocator: Allocator, expr: *const Expr, index: *const std.StringHashMapUnmanaged(usize), out: *std.ArrayList(usize)) ParseErr!void {
     switch (expr.tag) {
         .reference => {
-            const name = expr.ref_name orelse return;
-            for (rules, 0..) |rule, i| {
-                if (std.mem.eql(u8, rule.name, name)) {
-                    // Avoid duplicates
-                    for (out.*[0..count.*]) |existing| {
-                        if (existing == i) return;
-                    }
-                    if (count.* < 64) {
-                        out.*[count.*] = i;
-                        count.* += 1;
-                    }
-                    return;
-                }
-            }
+            const i = index.get(expr.ref_name orelse return) orelse return;
+            if (std.mem.indexOfScalar(usize, out.items, i) == null) try out.append(allocator, i);
         },
         .sequence => {
             // First position of a sequence is the first child
             if (expr.children) |children| {
-                if (children.len > 0) {
-                    collectFirstRefs(children[0], rules, out, count);
-                }
+                if (children.len > 0) try collectFirstRefs(allocator, children[0], index, out);
             }
         },
         .alternative => {
             // First position of an alternative is ANY of its branches
             if (expr.children) |children| {
-                for (children) |child| {
-                    collectFirstRefs(child, rules, out, count);
-                }
+                for (children) |child| try collectFirstRefs(allocator, child, index, out);
             }
         },
         .repetition => {
             // For ?, *, + the sub-expression is at first position
-            if (expr.rep_expr) |sub| {
-                collectFirstRefs(sub, rules, out, count);
-            }
+            if (expr.rep_expr) |sub| try collectFirstRefs(allocator, sub, index, out);
         },
         .not_predicate, .and_predicate => {
             // Predicates don't consume input, so what follows them
@@ -786,6 +847,156 @@ fn collectFirstRefs(expr: *const Expr, rules: []const *Rule, out: *[64]usize, co
             // Terminal expressions — they consume input, no first-position refs
         },
     }
+}
+
+// ============================================================================
+// AST mapping: actions and label multiplicity
+// ============================================================================
+
+/// What `-> name` after a rule converts its node to (see parse_ast).
+pub const Action = enum(u8) {
+    /// No action: the text of a leaf, the value of an only child, else a list
+    none,
+    str,
+    int,
+    float,
+    list,
+    tuple,
+    dict,
+    true,
+    false,
+    null,
+    /// The text of a quoted string literal: without its first and last
+    /// character, and with backslash escapes replaced
+    unquote,
+    /// The first child's value
+    first,
+    /// No value: left out of the parent's children
+    drop,
+    /// Any other name: a class (or callable) supplied by the user
+    class,
+};
+
+/// What error messages call a rule.
+pub fn displayName(rule: *const Rule) []const u8 {
+    return rule.display orelse rule.name;
+}
+
+pub fn actionOf(rule: *const Rule) Action {
+    const name = rule.action orelse return .none;
+    const builtins = [_]struct { []const u8, Action }{
+        .{ "str", .str },     .{ "int", .int },     .{ "float", .float }, .{ "list", .list },
+        .{ "tuple", .tuple }, .{ "dict", .dict },   .{ "True", .true },   .{ "False", .false },
+        .{ "None", .null },   .{ "first", .first }, .{ "drop", .drop },   .{ "unquote", .unquote },
+    };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, b[0], name)) return b[1];
+    }
+    return .class;
+}
+
+/// A label used by a rule: can several children carry it (a list), or at
+/// most one?
+pub const LabelUse = struct {
+    field: u8,
+    many: bool,
+};
+
+/// Occurrence counts, saturating at 2 ("many")
+const Counts = [256]u8;
+const MAX_SILENT_DEPTH = 16;
+
+fn findRule(grammar: *const Grammar, name: []const u8) ?*const Rule {
+    for (grammar.rules) |r| {
+        if (std.mem.eql(u8, r.name, name)) return r;
+    }
+    return null;
+}
+
+/// How many top-level nodes matching `expr` can add: 0, 1 or 2 (several).
+fn nodeCount(grammar: *const Grammar, expr: *const Expr, depth: u8) u8 {
+    switch (expr.tag) {
+        .literal, .char_class, .any_char, .not_predicate, .and_predicate => return 0,
+        .reference => {
+            const rule = findRule(grammar, expr.ref_name orelse return 0) orelse return 0;
+            if (!rule.silent) return 1;
+            if (depth >= MAX_SILENT_DEPTH) return 2;
+            return nodeCount(grammar, rule.expr, depth + 1);
+        },
+        .sequence => {
+            var n: u8 = 0;
+            for (expr.children orelse return 0) |child| n = @min(2, n + nodeCount(grammar, child, depth));
+            return n;
+        },
+        .alternative => {
+            var n: u8 = 0;
+            for (expr.children orelse return 0) |child| n = @max(n, nodeCount(grammar, child, depth));
+            return n;
+        },
+        .repetition => {
+            const n = nodeCount(grammar, expr.rep_expr orelse return 0, depth);
+            return if (expr.rep_kind == '?' or n == 0) n else 2;
+        },
+    }
+}
+
+/// Count, per label, the children of a node that can carry it. Labels inside
+/// @silent rules count for the rule that references them. `fold_rep` is the
+/// trailing repetition of a folded rule: each of its iterations is a node of
+/// its own, so it counts once.
+fn labelCounts(grammar: *const Grammar, expr: *const Expr, depth: u8, fold_rep: ?*const Expr, out: *Counts) void {
+    switch (expr.tag) {
+        .literal, .char_class, .any_char, .not_predicate, .and_predicate => {},
+        .reference => {
+            const rule = findRule(grammar, expr.ref_name orelse return) orelse return;
+            if (expr.field_id != 0) {
+                const n: u8 = if (rule.silent) @max(1, nodeCount(grammar, rule.expr, depth + 1)) else 1;
+                out[expr.field_id] = @min(2, out[expr.field_id] + n);
+            } else if (rule.silent and depth < MAX_SILENT_DEPTH) {
+                labelCounts(grammar, rule.expr, depth + 1, null, out);
+            }
+        },
+        .sequence => {
+            for (expr.children orelse return) |child| labelCounts(grammar, child, depth, fold_rep, out);
+        },
+        .alternative => {
+            var most: Counts = @splat(0);
+            for (expr.children orelse return) |child| {
+                var branch: Counts = @splat(0);
+                labelCounts(grammar, child, depth, null, &branch);
+                for (&most, branch) |*m, c| m.* = @max(m.*, c);
+            }
+            for (out, most) |*o, m| o.* = @min(2, o.* + m);
+        },
+        .repetition => {
+            var inner: Counts = @splat(0);
+            labelCounts(grammar, expr.rep_expr orelse return, depth, null, &inner);
+            const once = expr.rep_kind == '?' or expr == fold_rep;
+            for (out, inner) |*o, c| o.* = @min(2, o.* + if (once or c == 0) c else 2);
+        },
+    }
+}
+
+/// The labels a rule's node can have on its children, in field id order.
+pub fn ruleLabels(allocator: Allocator, grammar: *const Grammar, rule: *const Rule) ![]LabelUse {
+    var counts: Counts = @splat(0);
+    const fold_rep: ?*const Expr = if (rule.fold != .none) blk: {
+        const seq = rule.expr.children.?;
+        break :blk seq[seq.len - 1];
+    } else null;
+    labelCounts(grammar, rule.expr, 0, fold_rep, &counts);
+
+    var list: std.ArrayList(LabelUse) = .empty;
+    errdefer list.deinit(allocator);
+    for (counts, 0..) |c, field| {
+        if (c != 0) try list.append(allocator, .{ .field = @intCast(field), .many = c > 1 });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// Can a node of this rule have children?
+pub fn ruleHasChildren(grammar: *const Grammar, rule: *const Rule) bool {
+    return nodeCount(grammar, rule.expr, 0) != 0;
 }
 
 // ============================================================================

@@ -7,6 +7,7 @@ const grammar_parser = @import("grammar_parser.zig");
 const jit_codegen = @import("jit_codegen.zig");
 const jit_compiler = @import("jit_compiler.zig");
 const jit_helpers = @import("jit_helpers.zig");
+const diagnose = @import("diagnose.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -71,6 +72,250 @@ const ParseError = struct {
 };
 
 // ============================================================================
+// Diagnostic class — one error, warning or note about a source text
+// ============================================================================
+
+/// The type every stage of a language built on zgram reports problems with:
+/// zgram's own syntax errors (ParseError.diagnostic), and the checks and
+/// runtime errors of the packages built on it.
+const Diagnostic = struct {
+    _severity: ?*pyoz.PyObject = null,
+    _code: ?*pyoz.PyObject = null,
+    _message: ?*pyoz.PyObject = null,
+    /// Byte offsets into the UTF-8 source
+    _start: i64 = 0,
+    _end: i64 = 0,
+    /// 1-based, the column in bytes; 0 = unknown (render() works them out)
+    _line: i64 = 0,
+    _column: i64 = 0,
+    /// list[Diagnostic]
+    _notes: ?*pyoz.PyObject = null,
+
+    fn utf8(obj: ?*pyoz.PyObject) []const u8 {
+        var len: py.Py_ssize_t = 0;
+        const ptr = py.c.PyUnicode_AsUTF8AndSize(obj orelse return "", &len) orelse {
+            py.c.PyErr_Clear();
+            return "";
+        };
+        return ptr[0..@intCast(len)];
+    }
+
+    /// Takes new references to the objects. Raises (and returns null) on
+    /// arguments of the wrong type.
+    fn create(severity: *pyoz.PyObject, code: *pyoz.PyObject, message: *pyoz.PyObject, start: i64, end: i64, line: i64, column: i64, notes: ?*pyoz.PyObject) ?Diagnostic {
+        if (!py.PyUnicode_Check(severity) or !py.PyUnicode_Check(code) or !py.PyUnicode_Check(message)) {
+            py.PyErr_SetString(py.PyExc_TypeError(), "severity, code and message must be str");
+            return null;
+        }
+        const sev = utf8(severity);
+        if (!std.mem.eql(u8, sev, "error") and !std.mem.eql(u8, sev, "warning") and !std.mem.eql(u8, sev, "note")) {
+            py.PyErr_SetString(py.PyExc_ValueError(), "severity must be 'error', 'warning' or 'note'");
+            return null;
+        }
+        if (start < 0 or end < start or line < 0 or column < 0) {
+            py.PyErr_SetString(py.PyExc_ValueError(), "span must be 0 <= start <= end, and line and column >= 0");
+            return null;
+        }
+        const note_list = (if (notes) |n| py.c.PySequence_List(n) else py.c.PyList_New(0)) orelse return null;
+        for (0..@intCast(py.c.PyList_Size(note_list))) |i| {
+            const item = py.c.PyList_GetItem(note_list, @intCast(i)).?;
+            _ = Module.fromPy(*const Diagnostic, item) catch {
+                py.Py_DecRef(note_list);
+                py.c.PyErr_Clear();
+                py.PyErr_SetString(py.PyExc_TypeError(), "notes must be Diagnostic objects");
+                return null;
+            };
+        }
+        py.Py_IncRef(severity);
+        py.Py_IncRef(code);
+        py.Py_IncRef(message);
+        return .{ ._severity = severity, ._code = code, ._message = message, ._start = start, ._end = end, ._line = line, ._column = column, ._notes = note_list };
+    }
+
+    /// Diagnostic(severity, code, message, span, line=0, column=0, notes=())
+    pub fn __new__(args: pyoz.Args(struct {
+        severity: *pyoz.PyObject,
+        code: *pyoz.PyObject,
+        message: *pyoz.PyObject,
+        span: struct { i64, i64 },
+        line: i64 = 0,
+        column: i64 = 0,
+        notes: ?*pyoz.PyObject = null,
+    })) ?Diagnostic {
+        const a = args.value;
+        return create(a.severity, a.code, a.message, a.span[0], a.span[1], a.line, a.column, a.notes);
+    }
+
+    pub fn __del__(self: *Diagnostic) void {
+        inline for (.{ "_severity", "_code", "_message", "_notes" }) |name| {
+            if (@field(self, name)) |obj| py.Py_DecRef(obj);
+            @field(self, name) = null;
+        }
+    }
+
+    fn owned(obj: ?*pyoz.PyObject) ?*pyoz.PyObject {
+        const o = obj orelse py.Py_None();
+        py.Py_IncRef(o);
+        return o;
+    }
+
+    pub fn get_severity(self: *const Diagnostic) pyoz.Signature(?*pyoz.PyObject, "str") {
+        return .{ .value = owned(self._severity) };
+    }
+
+    pub fn get_code(self: *const Diagnostic) pyoz.Signature(?*pyoz.PyObject, "str") {
+        return .{ .value = owned(self._code) };
+    }
+
+    pub fn get_message(self: *const Diagnostic) pyoz.Signature(?*pyoz.PyObject, "str") {
+        return .{ .value = owned(self._message) };
+    }
+
+    pub fn get_span(self: *const Diagnostic) struct { i64, i64 } {
+        return .{ self._start, self._end };
+    }
+
+    pub fn get_line(self: *const Diagnostic) i64 {
+        return self._line;
+    }
+
+    pub fn get_column(self: *const Diagnostic) i64 {
+        return self._column;
+    }
+
+    pub fn get_notes(self: *const Diagnostic) pyoz.Signature(?*pyoz.PyObject, "list[Diagnostic]") {
+        return .{ .value = owned(self._notes) };
+    }
+
+    pub fn __eq__(self: *const Diagnostic, other: *const Diagnostic) bool {
+        if (self._start != other._start or self._end != other._end or self._line != other._line or self._column != other._column) return false;
+        inline for (.{ "_severity", "_code", "_message", "_notes" }) |name| {
+            const a = @field(self, name) orelse py.Py_None();
+            const b = @field(other, name) orelse py.Py_None();
+            if (py.c.PyObject_RichCompareBool(a, b, py.c.Py_EQ) != 1) {
+                py.c.PyErr_Clear();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    pub fn __repr__(self: *const Diagnostic, buf: []u8) []const u8 {
+        // Diagnostic('error', 'syntax', 'expected num', span=(19, 19), line=2, column=9)
+        var pos: usize = 0;
+        pos += copySlice(buf, pos, "Diagnostic('");
+        pos += copySlice(buf, pos, utf8(self._severity));
+        pos += copySlice(buf, pos, "', '");
+        pos += copySlice(buf, pos, utf8(self._code));
+        pos += copySlice(buf, pos, "', '");
+        const msg = utf8(self._message);
+        pos += copySlice(buf, pos, msg[0..@min(msg.len, 120)]);
+        pos += copySlice(buf, pos, "', span=(");
+        pos += fmtInt(buf, pos, self._start);
+        pos += copySlice(buf, pos, ", ");
+        pos += fmtInt(buf, pos, self._end);
+        pos += copySlice(buf, pos, "), line=");
+        pos += fmtInt(buf, pos, self._line);
+        pos += copySlice(buf, pos, ", column=");
+        pos += fmtInt(buf, pos, self._column);
+        pos += copySlice(buf, pos, ")");
+        return buf[0..pos];
+    }
+
+    /// Append "<file>:<line>:<col>: <severity>: <message> [<code>]", the
+    /// source line and a line of carets under the span, then the notes.
+    fn renderInto(self: *const Diagnostic, out: *std.ArrayList(u8), source: []const u8, filename: []const u8) !void {
+        const start: usize = @min(@as(usize, @intCast(self._start)), source.len);
+        const end: usize = @min(@as(usize, @intCast(self._end)), source.len);
+        var line: u64 = @intCast(self._line);
+        var column: u64 = @intCast(self._column);
+        if (line == 0) {
+            const lc = abi.lineCol(source, start);
+            line = lc.line;
+            column = lc.col;
+        }
+        const line_start = if (std.mem.lastIndexOfScalar(u8, source[0..start], '\n')) |i| i + 1 else 0;
+        const line_end = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse source.len;
+        const text = std.mem.trimEnd(u8, source[line_start..line_end], "\r");
+
+        var num_buf: [24]u8 = undefined;
+        const line_str = std.fmt.bufPrint(&num_buf, "{d}", .{line}) catch unreachable;
+        var col_buf: [24]u8 = undefined;
+        const col_str = std.fmt.bufPrint(&col_buf, "{d}", .{column}) catch unreachable;
+
+        if (filename.len != 0) {
+            try out.appendSlice(allocator, filename);
+            try out.append(allocator, ':');
+        }
+        try out.appendSlice(allocator, line_str);
+        try out.append(allocator, ':');
+        try out.appendSlice(allocator, col_str);
+        try out.appendSlice(allocator, ": ");
+        try out.appendSlice(allocator, utf8(self._severity));
+        try out.appendSlice(allocator, ": ");
+        try out.appendSlice(allocator, utf8(self._message));
+        const code = utf8(self._code);
+        if (code.len != 0) {
+            try out.appendSlice(allocator, " [");
+            try out.appendSlice(allocator, code);
+            try out.append(allocator, ']');
+        }
+
+        // "    3 | source line" / "      | ^^^^"
+        const gutter = @max(line_str.len, 5);
+        try out.append(allocator, '\n');
+        try out.appendNTimes(allocator, ' ', gutter - line_str.len);
+        try out.appendSlice(allocator, line_str);
+        try out.appendSlice(allocator, " | ");
+        try out.appendSlice(allocator, text);
+        try out.append(allocator, '\n');
+        try out.appendNTimes(allocator, ' ', gutter);
+        try out.appendSlice(allocator, " | ");
+        // One column per character: tabs stay tabs, UTF-8 continuation bytes don't count
+        for (source[line_start..start]) |ch| {
+            if (ch & 0xC0 == 0x80) continue;
+            try out.append(allocator, if (ch == '\t') '\t' else ' ');
+        }
+        var carets: usize = 0;
+        for (source[start..@max(start, @min(end, line_end))]) |ch| {
+            if (ch & 0xC0 != 0x80) carets += 1;
+        }
+        try out.appendNTimes(allocator, '^', @max(carets, 1));
+
+        if (self._notes) |notes| {
+            for (0..@intCast(py.c.PyList_Size(notes))) |i| {
+                const note = Module.fromPy(*const Diagnostic, py.c.PyList_GetItem(notes, @intCast(i)).?) catch continue;
+                try out.append(allocator, '\n');
+                try note.renderInto(out, source, filename);
+            }
+        }
+    }
+
+    /// Format the diagnostic with its source line and a caret under the span.
+    pub fn render(self: *const Diagnostic, args: pyoz.Args(struct { source: *pyoz.PyObject, filename: ?[]const u8 = null })) pyoz.Signature(?*pyoz.PyObject, "str") {
+        const src_obj = args.value.source;
+        var len: py.Py_ssize_t = 0;
+        const ptr: [*]const u8 = blk: {
+            if (py.PyUnicode_Check(src_obj)) break :blk py.c.PyUnicode_AsUTF8AndSize(src_obj, &len) orelse return .{ .value = null };
+            var p: [*]u8 = undefined;
+            if (py.PyBytes_Check(src_obj) and py.PyBytes_AsStringAndSize(src_obj, &p, &len) == 0) break :blk p;
+            py.PyErr_SetString(py.PyExc_TypeError(), "source must be str or bytes");
+            return .{ .value = null };
+        };
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        self.renderInto(&out, ptr[0..@intCast(len)], args.value.filename orelse "") catch {
+            _ = py.c.PyErr_NoMemory();
+            return .{ .value = null };
+        };
+        return .{ .value = py.c.PyUnicode_DecodeUTF8(out.items.ptr, @intCast(out.items.len), "replace") };
+    }
+
+    pub const __doc__: [*:0]const u8 = "Diagnostic(severity, code, message, span, line=0, column=0, notes=()): an error, warning or note about a source text. span is (start, end) in bytes of the UTF-8 source; line and column are 1-based.";
+    pub const render__doc__: [*:0]const u8 = "Format as 'file:line:col: severity: message [code]' followed by the source line, a caret line under the span, and the notes.";
+};
+
+// ============================================================================
 // Compiled grammars — JIT code shared by every parser compiled from the same text
 // ============================================================================
 
@@ -85,6 +330,22 @@ const Compiled = struct {
     hash: u64,
     /// Rule names by rule id, slices into name_buf
     rule_names: [][]const u8,
+    /// Label names by field id - 1, slices into name_buf
+    field_names: [][]const u8,
+    /// What error messages call each rule: its display name, else its name
+    display_names: [][]const u8,
+    /// Per rule: `-> Name()`, a class called with no arguments
+    no_args: []bool,
+    /// rule_names then field_names as C strings, for TreeView
+    name_strs: []abi.Str,
+    /// AST mapping per rule: what `-> name` means, and the name of a class action
+    actions: []grammar_parser.Action,
+    action_names: [][]const u8,
+    /// Labels per rule: rule r's are labels[label_start[r]..label_start[r + 1]]
+    labels: []grammar_parser.LabelUse,
+    label_start: []u32,
+    /// Per rule: can its node have children?
+    has_children: []bool,
     name_buf: []u8,
     refs: std.atomic.Value(u32) = .init(1),
 
@@ -108,6 +369,9 @@ const Compiled = struct {
 
         var total: usize = 0;
         for (grammar.rules) |r| total += r.name.len;
+        for (grammar.fields) |f| total += f.len;
+        for (grammar.rules) |r| total += if (r.action) |a| a.len else 0;
+        for (grammar.rules) |r| total += if (r.display) |d| d.len else 0;
         const name_buf = try allocator.alloc(u8, total);
         errdefer allocator.free(name_buf);
         const rule_names = try allocator.alloc([]const u8, grammar.rules.len);
@@ -118,6 +382,53 @@ const Compiled = struct {
             rule_names[i] = name_buf[off..][0..r.name.len];
             off += r.name.len;
         }
+        const field_names = try allocator.alloc([]const u8, grammar.fields.len);
+        errdefer allocator.free(field_names);
+        for (grammar.fields, 0..) |f, i| {
+            @memcpy(name_buf[off..][0..f.len], f);
+            field_names[i] = name_buf[off..][0..f.len];
+            off += f.len;
+        }
+
+        const name_strs = try allocator.alloc(abi.Str, rule_names.len + field_names.len);
+        errdefer allocator.free(name_strs);
+        for (rule_names, 0..) |n, i| name_strs[i] = .{ .ptr = n.ptr, .len = n.len };
+        for (field_names, rule_names.len..) |n, i| name_strs[i] = .{ .ptr = n.ptr, .len = n.len };
+
+        const n_rules = grammar.rules.len;
+        const actions = try allocator.alloc(grammar_parser.Action, n_rules);
+        errdefer allocator.free(actions);
+        const action_names = try allocator.alloc([]const u8, n_rules);
+        errdefer allocator.free(action_names);
+        const has_children = try allocator.alloc(bool, n_rules);
+        errdefer allocator.free(has_children);
+        const label_start = try allocator.alloc(u32, n_rules + 1);
+        errdefer allocator.free(label_start);
+        const display_names = try allocator.alloc([]const u8, n_rules);
+        errdefer allocator.free(display_names);
+        const no_args = try allocator.alloc(bool, n_rules);
+        errdefer allocator.free(no_args);
+        var all_labels: std.ArrayList(grammar_parser.LabelUse) = .empty;
+        for (grammar.rules, 0..) |r, i| {
+            no_args[i] = r.action_no_args;
+            display_names[i] = rule_names[i];
+            if (r.display) |d| {
+                @memcpy(name_buf[off..][0..d.len], d);
+                display_names[i] = name_buf[off..][0..d.len];
+                off += d.len;
+            }
+            actions[i] = grammar_parser.actionOf(r);
+            const a = r.action orelse "";
+            @memcpy(name_buf[off..][0..a.len], a);
+            action_names[i] = name_buf[off..][0..a.len];
+            off += a.len;
+            has_children[i] = grammar_parser.ruleHasChildren(grammar, r);
+            label_start[i] = @intCast(all_labels.items.len);
+            try all_labels.appendSlice(alloc, try grammar_parser.ruleLabels(alloc, grammar, r));
+        }
+        label_start[n_rules] = @intCast(all_labels.items.len);
+        const labels = try allocator.dupe(grammar_parser.LabelUse, all_labels.items);
+        errdefer allocator.free(labels);
 
         const module = jit_codegen.generateModule(alloc, grammar, .tree) catch return error.CompilationFailed;
         const jit = jit_compiler.jitCompile(module.module, module.context) catch return error.CompilationFailed;
@@ -128,6 +439,15 @@ const Compiled = struct {
             .text = text,
             .hash = std.hash.Wyhash.hash(0, grammar_text),
             .rule_names = rule_names,
+            .field_names = field_names,
+            .display_names = display_names,
+            .no_args = no_args,
+            .name_strs = name_strs,
+            .actions = actions,
+            .action_names = action_names,
+            .labels = labels,
+            .label_start = label_start,
+            .has_children = has_children,
             .name_buf = name_buf,
         };
         return self;
@@ -162,6 +482,15 @@ const Compiled = struct {
         if (self.validate_resource != null) jit_compiler.releaseGrammar(self.validate_resource);
         jit_compiler.releaseGrammar(self.resource);
         allocator.free(self.rule_names);
+        allocator.free(self.field_names);
+        allocator.free(self.display_names);
+        allocator.free(self.no_args);
+        allocator.free(self.name_strs);
+        allocator.free(self.actions);
+        allocator.free(self.action_names);
+        allocator.free(self.labels);
+        allocator.free(self.label_start);
+        allocator.free(self.has_children);
         allocator.free(self.name_buf);
         allocator.free(self.text);
         allocator.destroy(self);
@@ -267,29 +596,63 @@ fn compileCompiled(grammar_text: []const u8) !*Compiled {
 const RuleTable = struct {
     names: []*pyoz.PyObject,
     bytes: []const []const u8,
+    /// Label names indexed by field id - 1, interned likewise
+    fields: []*pyoz.PyObject,
+    field_bytes: []const []const u8,
+    /// The interned strings "__zspan__" and "__znode__"
+    span_attr: *pyoz.PyObject,
+    node_attr: *pyoz.PyObject,
 
-    fn create(rule_names: []const []const u8) !*RuleTable {
+    fn create(rule_names: []const []const u8, field_names: []const []const u8) !*RuleTable {
         const table = try allocator.create(RuleTable);
         errdefer allocator.destroy(table);
-        const names = try allocator.alloc(*pyoz.PyObject, rule_names.len);
-        errdefer allocator.free(names);
-        for (rule_names, 0..) |name, i| {
-            var s: ?*pyoz.PyObject = py.PyUnicode_FromStringAndSize(name.ptr, @intCast(name.len));
-            if (s == null) {
-                for (names[0..i]) |n| py.Py_DecRef(n);
-                return error.AllocationFailed;
-            }
-            py.c.PyUnicode_InternInPlace(@ptrCast(&s));
-            names[i] = s.?;
-        }
-        table.* = .{ .names = names, .bytes = rule_names };
+        const names = try intern(rule_names);
+        errdefer release(names);
+        const fields = try intern(field_names);
+        errdefer release(fields);
+        var span_attr: ?*pyoz.PyObject = py.PyUnicode_FromStringAndSize("__zspan__", 9) orelse return error.AllocationFailed;
+        py.c.PyUnicode_InternInPlace(@ptrCast(&span_attr));
+        errdefer py.Py_DecRef(span_attr.?);
+        var node_attr: ?*pyoz.PyObject = py.PyUnicode_FromStringAndSize("__znode__", 9) orelse return error.AllocationFailed;
+        py.c.PyUnicode_InternInPlace(@ptrCast(&node_attr));
+        table.* = .{ .names = names, .bytes = rule_names, .fields = fields, .field_bytes = field_names, .span_attr = span_attr.?, .node_attr = node_attr.? };
         return table;
     }
 
+    fn intern(strings: []const []const u8) ![]*pyoz.PyObject {
+        const objs = try allocator.alloc(*pyoz.PyObject, strings.len);
+        errdefer allocator.free(objs);
+        for (strings, 0..) |name, i| {
+            var s: ?*pyoz.PyObject = py.PyUnicode_FromStringAndSize(name.ptr, @intCast(name.len));
+            if (s == null) {
+                for (objs[0..i]) |n| py.Py_DecRef(n);
+                return error.AllocationFailed;
+            }
+            py.c.PyUnicode_InternInPlace(@ptrCast(&s));
+            objs[i] = s.?;
+        }
+        return objs;
+    }
+
+    fn release(objs: []*pyoz.PyObject) void {
+        for (objs) |n| py.Py_DecRef(n);
+        allocator.free(objs);
+    }
+
     fn destroy(self: *RuleTable) void {
-        for (self.names) |n| py.Py_DecRef(n);
-        allocator.free(self.names);
+        release(self.names);
+        release(self.fields);
+        py.Py_DecRef(self.span_attr);
+        py.Py_DecRef(self.node_attr);
         allocator.destroy(self);
+    }
+
+    /// Field id of the label `name` (0 if the grammar has no such label).
+    fn fieldIdOf(self: *const RuleTable, name: []const u8) u8 {
+        for (self.field_bytes, 1..) |b, id| {
+            if (std.mem.eql(u8, b, name)) return @intCast(id);
+        }
+        return 0;
     }
 
     fn idOf(self: *const RuleTable, name: []const u8) ?u16 {
@@ -324,6 +687,96 @@ const Tree = struct {
     _cache_parent: u32 = std.math.maxInt(u32),
     _cache_pos: u32 = 0,
     _cache_idx: u32 = 0,
+    /// Last counted node whose stored child count was saturated
+    _many_parent: u32 = std.math.maxInt(u32),
+    _many_count: u32 = 0,
+    /// The compiled grammar, kept alive by _parser
+    _compiled: ?*const Compiled = null,
+    /// The parser itself (the object _parser references)
+    _parser_ptr: ?*GrammarParser = null,
+    /// What `capsule` points to, filled in on first use
+    _view: abi.TreeView = .{},
+
+    /// The root node.
+    pub fn get_root(self: *const Tree) Node {
+        return makeNode(@constCast(self), 0);
+    }
+
+    /// Number of nodes.
+    pub fn __len__(self: *const Tree) i64 {
+        return self._count;
+    }
+
+    /// A copy of the node array: 16 bytes per node, in pre-order.
+    pub fn get_nodes(self: *const Tree) pyoz.Signature(?*pyoz.PyObject, "bytes") {
+        const ptr: [*]const u8 = if (self._nodes) |n| @ptrCast(n) else "";
+        return .{ .value = py.c.PyBytes_FromStringAndSize(ptr, @as(py.Py_ssize_t, self._count) * @sizeOf(abi.FlatNode)) };
+    }
+
+    /// The parsed text as UTF-8 bytes; node offsets index into it.
+    pub fn get_input(self: *const Tree) pyoz.Signature(?*pyoz.PyObject, "bytes") {
+        if (self._input_obj) |obj| {
+            if (py.PyBytes_Check(obj)) {
+                py.Py_IncRef(obj);
+                return .{ .value = obj };
+            }
+        }
+        const ptr: [*]const u8 = self._input_ptr orelse "";
+        return .{ .value = py.c.PyBytes_FromStringAndSize(ptr, @intCast(self._input_len)) };
+    }
+
+    fn nameList(names: []const *pyoz.PyObject) ?*pyoz.PyObject {
+        const list = py.c.PyList_New(@intCast(names.len)) orelse return null;
+        for (names, 0..) |n, i| {
+            py.Py_IncRef(n);
+            _ = py.c.PyList_SetItem(list, @intCast(i), n);
+        }
+        return list;
+    }
+
+    /// Rule names by rule id.
+    pub fn get_rules(self: *const Tree) pyoz.Signature(?*pyoz.PyObject, "list[str]") {
+        return .{ .value = nameList(if (self._rules) |r| r.names else &.{}) };
+    }
+
+    /// Label names by field id - 1.
+    pub fn get_fields(self: *const Tree) pyoz.Signature(?*pyoz.PyObject, "list[str]") {
+        return .{ .value = nameList(if (self._rules) |r| r.fields else &.{}) };
+    }
+
+    const CAPSULE_NAME = "zgram.tree.v1";
+
+    fn capsuleFree(capsule: ?*pyoz.PyObject) callconv(.c) void {
+        // The context is the Tree object the capsule kept alive
+        const tree: ?*pyoz.PyObject = @ptrCast(@alignCast(py.c.PyCapsule_GetContext(capsule)));
+        if (tree) |obj| py.Py_DecRef(obj);
+    }
+
+    /// A PyCapsule named "zgram.tree.v1" pointing to a parse_abi.TreeView of
+    /// this tree, for native code. The capsule keeps the tree alive.
+    pub fn get_capsule(const_self: *const Tree) pyoz.Signature(?*pyoz.PyObject, "object") {
+        // (property getters receive a const pointer)
+        const self: *Tree = @constCast(const_self);
+        const compiled = self._compiled orelse {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
+            return .{ .value = null };
+        };
+        self._view = .{
+            .node_count = self._count,
+            .nodes = self._nodes,
+            .input = self._input_ptr,
+            .input_len = self._input_len,
+            .rule_count = @intCast(compiled.rule_names.len),
+            .field_count = @intCast(compiled.field_names.len),
+            .rule_names = compiled.name_strs.ptr,
+            .field_names = compiled.name_strs.ptr + compiled.rule_names.len,
+        };
+        const capsule = py.c.PyCapsule_New(&self._view, CAPSULE_NAME, &capsuleFree) orelse return .{ .value = null };
+        const self_obj = Module.selfObject(Tree, self);
+        py.Py_IncRef(self_obj);
+        _ = py.c.PyCapsule_SetContext(capsule, self_obj);
+        return .{ .value = capsule };
+    }
 
     pub fn __del__(self: *Tree) void {
         if (self._nodes) |nodes| allocator.free(nodes[0..self._alloc_len]);
@@ -344,13 +797,28 @@ const Tree = struct {
         return @intCast(@min(next, self._count));
     }
 
+    /// Number of direct children of the node at `idx`. The stored count
+    /// saturates, so nodes with more children are counted sibling by sibling.
+    fn childCount(self: *Tree, idx: u32) u32 {
+        const f = self.flat(idx) orelse return 0;
+        if (f.child_count() < abi.CHILD_COUNT_MANY) return f.child_count();
+        if (self._many_parent == idx) return self._many_count;
+        const end = self.skip(idx);
+        var n: u32 = 0;
+        var ci: u32 = idx + 1;
+        while (ci < end) : (n += 1) ci = self.skip(ci);
+        self._many_parent = idx;
+        self._many_count = n;
+        return n;
+    }
+
     fn ruleName(self: *const Tree, f: abi.FlatNode) []const u8 {
         const rules = self._rules orelse return "";
         const rid = f.rule_id();
         return if (rid < rules.bytes.len) rules.bytes[rid] else "";
     }
 
-    pub const __doc__: [*:0]const u8 = "Internal storage shared by the Nodes of one parse.";
+    pub const __doc__: [*:0]const u8 = "The result of one parse: the flat node array, the input and the rule and label names. Shared by all its Nodes.";
 };
 
 fn makeNode(tree: *Tree, idx: u32) Node {
@@ -417,16 +885,15 @@ const Node = struct {
     }
 
     pub fn child_count(self: *const Node) i64 {
-        const f = self.flat() orelse return 0;
-        return f.child_count();
+        const t = self._t orelse return 0;
+        return t.childCount(self._idx);
     }
 
     /// Flat index of the child at `index`. Children are found by skipping
     /// sibling subtrees; sequential lookups resume from the previous one.
     fn childIndex(self: *const Node, index: u32) ?u32 {
         const t = self._t orelse return null;
-        const f = self.flat() orelse return null;
-        if (index >= f.child_count()) return null;
+        if (index >= t.childCount(self._idx)) return null;
 
         var pos: u32 = 0;
         var ci: u32 = self._idx + 1;
@@ -472,11 +939,10 @@ const Node = struct {
     pub fn __iter__(self: *const Node) NodeIter {
         var it = NodeIter{};
         const t = self._t orelse return it;
-        const f = self.flat() orelse return it;
         it._t = t;
         it._tree.set(Module.selfObject(Tree, t));
         it._next = self._idx + 1;
-        it._remaining = f.child_count();
+        it._remaining = t.childCount(self._idx);
         return it;
     }
 
@@ -519,11 +985,11 @@ const Node = struct {
 
     /// Return all children as a list.
     pub fn children(self: *const Node) pyoz.Signature(?*pyoz.PyObject, "list[Node]") {
-        const f = self.flat() orelse return .{ .value = py.c.PyList_New(0) };
-        const t = self._t.?;
-        const list = py.c.PyList_New(f.child_count()) orelse return .{ .value = null };
+        const t = self._t orelse return .{ .value = py.c.PyList_New(0) };
+        const cc = t.childCount(self._idx);
+        const list = py.c.PyList_New(cc) orelse return .{ .value = null };
         var ci: u32 = self._idx + 1;
-        for (0..f.child_count()) |i| {
+        for (0..cc) |i| {
             if (ci >= t._count) {
                 py.Py_DecRef(list);
                 py.PyErr_SetString(py.PyExc_RuntimeError(), "corrupt parse tree");
@@ -535,6 +1001,79 @@ const Node = struct {
             };
             _ = py.c.PyList_SetItem(list, @intCast(i), obj);
             ci = t.skip(ci);
+        }
+        return .{ .value = list };
+    }
+
+    /// The Tree this node belongs to.
+    pub fn get_tree(self: *const Node) pyoz.Signature(?*pyoz.PyObject, "Tree") {
+        const t = self._t orelse {
+            py.Py_IncRef(py.Py_None());
+            return .{ .value = py.Py_None() };
+        };
+        const obj = Module.selfObject(Tree, t);
+        py.Py_IncRef(obj);
+        return .{ .value = obj };
+    }
+
+    /// Index of this node in its tree's node array.
+    pub fn get_index(self: *const Node) i64 {
+        return self._idx;
+    }
+
+    /// The label this node was matched under in its parent rule, or None.
+    pub fn field(self: *const Node) pyoz.Signature(?*pyoz.PyObject, "str | None") {
+        const none = py.Py_None();
+        if (self._t) |t| {
+            if (t._rules) |table| {
+                const id = (self.flat() orelse return .{ .value = null }).field_id();
+                if (id != 0 and id <= table.fields.len) {
+                    py.Py_IncRef(table.fields[id - 1]);
+                    return .{ .value = table.fields[id - 1] };
+                }
+            }
+        }
+        py.Py_IncRef(none);
+        return .{ .value = none };
+    }
+
+    /// Flat index of the first child labelled `id` at or after flat index
+    /// `from` (a child of this node), or null.
+    fn nextLabelled(self: *const Node, from: u32, id: u8) ?u32 {
+        const t = self._t orelse return null;
+        const stop = t.skip(self._idx);
+        var ci = from;
+        while (ci < stop) : (ci = t.skip(ci)) {
+            if (t._nodes.?[ci].field_id() == id) return ci;
+        }
+        return null;
+    }
+
+    /// The first child matched under the label `name`, or None.
+    pub fn get(self: *const Node, name: []const u8) ?Node {
+        const t = self._t orelse return null;
+        const id = (t._rules orelse return null).fieldIdOf(name);
+        if (id == 0 or self._idx >= t._count) return null;
+        return makeNode(t, self.nextLabelled(self._idx + 1, id) orelse return null);
+    }
+
+    /// All children matched under the label `name`, in order.
+    pub fn get_all(self: *const Node, name: []const u8) pyoz.Signature(?*pyoz.PyObject, "list[Node]") {
+        const list = py.c.PyList_New(0) orelse return .{ .value = null };
+        const t = self._t orelse return .{ .value = list };
+        const id = (t._rules orelse return .{ .value = list }).fieldIdOf(name);
+        if (id == 0 or self._idx >= t._count) return .{ .value = list };
+        var from = self._idx + 1;
+        while (self.nextLabelled(from, id)) |ci| : (from = t.skip(ci)) {
+            const obj = Module.toPy(Node, makeNode(t, ci)) orelse {
+                py.Py_DecRef(list);
+                return .{ .value = null };
+            };
+            defer py.Py_DecRef(obj);
+            if (py.c.PyList_Append(list, obj) != 0) {
+                py.Py_DecRef(list);
+                return .{ .value = null };
+            }
         }
         return .{ .value = list };
     }
@@ -568,6 +1107,17 @@ const Node = struct {
         return .{ .value = list };
     }
 
+    /// Convert this subtree to values as the rules' `-> name` actions say
+    /// (what parse_ast() does for the whole input).
+    pub fn to_ast(self: *const Node, args: pyoz.Args(struct { spans: bool = true })) pyoz.Signature(?*pyoz.PyObject, "object") {
+        const t = self._t orelse return .{ .value = null };
+        const parser = t._parser_ptr orelse {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
+            return .{ .value = null };
+        };
+        return .{ .value = parser.buildAst(t, self._idx, args.value.spans) };
+    }
+
     /// Convert this subtree to nested tuples in one native pass:
     /// (rule, text, children) or, with spans=True, (rule, start, end, text, children).
     pub fn to_tuple(self: *const Node, args: pyoz.Args(struct { spans: bool = false })) pyoz.Signature(?*pyoz.PyObject, "tuple") {
@@ -591,7 +1141,7 @@ const Node = struct {
         var i: u32 = @intCast(@min(@as(u64, first) + f.subtree_size, t._count - 1));
         while (true) : (i -= 1) {
             const n = nodes[i];
-            const cc = n.child_count();
+            const cc = t.childCount(i);
             if (stack.items.len < cc) return .{ .value = null };
 
             const kids = py.c.PyTuple_New(cc) orelse return .{ .value = null };
@@ -648,7 +1198,13 @@ const Node = struct {
     pub const children__doc__: [*:0]const u8 = "Return all children as a list of Node.";
     pub const find__doc__: [*:0]const u8 = "Search this node and its descendants for nodes matching a rule name. Returns a list.";
     pub const find__params__ = "rule_name";
+    pub const field__doc__: [*:0]const u8 = "Return the label this node was matched under in its parent rule (label:rule in the grammar), or None.";
+    pub const get__doc__: [*:0]const u8 = "Return the first child matched under a label, or None.";
+    pub const get__params__ = "name";
+    pub const get_all__doc__: [*:0]const u8 = "Return all children matched under a label, in order.";
+    pub const get_all__params__ = "name";
     pub const child_count__doc__: [*:0]const u8 = "Return the number of child nodes.";
+    pub const to_ast__doc__: [*:0]const u8 = "Convert this subtree to values as the rules' `-> name` actions say. Objects built by `-> Class` get __zspan__ = (start, end) and __znode__ = the node's index, unless spans=False.";
     pub const to_tuple__doc__: [*:0]const u8 = "Convert this subtree to nested tuples in one native pass: (rule, text, children), or (rule, start, end, text, children) with spans=True.";
 
     // ── Freelist for fast allocation ──
@@ -740,6 +1296,10 @@ const LastError = struct {
     line: u32 = 0,
     col: u32 = 0,
     rule_id: u16 = 0,
+    /// The message when the error is a terminal failure found by
+    /// diagnose.zig ("expected ';'"); empty for the kinds above
+    text: [200]u8 = undefined,
+    text_len: u8 = 0,
 };
 
 const GrammarParser = struct {
@@ -748,8 +1308,22 @@ const GrammarParser = struct {
     /// Interned rule names, created on first parse (needs the GIL)
     _rules: ?*RuleTable = null,
     _last_error: LastError = .{},
+    /// The class (or callable) of each rule with a class action, once bound
+    /// with compile(ast=...) or bind(); one entry per rule
+    _classes: ?[*]?*pyoz.PyObject = null,
+
+    fn dropClasses(self: *GrammarParser) void {
+        const classes = self._classes orelse return;
+        const n = if (self._compiled) |c| c.rule_names.len else 0;
+        for (classes[0..n]) |cls| {
+            if (cls) |obj| py.Py_DecRef(obj);
+        }
+        allocator.free(classes[0..n]);
+        self._classes = null;
+    }
 
     pub fn __del__(self: *GrammarParser) void {
+        self.dropClasses();
         if (self._rules) |table| table.destroy();
         self._rules = null;
         if (self._compiled) |c| c.release();
@@ -759,7 +1333,7 @@ const GrammarParser = struct {
     fn ruleTable(self: *GrammarParser) !*RuleTable {
         if (self._rules) |r| return r;
         const compiled = self._compiled orelse return error.ParserNotLoaded;
-        self._rules = try RuleTable.create(compiled.rule_names);
+        self._rules = try RuleTable.create(compiled.rule_names, compiled.field_names);
         return self._rules.?;
     }
 
@@ -771,11 +1345,19 @@ const GrammarParser = struct {
         pos += copySlice(buf, pos, ", col ");
         pos += fmtInt(buf, pos, err.col);
         pos += copySlice(buf, pos, ": ");
-        pos += copySlice(buf, pos, errorMessage(self, err, buf[pos..]));
+        // errorMessage may build its text in the scratch space, which is
+        // already where the message goes
+        const msg = errorMessage(self, err, buf[pos..]);
+        pos += if (msg.ptr == buf[pos..].ptr) msg.len else copySlice(buf, pos, msg);
         return buf[0..pos];
     }
 
     fn errorMessage(self: *const GrammarParser, err: LastError, scratch: []u8) []const u8 {
+        if (err.text_len != 0) {
+            const n = @min(err.text_len, scratch.len);
+            @memcpy(scratch[0..n], err.text[0..n]);
+            return scratch[0..n];
+        }
         return switch (err.kind) {
             .none => "",
             .trailing_input => "unexpected input after match",
@@ -785,13 +1367,55 @@ const GrammarParser = struct {
                 if (err.rule_id >= compiled.rule_names.len) break :blk "unexpected input";
                 // Built in place at the start of scratch, then copied by the caller
                 var tmp: [abi.MAX_RULE_NAME + 16]u8 = undefined;
-                const name = compiled.rule_names[err.rule_id];
+                const name = compiled.display_names[err.rule_id];
                 const msg = std.fmt.bufPrint(&tmp, "expected {s}", .{name}) catch break :blk "unexpected input";
                 const n = @min(msg.len, scratch.len);
                 @memcpy(scratch[0..n], msg[0..n]);
                 break :blk scratch[0..n];
             },
         };
+    }
+
+    /// The generated parser reports the first rule that failed at the
+    /// furthest position a rule started from. diagnose.zig finds the furthest
+    /// failure of any kind and everything expected there (a missing ';' at
+    /// the end of a statement: "expected ';'", where it was expected).
+    /// Prefer that, except for input left over after a complete match with
+    /// nothing failing beyond it.
+    fn refineError(self: *GrammarParser, compiled: *const Compiled, input: []const u8, start_rule: u32) void {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const grammar = grammar_parser.parseGrammar(arena.allocator(), compiled.text) catch return;
+        const found = diagnose.diagnose(allocator, grammar, input, start_rule) orelse return;
+        if (found.pos < self._last_error.offset) return;
+        if (found.pos == self._last_error.offset and self._last_error.kind != .expected_rule) return;
+
+        const err = &self._last_error;
+        const lc = abi.lineCol(input, found.pos);
+        err.offset = @intCast(found.pos);
+        err.line = lc.line;
+        err.col = lc.col;
+        err.text_len = @intCast(found.message(&err.text).len);
+    }
+
+    /// A syntax error as a Diagnostic object (null, with the Python error
+    /// cleared, if it can't be created).
+    fn syntaxDiagnostic(message: []const u8, err: LastError) ?*pyoz.PyObject {
+        const severity = py.PyUnicode_FromStringAndSize("error", 5);
+        const code = py.PyUnicode_FromStringAndSize("syntax", 6);
+        const msg = py.PyUnicode_FromStringAndSize(message.ptr, @intCast(message.len));
+        defer inline for (.{ severity, code, msg }) |o| {
+            if (o) |obj| py.Py_DecRef(obj);
+        };
+        if (severity != null and code != null and msg != null) {
+            if (Diagnostic.create(severity.?, code.?, msg.?, err.offset, err.offset, err.line, err.col, null)) |d| {
+                if (Module.toPy(Diagnostic, d)) |obj| return obj;
+                var dropped = d;
+                dropped.__del__();
+            }
+        }
+        py.c.PyErr_Clear();
+        return null;
     }
 
     /// Run the compiled parser. On success returns the root Node; on failure
@@ -872,6 +1496,8 @@ const GrammarParser = struct {
                 ._input_ptr = ptr,
                 ._input_len = input_len,
                 ._rules = table,
+                ._compiled = compiled,
+                ._parser_ptr = self,
             };
             py.Py_IncRef(input);
             tree._parser.set(Module.selfObject(GrammarParser, self));
@@ -897,6 +1523,7 @@ const GrammarParser = struct {
             .rule_id = output.error_rule_id,
         };
         if (self._last_error.kind == .out_of_memory) return error.OutOfMemory;
+        self.refineError(compiled, ptr[0..input_len], start_rule);
         if (!raise_on_fail) return null;
 
         var msg_buf: [320]u8 = undefined;
@@ -916,13 +1543,14 @@ const GrammarParser = struct {
         py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
         if (v) |exc| {
             const err = self._last_error;
-            var scratch: [abi.MAX_RULE_NAME + 32]u8 = undefined;
+            var scratch: [256]u8 = undefined;
             const message = self.errorMessage(err, &scratch);
             const attrs = [_]struct { [*:0]const u8, ?*pyoz.PyObject }{
                 .{ "line", py.c.PyLong_FromUnsignedLong(err.line) },
                 .{ "column", py.c.PyLong_FromUnsignedLong(err.col) },
                 .{ "offset", py.c.PyLong_FromUnsignedLong(err.offset) },
                 .{ "message", py.PyUnicode_FromStringAndSize(message.ptr, @intCast(message.len)) },
+                .{ "diagnostic", syntaxDiagnostic(message, err) },
             };
             for (attrs) |a| {
                 if (a[1]) |val| {
@@ -932,6 +1560,391 @@ const GrammarParser = struct {
             }
         }
         py.c.PyErr_Restore(t, v, tb);
+    }
+
+    // ── AST building ──
+
+    /// Raise `exc` with "<before><name><after>".
+    fn raiseNamed(exc: *pyoz.PyObject, before: []const u8, name: []const u8, after: []const u8) void {
+        var buf: [512]u8 = undefined;
+        var pos: usize = 0;
+        pos += copySlice(buf[0 .. buf.len - 1], pos, before);
+        pos += copySlice(buf[0 .. buf.len - 1], pos, name);
+        pos += copySlice(buf[0 .. buf.len - 1], pos, after);
+        buf[pos] = 0;
+        py.PyErr_SetString(exc, @ptrCast(&buf));
+    }
+
+    /// Look up the class of every `-> Class` rule in `ast` (a mapping or any
+    /// object with attributes, such as a module). Sets a Python error and
+    /// returns false if one is missing.
+    fn bindClasses(self: *GrammarParser, ast: *pyoz.PyObject) bool {
+        const compiled = self._compiled orelse {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
+            return false;
+        };
+        const n = compiled.rule_names.len;
+        const classes = allocator.alloc(?*pyoz.PyObject, n) catch {
+            _ = py.c.PyErr_NoMemory();
+            return false;
+        };
+        @memset(classes, null);
+        var ok = true;
+        for (compiled.actions, 0..) |action, i| {
+            if (action != .class) continue;
+            const name = compiled.action_names[i];
+            const key = py.PyUnicode_FromStringAndSize(name.ptr, @intCast(name.len)) orelse {
+                ok = false;
+                break;
+            };
+            defer py.Py_DecRef(key);
+            classes[i] = if (py.PyDict_Check(ast)) py.c.PyObject_GetItem(ast, key) else py.PyObject_GetAttr(ast, key);
+            if (classes[i] == null) {
+                py.c.PyErr_Clear();
+                raiseNamed(py.PyExc_ValueError(), "ast has no '", name, "' (used as `-> name` in the grammar)");
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            for (classes) |cls| {
+                if (cls) |obj| py.Py_DecRef(obj);
+            }
+            allocator.free(classes);
+            return false;
+        }
+        self.dropClasses();
+        self._classes = classes.ptr;
+        return true;
+    }
+
+    /// Bind the classes named by `-> Class` actions: `ast` is a dict or an
+    /// object with them as attributes (a module, a namespace).
+    pub fn bind(self: *GrammarParser, ast: *pyoz.PyObject) pyoz.Signature(?*pyoz.PyObject, "None") {
+        if (!self.bindClasses(ast)) return .{ .value = null };
+        py.Py_IncRef(py.Py_None());
+        return .{ .value = py.Py_None() };
+    }
+
+    /// Parse the whole input and return the Tree (see Node.tree).
+    pub fn parse_tree(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null })) pyoz.Signature(anyerror!?*pyoz.PyObject, "Tree") {
+        const root = (self.run(args.value.input, args.value.start, 0, true) catch |e| return .{ .value = e }) orelse return .{ .value = null };
+        var node = root;
+        defer node._tree.clear();
+        const obj = Module.selfObject(Tree, root._t.?);
+        py.Py_IncRef(obj);
+        return .{ .value = obj };
+    }
+
+    /// Parse the whole input and convert the tree to values, bottom-up, as
+    /// the rules' `-> name` actions say.
+    pub fn parse_ast(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null, spans: bool = true })) pyoz.Signature(anyerror!?*pyoz.PyObject, "object") {
+        const root = (self.run(args.value.input, args.value.start, 0, true) catch |e| return .{ .value = e }) orelse return .{ .value = null };
+        var node = root;
+        defer node._tree.clear();
+        return .{ .value = self.buildAst(root._t.?, root._idx, args.value.spans) };
+    }
+
+    /// Convert the subtree at `root` to a value (a new reference; None if the
+    /// root is dropped). On failure sets a Python error and returns null.
+    fn buildAst(self: *GrammarParser, t: *Tree, root: u32, spans: bool) ?*pyoz.PyObject {
+        const compiled = self._compiled.?;
+        const nodes = t._nodes.?;
+
+        // Reverse pre-order: when a node is reached its children's values are
+        // the top entries of the stack, first child on top. null = dropped.
+        var stack: std.ArrayList(?*pyoz.PyObject) = .empty;
+        defer {
+            for (stack.items) |v| {
+                if (v) |o| py.Py_DecRef(o);
+            }
+            stack.deinit(allocator);
+        }
+
+        var i: u32 = @intCast(@min(@as(u64, root) + nodes[root].subtree_size, t._count - 1));
+        while (true) : (i -= 1) {
+            const cc = t.childCount(i);
+            if (stack.items.len < cc) {
+                py.PyErr_SetString(py.PyExc_RuntimeError(), "corrupt parse tree");
+                return null;
+            }
+            const kids = stack.items[stack.items.len - cc ..];
+            const value = self.convert(compiled, t, i, kids, spans) catch return null;
+            for (kids) |v| {
+                if (v) |o| py.Py_DecRef(o);
+            }
+            stack.items.len -= cc;
+            stack.append(allocator, value) catch {
+                if (value) |o| py.Py_DecRef(o);
+                _ = py.c.PyErr_NoMemory();
+                return null;
+            };
+            if (i == root) break;
+        }
+        const result = stack.pop().? orelse py.Py_None();
+        if (result == py.Py_None()) py.Py_IncRef(result);
+        return result;
+    }
+
+    const BuildError = error{PythonError};
+
+    /// `-> unquote`: the string a quoted literal stands for. Drops the first
+    /// and last byte (the quotes) and replaces backslash escapes: \n \t \r
+    /// \b \f \0, \xHH, \uHHHH (UTF-16 surrogate pairs combine), and any
+    /// other escaped character stands for itself (\" \' \\ \/).
+    fn unquote(text: []const u8) ?*pyoz.PyObject {
+        const inner = if (text.len >= 2) text[1 .. text.len - 1] else "";
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return py.PyUnicode_FromStringAndSize(inner.ptr, @intCast(inner.len));
+
+        // Every escape is at least as long as the UTF-8 it stands for
+        var stack_buf: [512]u8 = undefined;
+        const out = if (inner.len <= stack_buf.len) stack_buf[0..inner.len] else allocator.alloc(u8, inner.len) catch {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        defer if (out.ptr != &stack_buf) allocator.free(out);
+
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < inner.len) {
+            if (inner[i] != '\\' or i + 1 == inner.len) {
+                out[n] = inner[i];
+                n += 1;
+                i += 1;
+                continue;
+            }
+            const esc = inner[i + 1];
+            i += 2;
+            var cp: u21 = switch (esc) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'b' => 0x08,
+                'f' => 0x0C,
+                '0' => 0,
+                'x', 'u' => blk: {
+                    const digits: usize = if (esc == 'x') 2 else 4;
+                    if (i + digits > inner.len) break :blk esc;
+                    const v = std.fmt.parseInt(u16, inner[i..][0..digits], 16) catch break :blk esc;
+                    i += digits;
+                    break :blk v;
+                },
+                else => esc,
+            };
+            // A high surrogate followed by an escaped low one is one character
+            if (cp >= 0xD800 and cp < 0xDC00 and i + 6 <= inner.len and inner[i] == '\\' and inner[i + 1] == 'u') {
+                if (std.fmt.parseInt(u16, inner[i + 2 ..][0..4], 16)) |low| {
+                    if (low >= 0xDC00 and low < 0xE000) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                        i += 6;
+                    }
+                } else |_| {}
+            }
+            // Encode by hand: a lone surrogate must get through (surrogatepass below)
+            if (cp < 0x80) {
+                out[n] = @intCast(cp);
+                n += 1;
+            } else if (cp < 0x800) {
+                out[n] = @intCast(0xC0 | (cp >> 6));
+                out[n + 1] = @intCast(0x80 | (cp & 0x3F));
+                n += 2;
+            } else if (cp < 0x10000) {
+                out[n] = @intCast(0xE0 | (cp >> 12));
+                out[n + 1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+                out[n + 2] = @intCast(0x80 | (cp & 0x3F));
+                n += 3;
+            } else {
+                out[n] = @intCast(0xF0 | (cp >> 18));
+                out[n + 1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
+                out[n + 2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+                out[n + 3] = @intCast(0x80 | (cp & 0x3F));
+                n += 4;
+            }
+        }
+        return py.c.PyUnicode_DecodeUTF8(out.ptr, @intCast(n), "surrogatepass");
+    }
+
+    /// The kept (non-dropped) values of `kids` in child order, as a list or tuple.
+    fn collect(kids: []const ?*pyoz.PyObject, as_tuple: bool) BuildError!*pyoz.PyObject {
+        var n: usize = 0;
+        for (kids) |v| n += @intFromBool(v != null);
+        const seq = (if (as_tuple) py.c.PyTuple_New(@intCast(n)) else py.c.PyList_New(@intCast(n))) orelse return error.PythonError;
+        var k: py.Py_ssize_t = 0;
+        var j = kids.len;
+        while (j > 0) {
+            j -= 1;
+            const v = kids[j] orelse continue;
+            py.Py_IncRef(v);
+            // Both steal the reference
+            _ = if (as_tuple) py.c.PyTuple_SetItem(seq, k, v) else py.c.PyList_SetItem(seq, k, v);
+            k += 1;
+        }
+        return seq;
+    }
+
+    /// The value of node `i` given its children's values (`kids`, first child
+    /// last). Returns a new reference, or null for a dropped node.
+    fn convert(self: *GrammarParser, compiled: *const Compiled, t: *Tree, i: u32, kids: []const ?*pyoz.PyObject, spans: bool) BuildError!?*pyoz.PyObject {
+        const n = t._nodes.?[i];
+        const rid = n.rule_id();
+        if (rid >= compiled.actions.len) {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "corrupt parse tree");
+            return error.PythonError;
+        }
+        const s = @min(n.text_start, t._input_len);
+        const e = @min(@max(n.text_end, s), t._input_len);
+        const text_ptr = t._input_ptr.? + s;
+        const text_len: py.Py_ssize_t = @intCast(e - s);
+
+        switch (compiled.actions[rid]) {
+            .none => {
+                if (kids.len == 0) return py.PyUnicode_FromStringAndSize(text_ptr, text_len) orelse error.PythonError;
+                if (kids.len == 1) {
+                    if (kids[0]) |v| py.Py_IncRef(v);
+                    return kids[0];
+                }
+                return try collect(kids, false);
+            },
+            .str => return py.PyUnicode_FromStringAndSize(text_ptr, text_len) orelse error.PythonError,
+            .int, .float => |action| {
+                // Plain decimal numbers convert natively; anything else goes
+                // through Python's int()/float() for its exact rules and errors
+                const bytes = text_ptr[0..@intCast(text_len)];
+                if (action == .int and bytes.len <= 18) {
+                    if (std.fmt.parseInt(i64, bytes, 10)) |v| {
+                        if (std.mem.indexOfScalar(u8, bytes, '_') == null and bytes[0] != '+')
+                            return py.c.PyLong_FromLongLong(v) orelse error.PythonError;
+                    } else |_| {}
+                } else if (action == .float and bytes.len <= 32 and std.mem.indexOfNone(u8, bytes, "0123456789.-eE+") == null) {
+                    if (std.fmt.parseFloat(f64, bytes)) |v| {
+                        return py.c.PyFloat_FromDouble(v) orelse error.PythonError;
+                    } else |_| {}
+                }
+                const text = py.PyUnicode_FromStringAndSize(text_ptr, text_len) orelse return error.PythonError;
+                defer py.Py_DecRef(text);
+                return (if (action == .int) py.c.PyNumber_Long(text) else py.c.PyFloat_FromString(text)) orelse error.PythonError;
+            },
+            .true, .false, .null => |action| {
+                const obj = switch (action) {
+                    .true => py.Py_True(),
+                    .false => py.Py_False(),
+                    else => py.Py_None(),
+                };
+                py.Py_IncRef(obj);
+                return obj;
+            },
+            .unquote => return unquote(text_ptr[0..@intCast(text_len)]) orelse error.PythonError,
+            .list => return try collect(kids, false),
+            .tuple => return try collect(kids, true),
+            .dict => {
+                const dict = py.c.PyDict_New() orelse return error.PythonError;
+                errdefer py.Py_DecRef(dict);
+                var j = kids.len;
+                while (j > 0) {
+                    j -= 1;
+                    const pair = kids[j] orelse continue;
+                    if (!py.PyTuple_Check(pair) or py.PyTuple_Size(pair) != 2) {
+                        raiseNamed(py.PyExc_TypeError(), "rule '", compiled.rule_names[rid], "' -> dict: every child must be a (key, value) tuple (e.g. a rule with `-> tuple`)");
+                        return error.PythonError;
+                    }
+                    if (py.PyDict_SetItem(dict, py.PyTuple_GetItem(pair, 0).?, py.PyTuple_GetItem(pair, 1).?) != 0) return error.PythonError;
+                }
+                return dict;
+            },
+            .first => {
+                var j = kids.len;
+                while (j > 0) {
+                    j -= 1;
+                    if (kids[j]) |v| {
+                        py.Py_IncRef(v);
+                        return v;
+                    }
+                }
+                py.Py_IncRef(py.Py_None());
+                return py.Py_None();
+            },
+            .drop => return null,
+            .class => {},
+        }
+
+        // -> Class: labelled children become keyword arguments. A rule with
+        // no labels passes its children's values positionally, or its text
+        // if it can't have children.
+        const cls = (if (self._classes) |c| c[rid] else null) orelse {
+            raiseNamed(py.PyExc_ValueError(), "the grammar uses `-> ", compiled.action_names[rid], "`: compile with ast=... (or call bind()) before parse_ast()");
+            return error.PythonError;
+        };
+        const labels = compiled.labels[compiled.label_start[rid]..compiled.label_start[rid + 1]];
+        const table = t._rules.?;
+
+        var any_labelled = labels.len != 0;
+        var ci: u32 = i + 1;
+        for (0..kids.len) |_| {
+            if (t._nodes.?[ci].field_id() != 0) any_labelled = true;
+            ci = t.skip(ci);
+        }
+
+        var obj: *pyoz.PyObject = undefined;
+        if (compiled.no_args[rid]) {
+            const no_args = py.c.PyTuple_New(0) orelse return error.PythonError;
+            defer py.Py_DecRef(no_args);
+            obj = py.c.PyObject_Call(cls, no_args, null) orelse return error.PythonError;
+        } else if (any_labelled) {
+            const kwargs = py.c.PyDict_New() orelse return error.PythonError;
+            defer py.Py_DecRef(kwargs);
+            for (labels) |l| {
+                const initial = if (l.many) py.c.PyList_New(0) orelse return error.PythonError else py.Py_None();
+                defer if (l.many) py.Py_DecRef(initial);
+                if (py.PyDict_SetItem(kwargs, table.fields[l.field - 1], initial) != 0) return error.PythonError;
+            }
+            ci = i + 1;
+            var j = kids.len;
+            while (j > 0) : (ci = t.skip(ci)) {
+                j -= 1;
+                const field = t._nodes.?[ci].field_id();
+                const v = kids[j] orelse continue;
+                if (field == 0 or field > table.fields.len) continue;
+                const key = table.fields[field - 1];
+                var many = false;
+                for (labels) |l| {
+                    if (l.field == field) many = l.many;
+                }
+                if (many) {
+                    // Borrowed reference to the list created above
+                    const list = py.c.PyDict_GetItem(kwargs, key) orelse return error.PythonError;
+                    if (py.PyList_Append(list, v) != 0) return error.PythonError;
+                } else if (py.PyDict_SetItem(kwargs, key, v) != 0) return error.PythonError;
+            }
+            const no_args = py.c.PyTuple_New(0) orelse return error.PythonError;
+            defer py.Py_DecRef(no_args);
+            obj = py.c.PyObject_Call(cls, no_args, kwargs) orelse return error.PythonError;
+        } else {
+            const call_args = if (compiled.has_children[rid]) try collect(kids, true) else blk: {
+                const text = py.PyUnicode_FromStringAndSize(text_ptr, text_len) orelse return error.PythonError;
+                defer py.Py_DecRef(text);
+                const tuple = py.c.PyTuple_New(1) orelse return error.PythonError;
+                py.Py_IncRef(text);
+                _ = py.c.PyTuple_SetItem(tuple, 0, text);
+                break :blk tuple;
+            };
+            defer py.Py_DecRef(call_args);
+            obj = py.c.PyObject_Call(cls, call_args, null) orelse return error.PythonError;
+        }
+
+        if (spans) {
+            // Best effort: objects that can't take attributes go without
+            const span = py.c.PyTuple_New(2);
+            if (span) |sp| {
+                _ = py.c.PyTuple_SetItem(sp, 0, py.c.PyLong_FromUnsignedLong(n.text_start));
+                _ = py.c.PyTuple_SetItem(sp, 1, py.c.PyLong_FromUnsignedLong(n.text_end));
+            }
+            if (span == null or py.PyObject_SetAttr(obj, table.span_attr, span.?) != 0) py.c.PyErr_Clear();
+            if (span) |sp| py.Py_DecRef(sp);
+            const index = py.c.PyLong_FromUnsignedLong(i);
+            if (index == null or py.PyObject_SetAttr(obj, table.node_attr, index.?) != 0) py.c.PyErr_Clear();
+            if (index) |ix| py.Py_DecRef(ix);
+        }
+        return obj;
     }
 
     fn raise(exc: *pyoz.PyObject, msg: [*:0]const u8) ?Node {
@@ -1031,6 +2044,7 @@ const GrammarParser = struct {
 
         var e = ParseError{};
         const msg = self.errorMessage(err, &e._message);
+        if (msg.ptr != &e._message) @memcpy(e._message[0..msg.len], msg);
         e._message_len = msg.len;
         e._offset = err.offset;
         e._line = err.line;
@@ -1052,6 +2066,20 @@ const GrammarParser = struct {
         return .{ .value = list };
     }
 
+    /// Names of the grammar's labels, in order of first use.
+    pub fn fields(self: *GrammarParser) pyoz.Signature(?*pyoz.PyObject, "list[str]") {
+        const tbl = self.ruleTable() catch {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
+            return .{ .value = null };
+        };
+        const list = py.c.PyList_New(@intCast(tbl.fields.len)) orelse return .{ .value = null };
+        for (tbl.fields, 0..) |n, i| {
+            py.Py_IncRef(n);
+            _ = py.c.PyList_SetItem(list, @intCast(i), n);
+        }
+        return .{ .value = list };
+    }
+
     pub fn __repr__(self: *const GrammarParser, buf: []u8) []const u8 {
         const compiled = self._compiled orelse return "GrammarParser(not loaded)";
         var pos: usize = 0;
@@ -1065,6 +2093,11 @@ const GrammarParser = struct {
     pub const parse__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes), which must match completely. start= names the start rule (default: the first). Returns the root Node, raises ParseError on failure.";
     pub const match__doc__: [*:0]const u8 = "Match the start rule at the beginning of the input without requiring it to consume everything. Returns the root Node (see end()), or None if it doesn't match.";
     pub const rules__doc__: [*:0]const u8 = "Names of the grammar's rules, in definition order.";
+    pub const parse_tree__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and return the Tree: root, nodes, input, rules, fields, and a capsule for native code. Raises ParseError on failure.";
+    pub const bind__doc__: [*:0]const u8 = "Supply the classes named by `-> Class` actions: a dict, or an object with them as attributes (a module).";
+    pub const bind__params__ = "ast";
+    pub const parse_ast__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and convert the tree to values as the rules' `-> name` actions say. Objects built by `-> Class` get __zspan__ = (start, end) and __znode__ = the node's index, unless spans=False. Raises ParseError on failure.";
+    pub const fields__doc__: [*:0]const u8 = "Names of the grammar's labels (label:rule), in order of first use.";
     pub const matches__doc__: [*:0]const u8 = "Does the whole input match the grammar? Several times faster than parse(): builds no tree. On False, `error` explains the rejection. start= names the start rule.";
     pub const error__doc__: [*:0]const u8 = "ParseError from the last failed parse (message, line, column, offset), or None.";
 };
@@ -1082,10 +2115,32 @@ fn compileNative(grammar_text: []const u8) !GrammarParser {
     return .{ ._compiled = try compileCompiled(grammar_text) };
 }
 
+/// Completion step of compile_async, on the event loop thread: bind the
+/// classes named by `-> Class` actions, as compile(ast=...) does.
+fn bindAfterCompile(compiled: GrammarParser, ast: ?*pyoz.PyObject) pyoz.Signature(?GrammarParser, "GrammarParser") {
+    var parser = compiled;
+    if (ast) |obj| {
+        if (obj != py.Py_None() and !parser.bindClasses(obj)) {
+            // The parser never reaches Python: release it here
+            parser.__del__();
+            return .{ .value = null };
+        }
+    }
+    return .{ .value = parser };
+}
+
 /// Compile a grammar string into a native parser via LLVM JIT.
 /// Runs with the GIL released; repeated grammars come from a cache.
-fn compile(grammar_text: []const u8) !GrammarParser {
-    return pyoz.allowThreadsTry(compileNative, .{grammar_text});
+/// `ast` supplies the classes named by `-> Class` actions (see bind()).
+fn compile(args: pyoz.Args(struct { grammar: []const u8, ast: ?*pyoz.PyObject = null })) pyoz.Signature(anyerror!?GrammarParser, "GrammarParser") {
+    var parser = pyoz.allowThreadsTry(compileNative, .{args.value.grammar}) catch |e| return .{ .value = e };
+    if (args.value.ast) |ast| {
+        if (ast != py.Py_None() and !parser.bindClasses(ast)) {
+            parser.__del__();
+            return .{ .value = null };
+        }
+    }
+    return .{ .value = parser };
 }
 
 /// Drop cached compiled grammars (parsers already created keep working).
@@ -1119,12 +2174,43 @@ fn dumpIr(grammar_text: []const u8) !pyoz.Owned([]const u8) {
 // Module definition
 // ============================================================================
 
+const error_mappings = [_]pyoz.ErrorMapping{
+    pyoz.mapError("ParserNotLoaded", .RuntimeError),
+    pyoz.mapError("AllocationFailed", .RuntimeError),
+    pyoz.mapError("ParseFailed", .RuntimeError),
+    pyoz.mapError("IndexOutOfBounds", .IndexError),
+    pyoz.mapError("InputTooLarge", .ValueError),
+    pyoz.mapError("DuplicateRule", .ValueError),
+    pyoz.mapError("InvalidCharRange", .ValueError),
+    pyoz.mapError("NestingTooDeep", .ValueError),
+    pyoz.mapError("RuleNameTooLong", .ValueError),
+    pyoz.mapError("EmptyLiteral", .ValueError),
+    pyoz.mapError("TooManyRules", .ValueError),
+    pyoz.mapError("EmptyGrammar", .ValueError),
+    pyoz.mapError("UndefinedRule", .ValueError),
+    pyoz.mapError("LeftRecursion", .ValueError),
+    pyoz.mapErrorMsg("UnknownAnnotation", .ValueError, "unknown annotation (expected @silent, @memo, or one of @left, @right, @postfix)"),
+    pyoz.mapErrorMsg("InvalidFoldRule", .ValueError, "a @left, @right or @postfix rule must have the form `head (group)*` and can't be @silent"),
+    pyoz.mapErrorMsg("ExpectedRuleAfterLabel", .ValueError, "expected a rule name after 'label:' (only rule references can be labelled)"),
+    pyoz.mapErrorMsg("TooManyFields", .ValueError, "too many distinct labels (at most 255)"),
+    pyoz.mapError("ExpectedRuleName", .ValueError),
+    pyoz.mapError("ExpectedEquals", .ValueError),
+    pyoz.mapError("ExpectedExpression", .ValueError),
+    pyoz.mapError("ExpectedCloseParen", .ValueError),
+    pyoz.mapError("UnterminatedString", .ValueError),
+    pyoz.mapError("UnterminatedCharClass", .ValueError),
+    pyoz.mapError("CompilationFailed", .RuntimeError),
+};
+
 pub const Module = pyoz.module(.{
     .name = "zgram",
     .doc = "zgram - PEG parser generator. Compiles grammars to native code via LLVM JIT.",
+    .consts = &.{
+        pyoz.constant("TREE_ABI", @as(i64, abi.TREE_ABI)),
+    },
     .funcs = &.{
-        pyoz.func("compile", compile, "Compile a grammar string into a native parser").withParams("grammar"),
-        pyoz.func("compile_async", pyoz.asyncFn(compileNative), "Compile a grammar on a worker thread; returns an awaitable GrammarParser").withParams("grammar"),
+        pyoz.func("compile", compile, "Compile a grammar string into a native parser. ast= supplies the classes named by `-> Class` actions."),
+        pyoz.func("compile_async", pyoz.asyncThen(compileNative, bindAfterCompile), "Compile a grammar on a worker thread; returns an awaitable GrammarParser. ast= supplies the classes named by `-> Class` actions.").withParams("grammar, ast"),
         pyoz.func("clear_cache", clear_cache, "Drop cached compiled grammars"),
         pyoz.func("dump_ir", dump_ir, "Dump LLVM IR text for a grammar").withParams("grammar"),
         pyoz.func("version", version, "Return zgram version string"),
@@ -1132,37 +2218,15 @@ pub const Module = pyoz.module(.{
     .classes = &.{
         pyoz.class("Node", Node),
         pyoz.class("NodeIter", NodeIter),
-        pyoz.class("_Tree", Tree),
+        pyoz.class("Tree", Tree),
         pyoz.class("GrammarParser", GrammarParser),
         pyoz.class("ParseErrorInfo", ParseError),
+        pyoz.class("Diagnostic", Diagnostic),
     },
     .exceptions = &.{
         pyoz.exception("ParseError", .{ .doc = "Raised when parsing fails", .base = .ValueError }),
     },
-    .error_mappings = &.{
-        pyoz.mapError("ParserNotLoaded", .RuntimeError),
-        pyoz.mapError("AllocationFailed", .RuntimeError),
-        pyoz.mapError("ParseFailed", .RuntimeError),
-        pyoz.mapError("IndexOutOfBounds", .IndexError),
-        pyoz.mapError("InputTooLarge", .ValueError),
-        pyoz.mapError("DuplicateRule", .ValueError),
-        pyoz.mapError("InvalidCharRange", .ValueError),
-        pyoz.mapError("NestingTooDeep", .ValueError),
-        pyoz.mapError("RuleNameTooLong", .ValueError),
-        pyoz.mapError("EmptyLiteral", .ValueError),
-        pyoz.mapError("TooManyRules", .ValueError),
-        pyoz.mapError("EmptyGrammar", .ValueError),
-        pyoz.mapError("UndefinedRule", .ValueError),
-        pyoz.mapError("LeftRecursion", .ValueError),
-        pyoz.mapErrorMsg("UnknownAnnotation", .ValueError, "unknown annotation (expected @silent or @memo)"),
-        pyoz.mapError("ExpectedRuleName", .ValueError),
-        pyoz.mapError("ExpectedEquals", .ValueError),
-        pyoz.mapError("ExpectedExpression", .ValueError),
-        pyoz.mapError("ExpectedCloseParen", .ValueError),
-        pyoz.mapError("UnterminatedString", .ValueError),
-        pyoz.mapError("UnterminatedCharClass", .ValueError),
-        pyoz.mapError("CompilationFailed", .RuntimeError),
-    },
+    .error_mappings = &error_mappings,
 });
 
 // ============================================================================

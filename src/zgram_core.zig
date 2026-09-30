@@ -17,4 +17,6 @@ comptime {
     _ = jit_helpers.zgram_set_error_at_hwm;
     _ = jit_helpers.zgram_memo_lookup;
     _ = jit_helpers.zgram_memo_store;
+    _ = jit_helpers.zgram_tag_field;
+    _ = jit_helpers.zgram_fold;
 }

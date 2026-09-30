@@ -4,6 +4,33 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Run a build step quietly; on failure show its output and stop.
+quiet() {
+    local log
+    log="$(mktemp)"
+    if ! "$@" > "$log" 2>&1; then
+        echo "FAILED: $*" >&2
+        cat "$log" >&2
+        rm -f "$log"
+        exit 1
+    fi
+    rm -f "$log"
+}
+
+# Configure the CMake project in .. from the current build directory. A build
+# directory made by a checkout at another path (the repository was moved or
+# copied) is emptied first: CMake refuses to reuse its caches, including
+# those of the dependencies it fetched.
+configure() {
+    local src
+    src="$(cd .. && pwd)"
+    if [ "$(cat .source_dir 2>/dev/null)" != "$src" ]; then
+        find . -mindepth 1 -delete
+        echo "$src" > .source_dir
+    fi
+    quiet cmake .. "$@"
+}
+
 echo "=== zgram vs rust-peg, Spirit X3, lexy, PEGTL, pest, PackCC, cpp-peglib — JSON Parse Benchmark ==="
 echo ""
 
@@ -23,8 +50,8 @@ echo ""
 echo "Building PEGTL benchmark..."
 mkdir -p "$SCRIPT_DIR/pegtl/build"
 cd "$SCRIPT_DIR/pegtl/build"
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3" > /dev/null 2>&1
-make -j"$(nproc)" > /dev/null 2>&1
+configure -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3"
+quiet make -j"$(nproc)"
 PEGTL_BIN="$SCRIPT_DIR/pegtl/build/pegtl_bench"
 echo ""
 
@@ -32,8 +59,8 @@ echo ""
 echo "Building cpp-peglib benchmark..."
 mkdir -p "$SCRIPT_DIR/cpp-peglib/build"
 cd "$SCRIPT_DIR/cpp-peglib/build"
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3" > /dev/null 2>&1
-make -j"$(nproc)" > /dev/null 2>&1
+configure -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3"
+quiet make -j"$(nproc)"
 CPPPEG_BIN="$SCRIPT_DIR/cpp-peglib/build/cpppeg_bench"
 echo ""
 
@@ -41,8 +68,8 @@ echo ""
 echo "Building lexy benchmarks..."
 mkdir -p "$SCRIPT_DIR/lexy/build"
 cd "$SCRIPT_DIR/lexy/build"
-cmake .. -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-make -j"$(nproc)" > /dev/null 2>&1
+configure -DCMAKE_BUILD_TYPE=Release
+quiet make -j"$(nproc)"
 LEXY_BIN="$SCRIPT_DIR/lexy/build/lexy_bench"
 LEXY_AST_BIN="$SCRIPT_DIR/lexy/build/lexy_ast_bench"
 echo ""
@@ -51,8 +78,8 @@ echo ""
 echo "Building Spirit X3 benchmarks..."
 mkdir -p "$SCRIPT_DIR/spirit-x3/build"
 cd "$SCRIPT_DIR/spirit-x3/build"
-cmake .. -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-make -j"$(nproc)" > /dev/null 2>&1
+configure -DCMAKE_BUILD_TYPE=Release
+quiet make -j"$(nproc)"
 X3_BIN="$SCRIPT_DIR/spirit-x3/build/spirit_x3_bench"
 X3_AST_BIN="$SCRIPT_DIR/spirit-x3/build/spirit_x3_ast_bench"
 echo ""
@@ -61,29 +88,29 @@ echo ""
 echo "Building PackCC benchmark..."
 mkdir -p "$SCRIPT_DIR/packcc/build"
 cd "$SCRIPT_DIR/packcc/build"
-cmake .. -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-make -j"$(nproc)" > /dev/null 2>&1
+configure -DCMAKE_BUILD_TYPE=Release
+quiet make -j"$(nproc)"
 PACKCC_BIN="$SCRIPT_DIR/packcc/build/packcc_bench"
 echo ""
 
 # Build pest benchmark
 echo "Building pest benchmark..."
 cd "$SCRIPT_DIR/pest"
-cargo build --release > /dev/null 2>&1
+quiet cargo build --release
 PEST_BIN="$SCRIPT_DIR/pest/target/release/pest_bench"
 echo ""
 
 # Build rust-peg tree-building benchmark
 echo "Building rust-peg (tree) benchmark..."
 cd "$SCRIPT_DIR/rust-peg-tree"
-cargo build --release > /dev/null 2>&1
+quiet cargo build --release
 RUSTPEG_TREE_BIN="$SCRIPT_DIR/rust-peg-tree/target/release/rustpeg_tree_bench"
 echo ""
 
 # Build rust-peg benchmark
 echo "Building rust-peg benchmark..."
 cd "$SCRIPT_DIR/rust-peg"
-cargo build --release > /dev/null 2>&1
+quiet cargo build --release
 RUSTPEG_BIN="$SCRIPT_DIR/rust-peg/target/release/rustpeg_bench"
 echo ""
 

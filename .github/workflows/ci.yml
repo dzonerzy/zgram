@@ -41,7 +41,7 @@ jobs:
                   restore-keys: zig-${{ runner.os }}-
 
             - name: Install PyOZ
-              run: python -m pip install "pyoz>=0.13.3"
+              run: python -m pip install "pyoz>=0.13.7"
 
             - name: Build wheel
               run: pyoz build --release

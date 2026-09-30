@@ -29,27 +29,124 @@ class TestCompileCache:
                 zgram.compile("a = b\n")
 
 
+def run_async(coro, seconds=30):
+    """asyncio.run with a time limit: an awaitable that never resolves fails
+    the test instead of hanging the run (pytest can't interrupt native waits)."""
+
+    async def limited():
+        return await asyncio.wait_for(coro, seconds)
+
+    return asyncio.run(limited())
+
+
 class TestCompileAsync:
     def test_compile_async(self):
         async def main():
             p = await zgram.compile_async("greeting = 'hi ' name\nname = [a-z]+\n")
             return p.parse("hi bob").to_tuple()
 
-        assert asyncio.run(main()) == ("greeting", "hi bob", (("name", "bob", ()),))
+        assert run_async(main()) == ("greeting", "hi bob", (("name", "bob", ()),))
 
     def test_compile_async_concurrent(self):
         async def main():
             ps = await asyncio.gather(*(zgram.compile_async(f"r{i} = 'x'+ '{i}'\n") for i in range(4)))
             return [p.parse(f"xx{i}").text() for i, p in enumerate(ps)]
 
-        assert asyncio.run(main()) == ["xx0", "xx1", "xx2", "xx3"]
+        assert run_async(main()) == ["xx0", "xx1", "xx2", "xx3"]
 
     def test_compile_async_error(self):
         async def main():
             await zgram.compile_async("a = (\n")
 
         with pytest.raises(ValueError):
-            asyncio.run(main())
+            run_async(main())
+
+    AST_GRAMMAR = "word = [a-z]+ -> Word\n"
+
+    def test_compile_async_ast(self):
+        async def main():
+            p = await zgram.compile_async(self.AST_GRAMMAR, ast={"Word": str.upper})
+            return p.parse_ast("abc")
+
+        assert run_async(main()) == "ABC"
+
+    def test_compile_async_ast_positional_and_module(self):
+        from types import SimpleNamespace
+
+        async def main():
+            p = await zgram.compile_async(self.AST_GRAMMAR, SimpleNamespace(Word=str.title))
+            return p.parse_ast("abc")
+
+        assert run_async(main()) == "Abc"
+
+    def test_compile_async_without_ast(self):
+        async def main():
+            unbound = await zgram.compile_async(self.AST_GRAMMAR)
+            none = await zgram.compile_async(self.AST_GRAMMAR, ast=None)
+            return unbound, none
+
+        unbound, none = run_async(main())
+        for p in (unbound, none):
+            assert p.parse("abc").text() == "abc"
+            with pytest.raises(ValueError, match="-> Word"):
+                p.parse_ast("abc")
+        unbound.bind({"Word": str.upper})
+        assert unbound.parse_ast("abc") == "ABC"
+
+    def test_compile_async_missing_class(self):
+        async def main():
+            await zgram.compile_async(self.AST_GRAMMAR, ast={})
+
+        with pytest.raises(ValueError, match="ast has no 'Word'"):
+            run_async(main())
+
+    def test_compile_async_grammar_error_with_ast(self):
+        async def main():
+            await zgram.compile_async("a = (\n", ast={"Word": str})
+
+        with pytest.raises(ValueError):
+            run_async(main())
+
+    def test_compile_async_ast_references(self):
+        import sys
+
+        cls = type("Word", (), {"__init__": lambda self, text: None})
+        ast = {"Word": cls}
+
+        async def main(ok):
+            try:
+                p = await zgram.compile_async(self.AST_GRAMMAR if ok else "w = [a-z]+ -> Word\nx = 'a' -> Missing", ast=ast)
+                p.parse_ast("abc")
+            except ValueError:
+                pass
+
+        before = (sys.getrefcount(cls), sys.getrefcount(ast))
+        for ok in (True, False) * 20:
+            run_async(main(ok))
+        assert (sys.getrefcount(cls), sys.getrefcount(ast)) == before
+
+    def test_compile_async_cancelled(self):
+        async def main():
+            # A grammar not seen before, so the compile really runs
+            task = asyncio.ensure_future(zgram.compile_async("c = 'cancel-me-1' [a-z]+ -> Word\n", ast={"Word": str}))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # The event loop and later compiles are unaffected
+            p = await zgram.compile_async(self.AST_GRAMMAR, ast={"Word": str.upper})
+            return p.parse_ast("ok")
+
+        assert run_async(main()) == "OK"
+
+    def test_compile_async_concurrent_with_ast(self):
+        async def main():
+            ps = await asyncio.gather(
+                *(zgram.compile_async(f"w{i} = [a-z]+ '{i}' -> Word\n", ast={"Word": (lambda i: lambda t: (i, t))(i)}) for i in range(6))
+            )
+            return [p.parse_ast(f"ab{i}") for i, p in enumerate(ps)]
+
+        assert run_async(main()) == [(i, f"ab{i}") for i in range(6)]
 
 
 class TestStartRuleAndMatch:
@@ -215,7 +312,7 @@ class TestMatches:
     def test_error_after_rejection(self, json_parser):
         assert json_parser.matches('{"a": }') is False
         err = json_parser.error
-        assert (err.line(), err.column(), err.message()) == (1, 7, "expected object")
+        assert (err.line(), err.column(), err.message()) == (1, 7, "expected object, array, string, number, 'true', 'false' or 'null'")
         assert json_parser.matches("[1]") is True
         assert json_parser.error is None
 
