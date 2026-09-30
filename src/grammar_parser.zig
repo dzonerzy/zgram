@@ -87,6 +87,10 @@ pub const Rule = struct {
     /// @left / @right / @postfix annotation. With no repetition matched the
     /// rule produces no node of its own: its operand stands in for it.
     fold: Fold = .none,
+    /// @recover(expr): when error recovery skips a broken occurrence of this
+    /// rule in a repetition, it resumes right after the next match of `expr`
+    /// (a `;`, say) instead of wherever the rule can start again
+    recover: ?*Expr = null,
 };
 
 pub const Grammar = struct {
@@ -99,6 +103,7 @@ pub const Grammar = struct {
         allocator.free(self.fields);
         for (self.rules) |rule| {
             freeExpr(allocator, rule.expr);
+            if (rule.recover) |r| freeExpr(allocator, r);
             if (rule.action) |a| allocator.free(a);
             if (rule.display) |d| allocator.free(d);
             allocator.free(rule.name);
@@ -214,13 +219,15 @@ const GrammarParserImpl = struct {
             return error.EmptyGrammar;
         }
 
-        if (rules_list.items.len > abi.MAX_RULES) {
+        // One rule id stays free: the one error nodes get (recovery)
+        if (rules_list.items.len >= abi.MAX_RULES) {
             return error.TooManyRules;
         }
 
         // Validate references
         for (rules_list.items) |rule| {
             try self.validateRefs(rule.expr, rules_list.items);
+            if (rule.recover) |r| try self.validateRefs(r, rules_list.items);
         }
 
         // Detect left recursion (rule can reach itself without consuming input)
@@ -274,10 +281,12 @@ const GrammarParserImpl = struct {
             return self.parseRule();
         }
 
-        // Annotations: @silent, @memo, @left / @right / @postfix (any order)
+        // Annotations: @silent, @memo, @left / @right / @postfix, @recover(expr) (any order)
         var is_silent = false;
         var is_memo = false;
         var fold: Fold = .none;
+        var recover: ?*Expr = null;
+        errdefer if (recover) |r| freeExpr(self.allocator, r);
         while (self.peek() == '@') {
             self.advance(); // skip '@'
             const annotation = self.parseIdentifier() orelse return error.UnknownAnnotation;
@@ -285,6 +294,11 @@ const GrammarParserImpl = struct {
                 is_silent = true;
             } else if (std.mem.eql(u8, annotation, "memo")) {
                 is_memo = true;
+            } else if (std.mem.eql(u8, annotation, "recover")) {
+                if (recover != null or !self.match('(')) return error.UnknownAnnotation;
+                recover = try self.parseExpression();
+                self.skipWs();
+                if (!self.match(')')) return error.ExpectedCloseParen;
             } else if (std.meta.stringToEnum(Fold, annotation)) |f| {
                 if (f == .none or fold != .none) return error.UnknownAnnotation;
                 fold = f;
@@ -349,6 +363,7 @@ const GrammarParserImpl = struct {
             .fold = fold,
             .display = display,
             .action_no_args = no_args,
+            .recover = recover,
         };
         return rule;
     }

@@ -30,6 +30,12 @@ pub const Mode = enum {
     /// (callers re-run the tree parser to explain a rejection). Rules that
     /// aren't part of a recursion cycle are inlined into their callers.
     validate,
+    /// Build the tree like `tree`, and recover from syntax errors: a
+    /// repetition whose element runs into a known error (ParseOutput
+    /// .known_errors) skips the broken text into an error node and goes on.
+    /// Where to resume is found with validator copies of the rules, compiled
+    /// into the same module.
+    recover,
 };
 
 /// Result of code generation — pass both to jit_compiler.jitCompile().
@@ -91,6 +97,23 @@ const Codegen = struct {
     alloc_flags: []const bool,
 
     mode: Mode,
+
+    /// A validator that still tracks the furthest failure: recovery's
+    /// probes, which learn from it how far an element got before failing
+    probe_hwm: bool = false,
+    /// Recover mode: the validator copies of the rules, and the flags that
+    /// go with them (every rule silent, none allocating), for emitProbe()
+    vrule_fns: []LB.Value = &.{},
+    probe_silent: []const bool = &.{},
+    probe_alloc: []const bool = &.{},
+    helper_recover_error: LB.Value = null,
+    helper_recover_error_type: LB.Type = null,
+    helper_recover_begin: LB.Value = null,
+    helper_recover_begin_type: LB.Type = null,
+    helper_recover_step: LB.Value = null,
+    helper_recover_step_type: LB.Type = null,
+    helper_error_node: LB.Value = null,
+    helper_error_node_type: LB.Type = null,
 };
 
 /// Generate an LLVM module from a parsed grammar.
@@ -200,7 +223,53 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
         }
     }
 
-    // Generate each rule function body
+    // Recover mode: validator copies of the rules, for recovery's probes
+    // ("could the repetition's element start here?"). No memo wrappers: the
+    // memo table is the tree parser's, and a validator's entries have no nodes.
+    const vrule_fns = allocator.alloc(LB.Value, if (mode == .recover) grammar.rules.len else 0) catch return CodegenError.OutOfMemory;
+    defer allocator.free(vrule_fns);
+    const probe_silent = allocator.alloc(bool, vrule_fns.len) catch return CodegenError.OutOfMemory;
+    defer allocator.free(probe_silent);
+    @memset(probe_silent, true);
+    const probe_alloc = allocator.alloc(bool, vrule_fns.len) catch return CodegenError.OutOfMemory;
+    defer allocator.free(probe_alloc);
+    @memset(probe_alloc, false);
+    for (vrule_fns, 0..) |*f, i| {
+        const name = std.fmt.allocPrintSentinel(allocator, "vrule_{d}", .{i}, 0) catch return CodegenError.OutOfMemory;
+        defer allocator.free(name);
+        f.* = b.addFunction(name, rule_fn_type);
+        b.setLinkageInternal(f.*);
+        b.addFnAttr(f.*, "nounwind");
+        b.addParamAttr(f.*, 0, "noalias");
+        b.addParamAttr(f.*, 0, "readonly");
+        b.addParamAttr(f.*, 2, "noalias");
+        if (!breakers[i]) b.addFnAttr(f.*, "alwaysinline");
+    }
+
+    // Recovery helpers (jit_helpers.zig)
+    // i64 zgram_recover_error(ptr output, i64 start, i64 reach)
+    const helper_recover_error_type = b.fnType(b.i64, &.{ b.ptr, b.i64, b.i64 });
+    // void zgram_recover_begin(ptr output, ptr input, i64 start, i64 err)
+    const helper_recover_begin_type = b.fnType(b.void, &.{ b.ptr, b.ptr, b.i64, b.i64 });
+    // i64 zgram_recover_step(ptr output, ptr input, i64 len)
+    const helper_recover_step_type = b.fnType(b.i64, &.{ b.ptr, b.ptr, b.i64 });
+    // i32 zgram_error_node(ptr output, i64 start, i64 end, i32 rule)
+    const helper_error_node_type = b.fnType(b.i32, &.{ b.ptr, b.i64, b.i64, b.i32 });
+    var helper_recover_error: LB.Value = null;
+    var helper_recover_begin: LB.Value = null;
+    var helper_recover_step: LB.Value = null;
+    var helper_error_node: LB.Value = null;
+    if (mode == .recover) {
+        helper_recover_error = b.addFunction("zgram_recover_error", helper_recover_error_type);
+        helper_recover_begin = b.addFunction("zgram_recover_begin", helper_recover_begin_type);
+        helper_recover_step = b.addFunction("zgram_recover_step", helper_recover_step_type);
+        helper_error_node = b.addFunction("zgram_error_node", helper_error_node_type);
+        for ([_]LB.Value{ helper_recover_error, helper_recover_begin, helper_recover_step, helper_error_node }) |h| b.addFnAttr(h, "nounwind");
+    }
+
+    // Generate each rule function body (and in recover mode, each validator copy)
+    for (0..if (mode == .recover) 2 else 1) |pass| {
+    const probe = pass == 1;
     for (grammar.rules, 0..) |rule, i| {
         var cg = Codegen{
             .b = &b,
@@ -224,13 +293,29 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
             .helper_set_error_at_hwm_type = helper_set_error_at_hwm_type,
             .helper_ensure_capacity_type = helper_ensure_capacity_type,
             .grammar = grammar,
-            .silent_flags = silent_flags,
+            .silent_flags = if (probe) probe_silent else silent_flags,
             .child_count_ptr = undefined,
             .simd_width = simd_width,
-            .alloc_flags = alloc_flags,
-            .mode = mode,
+            .alloc_flags = if (probe) probe_alloc else alloc_flags,
+            .mode = if (probe) .validate else mode,
+            .vrule_fns = vrule_fns,
+            .probe_silent = probe_silent,
+            .probe_alloc = probe_alloc,
+            .helper_recover_error = helper_recover_error,
+            .helper_recover_error_type = helper_recover_error_type,
+            .helper_recover_begin = helper_recover_begin,
+            .helper_recover_begin_type = helper_recover_begin_type,
+            .helper_recover_step = helper_recover_step,
+            .helper_recover_step_type = helper_recover_step_type,
+            .helper_error_node = helper_error_node,
+            .helper_error_node_type = helper_error_node_type,
         };
-        try emitRuleFunction(&cg, rule, @intCast(i), body_fns[i], breakers[i]);
+        if (probe) {
+            cg.rule_fns = vrule_fns;
+            cg.probe_hwm = true;
+        }
+        try emitRuleFunction(&cg, rule, @intCast(i), if (probe) vrule_fns[i] else body_fns[i], breakers[i]);
+    }
     }
 
     // Wrappers for @memo rules
@@ -296,6 +381,8 @@ fn emitRuleFunction(cg: *Codegen, rule: *const gp.Rule, rule_id: u16, func: LB.V
         const result_pos = try emitExpr(cg, rule.expr, pos_arg, fail_block);
         _ = b.ret(result_pos);
         b.positionAtEnd(fail_block);
+        // A recovery probe notes how far it got (see emitRecovery)
+        if (cg.probe_hwm) try emitHwmUpdate(cg, pos_arg, rule_id);
         _ = b.ret(b.constSInt(b.i64, -1));
     } else if (rule.fold != .none) {
         // Folded rule: reserves no node. Its nodes pile up from `first`, the
@@ -747,7 +834,7 @@ fn emitReference(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
     if (!found) return CodegenError.InvalidGrammar;
 
     // A labelled reference tags the nodes the call adds, which start here
-    const field_id = if (cg.mode == .tree and cg.alloc_flags[rule_idx]) expr.field_id else 0;
+    const field_id = if (cg.mode != .validate and cg.alloc_flags[rule_idx]) expr.field_id else 0;
     const nc_ptr = if (field_id != 0) b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "lbl_nc_ptr") else undefined;
     const first_node = if (field_id != 0) b.load(b.i32, nc_ptr, 4, "lbl_first") else undefined;
 
@@ -811,10 +898,57 @@ fn emitReference(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
 fn emitSequence(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
     const children = expr.children orelse return CodegenError.InvalidGrammar;
     var cur_pos = pos;
-    for (children) |child| {
-        cur_pos = try emitExpr(cg, child, cur_pos, fail_block);
+    for (children, 0..) |child, i| {
+        // Recover mode: a literal after the start of a sequence (a closing
+        // `}`, a `;`, an `=`) that's missing exactly at a known error is
+        // taken as there, zero-width, so what surrounds it keeps its
+        // structure. The first item decides whether the sequence applies at
+        // all, so it is never made up.
+        if (cg.mode == .recover and i > 0 and child.tag == .literal) {
+            cur_pos = try emitInsertableLiteral(cg, child, cur_pos, fail_block);
+        } else {
+            cur_pos = try emitExpr(cg, child, cur_pos, fail_block);
+        }
     }
     return cur_pos;
+}
+
+/// A literal that recovery may insert: see emitSequence.
+fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
+    const b = cg.b;
+    const missing = try b.newBlock("ins_missing");
+    const inserted = try b.newBlock("ins_inserted");
+    const merge = try b.newBlock("ins_merge");
+    const end = try emitLiteral(cg, expr, pos, missing);
+    const matched = b.getCurrentBlock();
+    _ = b.br(merge);
+
+    // Missing: note how far such misses go (the caller learns precise error
+    // positions from it); and is a known error right here?
+    b.positionAtEnd(missing);
+    const lit_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_LIT_POS)}, "ins_lit_ptr");
+    const lit_cur = b.load(b.i32, lit_ptr, 4, "ins_lit_cur");
+    const pos32 = b.trunc(pos, b.i32, "ins_pos32");
+    const further = b.icmp(.ugt, pos32, lit_cur, "ins_further");
+    _ = b.store(b.select(further, pos32, lit_cur, "ins_lit_new"), lit_ptr, 4);
+    // and which literal it was, for the message
+    const text = expr.literal_value orelse "";
+    const len_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_LIT_LEN)}, "ins_len_ptr");
+    const text_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_LIT_TEXT)}, "ins_text_ptr");
+    const len_cur = b.load(b.i32, len_ptr, 4, "ins_len_cur");
+    const text_cur = b.load(b.ptr, text_ptr, 8, "ins_text_cur");
+    _ = b.store(b.select(further, b.constInt(b.i32, @intCast(text.len)), len_cur, "ins_len_new"), len_ptr, 4);
+    _ = b.store(b.select(further, b.addGlobalString("ins_lit", text), text_cur, "ins_text_new"), text_ptr, 8);
+    const err = b.call(cg.helper_recover_error_type, cg.helper_recover_error, &.{ cg.output_ptr, pos, pos }, "ins_err");
+    _ = b.condBr(b.icmp(.sge, err, b.constSInt(b.i64, 0), "ins_known"), inserted, fail_block);
+
+    b.positionAtEnd(inserted);
+    _ = b.br(merge);
+
+    b.positionAtEnd(merge);
+    const result = b.phi(b.i64, "ins_pos");
+    b.addIncoming(result, &.{ end, pos }, &.{ matched, inserted });
+    return result;
 }
 
 /// Check if an expression can allocate nodes when evaluated.
@@ -1347,7 +1481,7 @@ fn resolveSilent(cg: *const Codegen, expr: *const gp.Expr, chain: *[8]u16, chain
 /// Record a failure of `rule_id` at `pos` in the high-water mark, exactly as
 /// the rule's own fail block would.
 fn emitHwmUpdate(cg: *Codegen, pos: LB.Value, rule_id: u16) CodegenError!void {
-    if (cg.mode == .validate) return;
+    if (cg.mode == .validate and !cg.probe_hwm) return;
     const b = cg.b;
     const hwm_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_MAX_POS)}, "hwm_ptr");
     const cur = b.load(b.i32, hwm_ptr, 4, "cur_hwm");
@@ -1612,15 +1746,17 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         if (canSimdScan(resolved)) {
             return emitSimdCharScan(cg, resolved, pos, fail_block, kind, chain[0..chain_len]);
         }
-        // Inlining the silent rule would drop the label on the reference to it
+        // Inlining the silent rule would drop the label on the reference to
+        // it; and the vector loop doesn't recover from errors
         const labelled = sub.tag == .reference and sub.field_id != 0;
-        if (kind == '*' and resolved.tag == .alternative and !labelled) {
+        if (kind == '*' and resolved.tag == .alternative and !labelled and !recovers(cg, sub)) {
             if (try emitSimdAltLoop(cg, resolved, pos, chain[0..chain_len])) |end| return end;
         }
     }
 
     const needs_nc_save = exprAllocatesNodes(cg, sub);
     const always_consumes = exprAlwaysConsumes(sub);
+    const rec = kind != '?' and recovers(cg, sub);
 
     if (kind == '?') {
         // Optional: try once, succeed either way
@@ -1692,7 +1828,9 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
             saved_nc = b.load(b.i32, nc_ptr, 4, "rep_saved");
             saved_cc = saveChildCount(cg);
         }
+        const hwm_saved = if (rec) hwmRestart(cg, pos_phi) else undefined;
         const body_result = try emitExpr(cg, sub, pos_phi, loop_fail);
+        if (rec) _ = hwmMerge(cg, hwm_saved);
         const body_end_block = b.getCurrentBlock();
         if (always_consumes) {
             // Sub-expr always consumes >=1 byte, no need for zero-length check
@@ -1702,22 +1840,23 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
             _ = b.condBr(no_progress, loop_exit, loop_header);
         }
 
-        // Loop fail: restore node_count if needed, exit loop
+        // Loop fail: restore node_count if needed, exit loop (or recover)
         b.positionAtEnd(loop_fail);
         if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
-        _ = b.br(loop_exit);
+        const fail_exit = try endIteration(cg, rec, sub, pos_phi, hwm_saved, loop_header, loop_exit);
 
         // Finish phi: incoming from entry (first result) and from body (next result)
         b.addIncoming(pos_phi, &.{ first_result, body_result }, &.{ first_block, body_end_block });
+        if (fail_exit.recovered) |r| b.addIncoming(pos_phi, &.{r[0]}, &.{r[1]});
 
         // Exit
         b.positionAtEnd(loop_exit);
         if (always_consumes) {
-            // Only one incoming edge: loop_fail
+            // Only one incoming edge: the failed iteration
             return pos_phi;
         } else {
             const exit_phi = b.phi(b.i64, "rep_exit_pos");
-            b.addIncoming(exit_phi, &.{ pos_phi, pos_phi, first_result }, &.{ loop_fail, body_end_block, first_block });
+            b.addIncoming(exit_phi, &.{ pos_phi, pos_phi, first_result }, &.{ fail_exit.block, body_end_block, first_block });
             return exit_phi;
         }
     } else {
@@ -1738,7 +1877,9 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
             saved_nc = b.load(b.i32, nc_ptr, 4, "rep_saved");
             saved_cc = saveChildCount(cg);
         }
+        const hwm_saved = if (rec) hwmRestart(cg, pos_phi) else undefined;
         const body_result = try emitExpr(cg, sub, pos_phi, loop_fail);
+        if (rec) _ = hwmMerge(cg, hwm_saved);
         const body_end_block = b.getCurrentBlock();
         if (always_consumes) {
             _ = b.br(loop_header);
@@ -1747,13 +1888,14 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
             _ = b.condBr(no_progress, loop_exit, loop_header);
         }
 
-        // Loop fail: restore nc if needed, exit
+        // Loop fail: restore nc if needed, exit (or recover)
         b.positionAtEnd(loop_fail);
         if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
-        _ = b.br(loop_exit);
+        const fail_exit = try endIteration(cg, rec, sub, pos_phi, hwm_saved, loop_header, loop_exit);
 
         // Finish phi
         b.addIncoming(pos_phi, &.{ pos, body_result }, &.{ entry_block, body_end_block });
+        if (fail_exit.recovered) |r| b.addIncoming(pos_phi, &.{r[0]}, &.{r[1]});
 
         // Exit
         b.positionAtEnd(loop_exit);
@@ -1761,10 +1903,242 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
             return pos_phi;
         } else {
             const exit_phi = b.phi(b.i64, "rep_exit_pos");
-            b.addIncoming(exit_phi, &.{ pos_phi, pos_phi }, &.{ loop_fail, body_end_block });
+            b.addIncoming(exit_phi, &.{ pos_phi, pos_phi }, &.{ fail_exit.block, body_end_block });
             return exit_phi;
         }
     }
+}
+
+// ── Error recovery (recover mode) ──
+
+const IterationEnd = struct {
+    /// The block the loop exit is reached from when an iteration fails
+    block: LB.Block,
+    /// With recovery: the position to go on at, and the block that goes on
+    recovered: ?struct { LB.Value, LB.Block } = null,
+};
+
+/// The end of a repetition's failed iteration (the current block, after the
+/// node count is restored): exit the loop, or with `rec` try recovering first.
+/// Every way out of the loop through here leaves from one block, so the
+/// exit's phi keeps a single incoming edge for it.
+fn endIteration(cg: *Codegen, rec: bool, sub: *const gp.Expr, start: LB.Value, hwm_saved: HwmSave, loop_header: LB.Block, loop_exit: LB.Block) CodegenError!IterationEnd {
+    const b = cg.b;
+    if (!rec) {
+        const here = b.getCurrentBlock();
+        _ = b.br(loop_exit);
+        return .{ .block = here };
+    }
+    const rec_exit = try b.newBlock("rec_exit");
+    const recovered = try emitRecovery(cg, sub, start, hwmMerge(cg, hwm_saved), rec_exit);
+    _ = b.br(loop_header);
+    b.positionAtEnd(rec_exit);
+    _ = b.br(loop_exit);
+    return .{ .block = rec_exit, .recovered = recovered };
+}
+
+/// Does this repetition recover from syntax errors? In recover mode, the
+/// repetitions of elements that make nodes do: lists of statements, of
+/// items, of arguments. Not whitespace or the characters of a token.
+fn recovers(cg: *const Codegen, sub: *const gp.Expr) bool {
+    return cg.mode == .recover and exprAllocatesNodes(cg, sub);
+}
+
+const HwmSave = struct { pos: LB.Value, rule: LB.Value };
+
+fn hwmPointers(cg: *Codegen) [2]LB.Value {
+    const b = cg.b;
+    return .{
+        b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_MAX_POS)}, "rec_hwm_ptr"),
+        b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_MAX_POS_RULE_ID)}, "rec_hwm_rule_ptr"),
+    };
+}
+
+/// Before an element's attempt: save the furthest-failure mark and restart
+/// it at the element's start, to learn how far this attempt gets.
+fn hwmRestart(cg: *Codegen, pos: LB.Value) HwmSave {
+    const b = cg.b;
+    const ptrs = hwmPointers(cg);
+    const saved = HwmSave{ .pos = b.load(b.i32, ptrs[0], 4, "rec_saved_hwm"), .rule = b.load(b.i16, ptrs[1], 2, "rec_saved_rule") };
+    _ = b.store(b.trunc(pos, b.i32, "rec_start32"), ptrs[0], 4);
+    return saved;
+}
+
+/// After the attempt: how far it got. The mark becomes the further of that
+/// and the saved one again.
+fn hwmMerge(cg: *Codegen, saved: HwmSave) LB.Value {
+    const b = cg.b;
+    const ptrs = hwmPointers(cg);
+    const reach = b.load(b.i32, ptrs[0], 4, "rec_reach");
+    const rule = b.load(b.i16, ptrs[1], 2, "rec_reach_rule");
+    const keep = b.icmp(.ult, reach, saved.pos, "rec_keep_saved");
+    _ = b.store(b.select(keep, saved.pos, reach, "rec_hwm"), ptrs[0], 4);
+    _ = b.store(b.select(keep, saved.rule, rule, "rec_rule"), ptrs[1], 2);
+    return b.zext(reach, b.i64, "rec_reach64");
+}
+
+/// After a probe: how far it got. The mark is the saved one again: where
+/// recovery looked for a place to resume isn't a failure of the parse (a
+/// broken element it resumes at fails again when the loop tries it).
+fn hwmRestore(cg: *Codegen, saved: HwmSave) LB.Value {
+    const b = cg.b;
+    const ptrs = hwmPointers(cg);
+    const reach = b.load(b.i32, ptrs[0], 4, "rec_probe_reach");
+    _ = b.store(saved.pos, ptrs[0], 4);
+    _ = b.store(saved.rule, ptrs[1], 2);
+    return b.zext(reach, b.i64, "rec_probe_reach64");
+}
+
+/// `expr` as a validator would match it: no nodes, no child counts, the
+/// validator copies of the rules. For recovery's "could this start here?".
+fn emitProbe(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
+    const saved = cg.*;
+    defer cg.* = saved;
+    cg.mode = .validate;
+    cg.probe_hwm = true;
+    cg.rule_fns = cg.vrule_fns;
+    cg.silent_flags = cg.probe_silent;
+    cg.alloc_flags = cg.probe_alloc;
+    cg.child_count_ptr = null;
+    cg.fold_rep = null;
+    return emitExpr(cg, expr, pos, fail_block);
+}
+
+/// The rule a repetition's element is (or begins with), if any.
+fn elementRule(cg: *const Codegen, sub: *const gp.Expr) ?usize {
+    var e = sub;
+    if (e.tag == .sequence) e = (e.children orelse return null)[0];
+    if (e.tag != .reference) return null;
+    return ruleIndex(cg, e.ref_name orelse return null);
+}
+
+/// The @recover(sync) of that rule.
+fn syncOf(cg: *const Codegen, sub: *const gp.Expr) ?*const gp.Expr {
+    return cg.grammar.rules[elementRule(cg, sub) orelse return null].recover;
+}
+
+/// In a repetition's failure block, after its node count is restored: the
+/// element's attempt at `start` got as far as `reach`. If a known error lies
+/// in between, skip the broken text into an error node and go on with the
+/// loop; otherwise leave the loop as usual. Returns the position and block to
+/// add to the loop header's phi.
+///
+/// Where the loop goes on: from the error, at the first place outside the
+/// brackets the broken text opened where the element matches, or starts
+/// matching and gets somewhere before failing (another broken element: the
+/// next round of recovery, knowing that error too, skips it on its own
+/// rather than swallowing it here). With a @recover(sync) on the element's
+/// rule, the broken element ends after the first match of `sync` instead,
+/// and the look for the element goes on from there. It stops at a closing
+/// bracket the broken text didn't open, or at the end of the input.
+fn emitRecovery(cg: *Codegen, sub: *const gp.Expr, start: LB.Value, reach: LB.Value, loop_exit: LB.Block) CodegenError!struct { LB.Value, LB.Block } {
+    const b = cg.b;
+    const err = b.call(cg.helper_recover_error_type, cg.helper_recover_error, &.{ cg.output_ptr, start, reach }, "rec_err");
+    const begin_block = try b.newBlock("rec_begin");
+    _ = b.condBr(b.icmp(.sge, err, b.constSInt(b.i64, 0), "rec_found"), begin_block, loop_exit);
+
+    b.positionAtEnd(begin_block);
+    _ = b.call(cg.helper_recover_begin_type, cg.helper_recover_begin, &.{ cg.output_ptr, cg.input_ptr, start, err }, "");
+    const make_block = try b.newBlock("rec_make");
+    var resume_vals: [3]LB.Value = undefined;
+    var resume_blocks: [3]LB.Block = undefined;
+    var n_resume: usize = 0;
+
+    // With a sync point: skip to just after it (or stop)
+    const elem_scan = try b.newBlock("rec_scan");
+    if (syncOf(cg, sub)) |sync| {
+        const sync_scan = try b.newBlock("rec_sync_scan");
+        _ = b.br(sync_scan);
+        b.positionAtEnd(sync_scan);
+        const cand = b.call(cg.helper_recover_step_type, cg.helper_recover_step, &.{ cg.output_ptr, cg.input_ptr, cg.input_len }, "rec_sync_cand");
+        const sync_stop = try b.newBlock("rec_sync_stop");
+        const sync_probe = try b.newBlock("rec_sync_probe");
+        _ = b.condBr(b.icmp(.slt, cand, b.constSInt(b.i64, 0), "rec_sync_is_stop"), sync_stop, sync_probe);
+
+        b.positionAtEnd(sync_stop);
+        resume_vals[n_resume] = b.sub(b.constSInt(b.i64, -1), cand, "rec_sync_stop_pos");
+        resume_blocks[n_resume] = sync_stop;
+        n_resume += 1;
+        _ = b.br(make_block);
+
+        b.positionAtEnd(sync_probe);
+        const sync_fail = try b.newBlock("rec_sync_fail");
+        const sync_saved = hwmRestart(cg, cand);
+        const sync_end = try emitProbe(cg, sync, cand, sync_fail);
+        _ = hwmRestore(cg, sync_saved);
+        // After the sync point, look for the element from there
+        _ = b.call(cg.helper_recover_begin_type, cg.helper_recover_begin, &.{ cg.output_ptr, cg.input_ptr, sync_end, sync_end }, "");
+        _ = b.br(elem_scan);
+
+        b.positionAtEnd(sync_fail);
+        _ = hwmRestore(cg, sync_saved);
+        _ = b.br(sync_scan);
+    } else _ = b.br(elem_scan);
+
+    // The next candidate place to resume, or where to stop
+    b.positionAtEnd(elem_scan);
+    const cand = b.call(cg.helper_recover_step_type, cg.helper_recover_step, &.{ cg.output_ptr, cg.input_ptr, cg.input_len }, "rec_cand");
+    const stop_block = try b.newBlock("rec_stop");
+    const probe_block = try b.newBlock("rec_probe");
+    _ = b.condBr(b.icmp(.slt, cand, b.constSInt(b.i64, 0), "rec_is_stop"), stop_block, probe_block);
+
+    b.positionAtEnd(stop_block);
+    resume_vals[n_resume] = b.sub(b.constSInt(b.i64, -1), cand, "rec_stop_pos");
+    resume_blocks[n_resume] = stop_block;
+    n_resume += 1;
+    _ = b.br(make_block);
+
+    // Does the element match here, or start to? (how far a failed attempt
+    // got is the furthest-failure mark, restarted for it)
+    b.positionAtEnd(probe_block);
+    const probe_fail = try b.newBlock("rec_probe_fail");
+    const hwm_saved = hwmRestart(cg, cand);
+    _ = try emitProbe(cg, sub, cand, probe_fail);
+    _ = hwmRestore(cg, hwm_saved);
+    resume_vals[n_resume] = cand;
+    resume_blocks[n_resume] = b.getCurrentBlock();
+    n_resume += 1;
+    _ = b.br(make_block);
+
+    b.positionAtEnd(probe_fail);
+    const probe_reach = hwmRestore(cg, hwm_saved);
+    const started = b.@"and"(
+        b.icmp(.ugt, probe_reach, cand, "rec_started"),
+        b.icmp(.ugt, cand, start, "rec_after_start"),
+        "rec_resume_at_start",
+    );
+    // A broken element starting here: resume here too (the loop stops at it,
+    // and the next round, knowing its error, skips it)
+    const started_block = try b.newBlock("rec_started_here");
+    _ = b.condBr(started, started_block, elem_scan);
+    b.positionAtEnd(started_block);
+    _ = b.br(make_block);
+    // (the same position as a match: add it to the phi below)
+    const started_val = cand;
+
+    b.positionAtEnd(make_block);
+    const resume_pos = b.phi(b.i64, "rec_resume");
+    b.addIncoming(resume_pos, resume_vals[0..n_resume], resume_blocks[0..n_resume]);
+    b.addIncoming(resume_pos, &.{started_val}, &.{started_block});
+    // No progress: the loop ends here, with no error node (skipping nothing
+    // would loop forever)
+    const node_block = try b.newBlock("rec_node");
+    _ = b.condBr(b.icmp(.ugt, resume_pos, start, "rec_progressed"), node_block, loop_exit);
+
+    b.positionAtEnd(node_block);
+    const rule_id: u32 = if (elementRule(cg, sub)) |r| @intCast(r) else abi.NO_RULE;
+    const made = b.call(cg.helper_error_node_type, cg.helper_error_node, &.{ cg.output_ptr, start, resume_pos, b.constInt(b.i32, rule_id) }, "rec_node");
+    const count_block = try b.newBlock("rec_count");
+    // No memory for the node: the loop ends (the parse reports it)
+    _ = b.condBr(b.icmp(.ne, made, b.constInt(b.i32, 0), "rec_node_ok"), count_block, loop_exit);
+
+    // The error node is one more child of the rule the repetition is in
+    b.positionAtEnd(count_block);
+    if (cg.child_count_ptr != null) {
+        const cc = b.load(b.i32, cg.child_count_ptr, 4, "rec_cc");
+        _ = b.store(b.add(cc, b.constInt(b.i32, 1), "rec_cc1"), cg.child_count_ptr, 4);
+    }
+    return .{ resume_pos, count_block };
 }
 
 /// Emit not predicate: !expr — succeeds if expr fails, consumes nothing.

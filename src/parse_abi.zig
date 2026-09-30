@@ -137,7 +137,60 @@ pub const ParseOutput = extern struct {
     /// with ErrorKind.too_deep, and sets this to the highest address so that
     /// every rule entered afterwards fails too.
     stack_limit: usize = 0,
+
+    // Error recovery (the parser compiled in recover mode only)
+
+    /// Positions of the syntax errors known so far, sorted: a repetition
+    /// whose element fails after reaching one of them skips the broken text
+    /// into an error node and goes on. Set by the caller.
+    known_errors: ?[*]const u32 = null,
+    known_count: u32 = 0,
+    /// The rule id error nodes get: the grammar's rule count. Set by the caller.
+    error_rule: u32 = 0,
+    /// How freely to skip, raised by the caller each time a round finds
+    /// nothing new. 0: skip an element only if its attempt failed furthest
+    /// at a known error, and only up to where the element (or an outer
+    /// repetition's) goes on. RECOVER_TO_END: skipped text may also run to
+    /// the end of the input. RECOVER_LOOSE: also skip an element that
+    /// reached a known error but failed further on.
+    recover_level: u8 = 0,
+    /// Where recovery is looking for a place to resume (zgram_recover_step)
+    scan_pos: u64 = 0,
+    /// Brackets opened and not closed since the skipped text began
+    scan_depth: i64 = 0,
+    /// Where the look began, and whether it is the second look, which
+    /// ignores the brackets the skipped text opened (the first found no
+    /// place outside them: an unclosed `(` in the broken text)
+    scan_start: u64 = 0,
+    scan_ignoring_opens: bool = false,
+    /// The furthest place a literal that could be inserted was missing: a
+    /// more precise position for an error than the furthest failed rule
+    /// (where `=` was missing, rather than where the statement began)
+    lit_pos: u32 = 0,
+    /// The literal missing there (the first one missed at lit_pos), for the
+    /// error's message; in the compiled grammar's memory
+    lit_len: u32 = 0,
+    lit_text: ?[*]const u8 = null,
+    /// Each error node made, with the rule the skipped element begins with
+    /// (for its error message); a caller-provided buffer, filled while
+    /// there's room. Backtracking may drop nodes listed here.
+    recovered: ?[*]Recovered = null,
+    recovered_count: u32 = 0,
+    recovered_capacity: u32 = 0,
 };
+
+/// An error node's start, and the rule the broken element begins with
+/// (NO_RULE if it doesn't begin with one)
+pub const Recovered = extern struct {
+    start: u32,
+    rule: u32,
+};
+
+pub const NO_RULE: u32 = std.math.maxInt(u32);
+
+/// ParseOutput.recover_level values
+pub const RECOVER_TO_END: u8 = 1;
+pub const RECOVER_LOOSE: u8 = 2;
 
 /// Field offsets used by the code generator
 pub const OFF_NODES_PTR = @offsetOf(ParseOutput, "nodes_ptr");
@@ -147,6 +200,9 @@ pub const OFF_MAX_POS = @offsetOf(ParseOutput, "max_pos");
 pub const OFF_MAX_POS_RULE_ID = @offsetOf(ParseOutput, "max_pos_rule_id");
 pub const OFF_END_POS = @offsetOf(ParseOutput, "end_pos");
 pub const OFF_ERROR_KIND = @offsetOf(ParseOutput, "error_kind");
+pub const OFF_LIT_POS = @offsetOf(ParseOutput, "lit_pos");
+pub const OFF_LIT_LEN = @offsetOf(ParseOutput, "lit_len");
+pub const OFF_LIT_TEXT = @offsetOf(ParseOutput, "lit_text");
 pub const OFF_STACK_LIMIT = @offsetOf(ParseOutput, "stack_limit");
 
 // Compile-time ABI assertions

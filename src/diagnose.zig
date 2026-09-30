@@ -76,6 +76,15 @@ pub const Result = struct {
     }
 };
 
+/// "expected '}'": the message for one missing literal.
+pub fn expectedLiteral(literal: []const u8, buf: []u8) []const u8 {
+    var w = Writer{ .buf = buf };
+    w.put("expected '");
+    for (literal) |ch| w.putChar(ch, '\'');
+    w.put("'");
+    return w.buf[0..w.len];
+}
+
 const Writer = struct {
     buf: []u8,
     len: usize = 0,
@@ -323,12 +332,24 @@ fn nullable(grammar: *const gp.Grammar, index: *const std.StringHashMapUnmanaged
 /// failure. null if the input matches after all, nothing was
 /// recorded, or the run was abandoned (too deep, too slow, out of memory).
 pub fn diagnose(allocator: Allocator, grammar: *const gp.Grammar, input: []const u8, start_rule: usize) ?Result {
+    return run(allocator, grammar, input, start_rule, 0, true);
+}
+
+/// What `rule`, matched from `pos` (not the start of the input), expected
+/// at the furthest place it failed: for the message of an error that
+/// recovery met inside that rule. The rule may still match (a repetition in
+/// it stopping at the error); the caller checks the position is the error's.
+pub fn diagnoseAt(allocator: Allocator, grammar: *const gp.Grammar, input: []const u8, rule: usize, pos: usize) ?Result {
+    return run(allocator, grammar, input, rule, pos, false);
+}
+
+fn run(allocator: Allocator, grammar: *const gp.Grammar, input: []const u8, start_rule: usize, pos: usize, whole: bool) ?Result {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const n = grammar.rules.len;
-    if (start_rule >= n) return null;
+    if (start_rule >= n or pos > input.len) return null;
     var interp = Interp{
         .allocator = alloc,
         .grammar = grammar,
@@ -348,8 +369,10 @@ pub fn diagnose(allocator: Allocator, grammar: *const gp.Grammar, input: []const
         interp.token[i] = !r.silent and !gp.ruleHasChildren(grammar, r);
     }
 
-    const end = interp.rule(start_rule, 0) catch return null;
-    if (end != null and end.? == input.len) return null;
+    const end = interp.rule(start_rule, pos) catch return null;
+    // The whole input must be matched (a rule from the middle is diagnosed
+    // either way: see diagnoseAt)
+    if (whole and end != null and end.? == input.len) return null;
     if (interp.result.count == 0) return null;
     return interp.result;
 }

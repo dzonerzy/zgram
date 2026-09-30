@@ -5,6 +5,20 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-30
+
+### Added
+- **Error recovery:** `parse()`, `parse_tree()` and `parse_ast()` take `recover=True`. A syntax error then doesn't raise: the broken text becomes an error node (rule `"<error>"`, a leaf) and parsing goes on after it; `tree.errors` lists every error as a `Diagnostic`, in source order, with the message a plain parse gives it. It works on any grammar without changes. Repetitions of elements that make nodes (statements, items, arguments) skip a broken element to the next place, outside the brackets it opened, where an element matches; skipping stops at a closing bracket the broken text didn't open. A literal that isn't the first of its sequence is taken as present when it is missing right at an error (`let a 1;` keeps its statement with `expected '='`; an unclosed block at the end gets `expected '}'`). Up to 100 errors per parse. `parse_ast()` converts error nodes to `None`.
+- **`@recover(expr)`** on a rule: a broken element that begins with that rule is skipped through the first match of `expr` (`@recover(';') stmt = ...`).
+- **`Tree.errors`**: the syntax errors a recovered tree was parsed from (empty otherwise).
+
+### Changed
+- **A grammar can have up to 4095 rules** (was 4096): the last rule id is reserved for error nodes.
+- **`Diagnostic` repr** shows its strings as Python reprs, so quotes in messages (`"expected '='"`) are escaped.
+
+### Performance
+- Parsing without errors, with or without `recover=True`, is unchanged: the recovering parser only runs after a parse fails. It is compiled the first time that happens and cached with the grammar. A recovered parse costs about one more parse per error, each stopping at the next error (1 error in a 0.55 MB file: 2.5 ms against 1.4 ms for a valid one).
+
 ## [0.2.1] - 2026-09-30
 
 ### Fixed

@@ -157,8 +157,9 @@ rule_name = expression
 | `@left`, `@right`, `@postfix` | Annotation: fold a chain `head (group)*` into nested nodes |
 | `-> name` | After a rule: what `parse_ast()` converts its node to |
 | `name "display name" = ...` | What error messages call the rule (`expected expression`) |
+| `@recover(expr)` | Annotation: with `recover=True`, a broken element of this rule ends after `expr` (see [Error Recovery](#error-recovery)) |
 
-The first rule is the start rule. A grammar can have up to 4096 rules.
+The first rule is the start rule. A grammar can have up to 4095 rules.
 
 ### `@silent` Annotation
 
@@ -314,11 +315,11 @@ parser = zgram.compile("start = [a-z]+")
 tree = parser.parse("hello")
 ```
 
-- **`parse(input: str | bytes, start: str | None = None) -> Node`** -- Parse the whole input and return the root node. Raises `ParseError` on failure. `start` picks the start rule (default: the first rule). `bytes` input must be UTF-8 if you call `text()`.
+- **`parse(input: str | bytes, start: str | None = None, recover: bool = False) -> Node`** -- Parse the whole input and return the root node. Raises `ParseError` on failure; with `recover=True`, a syntax error doesn't raise (see [Error Recovery](#error-recovery)). `start` picks the start rule (default: the first rule). `bytes` input must be UTF-8 if you call `text()`.
 - **`match(input: str | bytes, start: str | None = None) -> Node | None`** -- Match the start rule at the beginning of the input without requiring it to consume everything (like `re.match`). The root node's `end()` is where the match stopped. Returns `None` if it doesn't match.
 - **`matches(input: str | bytes, start: str | None = None) -> bool`** -- Does the whole input match? Runs a separate validation-only parser that builds no tree (about 2x faster than `parse()`). On `False`, `error` explains the rejection. The validator is compiled on the first call (0.1-1 s depending on grammar size) and cached with the grammar.
-- **`parse_ast(input: str | bytes, start: str | None = None, spans: bool = True) -> object`** -- Parse the whole input and convert the tree to values as the rules' `-> name` actions say. Raises `ParseError` on failure.
-- **`parse_tree(input: str | bytes, start: str | None = None) -> Tree`** -- Parse the whole input and return the `Tree` (see [Tree](#tree)).
+- **`parse_ast(input: str | bytes, start: str | None = None, spans: bool = True, recover: bool = False) -> object`** -- Parse the whole input and convert the tree to values as the rules' `-> name` actions say. Raises `ParseError` on failure; with `recover=True`, broken text converts to `None`.
+- **`parse_tree(input: str | bytes, start: str | None = None, recover: bool = False) -> Tree`** -- Parse the whole input and return the `Tree` (see [Tree](#tree)); with `recover=True`, `tree.errors` lists the syntax errors.
 - **`bind(ast) -> None`** -- Supply (or replace) the classes named by `-> Name` actions.
 - **`rules() -> list[str]`** -- The grammar's rule names, in definition order.
 - **`fields() -> list[str]`** -- The grammar's labels, in order of first use.
@@ -427,10 +428,11 @@ tree.nodes     # bytes: a copy of the node array, 16 bytes per node, in pre-orde
 tree.input     # bytes: the parsed text as UTF-8 (node offsets index into it)
 tree.rules     # rule names by rule id
 tree.fields    # label names by field id - 1
+tree.errors    # list[Diagnostic]: the syntax errors recovered from (recover=True)
 tree.capsule   # PyCapsule "zgram.tree.v1" for native code
 ```
 
-Each node is four little-endian `uint32`: `text_start`, `text_end`, `subtree_size` (number of descendants, which follow the node directly) and `meta` = child count (bits 0-11, 4095 meaning "4095 or more") | rule id (bits 12-23) | field id (bits 24-31, 0 = unlabelled).
+Each node is four little-endian `uint32`: `text_start`, `text_end`, `subtree_size` (number of descendants, which follow the node directly) and `meta` = child count (bits 0-11, 4095 meaning "4095 or more") | rule id (bits 12-23) | field id (bits 24-31, 0 = unlabelled). An error node of a recovered tree has rule id `len(tree.rules)` (one past the last rule).
 
 The capsule points to this C struct (`TreeView` in `src/parse_abi.zig`), which reads the nodes and input in place, without copying. The capsule keeps the tree alive. `zgram.TREE_ABI` (currently `1`) is the struct's `abi` field; native code should check it before reading anything else.
 
@@ -513,6 +515,65 @@ err = parser.error
 print(err.message(), err.line(), err.column(), err.offset())
 ```
 
+## Error Recovery
+
+An editor, a linter or a compiler that reports every error at once needs a tree even for broken text. With `recover=True`, `parse()`, `parse_tree()` and `parse_ast()` don't raise on a syntax error: the broken text becomes **error nodes** (rule `"<error>"`) and the parse goes on after it. `tree.errors` lists every error as a [`Diagnostic`](#diagnostic), in source order. No grammar changes are needed:
+
+```python
+parser = zgram.compile(r"""
+    program       = ws (stmt ws)*
+    @silent stmt  = let_stmt | if_stmt | expr_stmt
+    let_stmt      = 'let' kw ws name:ident ws '=' ws value:expr ws ';'
+    if_stmt       = 'if' kw ws cond:expr ws block
+    block         = '{' ws (stmt ws)* '}'
+    @silent expr_stmt = expr ws ';'
+    @left expr    = left:atom (ws op:binop ws right:atom)*
+    binop         = [+*]
+    @silent atom  = num | call | ident | '(' ws expr ws ')'
+    call          = name:ident '(' ws (args:expr (ws ',' ws args:expr)*)? ws ')'
+    num           = [0-9]+
+    ident         = !('let' kw | 'if' kw) [a-z]+
+    @silent kw    = ![a-z]
+    @silent ws    = [ \n]*
+""")
+
+src = """let a = 1;
+let b = ;
+if a {
+  let c = f(a 2);
+  let d = 4
+}
+"""
+tree = parser.parse_tree(src, recover=True)
+[(n.rule(), n.text()) for n in tree.root]
+# [('let_stmt', 'let a = 1;'), ('<error>', 'let b = ;\n'),
+#  ('if_stmt', 'if a {\n  let c = f(a 2);\n  let d = 4\n}')]
+[n.rule() for n in tree.root[2].child(1)]     # the block keeps both statements
+# ['let_stmt', 'let_stmt']
+for d in tree.errors:
+    print(d.render(src, "prog.txt"))
+# prog.txt:2:9: error: expected expr [syntax]
+#     2 | let b = ;
+#       |         ^
+# prog.txt:4:15: error: expected binop, ',' or ')' [syntax]
+#     4 |   let c = f(a 2);
+#       |               ^
+# prog.txt:6:1: error: expected binop or ';' [syntax]
+#     6 | }
+#       | ^
+```
+
+How the parser recovers:
+
+- **Skipping.** A repetition whose elements make nodes (statements, items, arguments) skips an element that breaks at a known error into an error node and goes on at the next place, outside any brackets the broken text opened, where an element matches (`let b = ;` above). Skipped text stops at a closing bracket it didn't open, which belongs to the construct around it (`{ let b = + }` keeps its block). Repetitions of characters (whitespace, the digits of a number) never skip.
+- **Insertion.** A literal that isn't the first item of its sequence is taken as present when it is missing right at an error: `let a 1;` parses as a `let_stmt` with `expected '='`, `let d = 4` above as one with `expected binop or ';'`, and a block left open at the end of the input gets its `}` (`expected '}'`). The first item is never made up: `a = 1;` isn't turned into a `let` statement.
+- **`@recover(expr)`** on a rule: a broken element that begins with it ends after the first match of `expr` (after the brackets the broken text opened), and the parse looks for the next element from there. `@recover(';') @silent stmt = ...` skips a broken statement through its `;`, where the default could resume at a fragment of it (`2;` in `let d = + 2;`). `expr` is any expression: `@recover([;\n])`.
+- **Messages** are those a plain parse gives, worked out around each error; the first error is the one `parse()` without `recover` raises (`parser.error` is set to it).
+- **Error nodes** are leaves; their rule id is the grammar's rule count, one past the last rule, and `"<error>"` isn't in `parser.rules()` or `tree.rules`. `node.find("<error>")` finds them. `to_ast()`/`parse_ast()` convert them to `None` (to get both the values and the errors, use `parser.parse_tree(src, recover=True)`, then `tree.root.to_ast()` and `tree.errors`).
+- **Limits:** after 100 errors, the rest of the input is one error node. When no repetition can skip an error (nothing to resume at, as when the start rule isn't a repetition), the part of the input the start rule matched keeps its nodes and the rest becomes one error node. Input nested too deeply still raises `ParseError`.
+
+**Cost.** Valid input parses at full speed with or without `recover=True`: the recovering parser only runs after a parse fails. It is compiled the first time that happens (about as long as the grammar's own compile) and cached with the grammar. Recovery parses again once per error found, each parse stopping at the next error: on a 0.55 MB file (1.4 ms to parse), 1 error takes 2.5 ms, 10 errors 11 ms, 30 errors 32 ms.
+
 ## Architecture
 
 ```
@@ -582,6 +643,8 @@ test/
   test_tree.py                 # parse_tree(), Tree, the zgram.tree.v1 capsule
   test_diagnostic.py           # Diagnostic, ParseError.diagnostic
   test_error_messages.py       # "expected ';'" errors from the diagnosis pass
+  test_recover.py              # Error recovery: recover=True, error nodes, @recover
+  test_deep.py                 # Deeply nested input fails cleanly
   test_example_tiny.py         # The tiny example language
   test_benchmark_json.py       # Multi-parser comparative benchmark
   test_benchmark_sql2mongo.py  # SQL-to-MongoDB latency benchmark

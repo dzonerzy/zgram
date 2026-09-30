@@ -204,14 +204,13 @@ const Diagnostic = struct {
     pub fn __repr__(self: *const Diagnostic, buf: []u8) []const u8 {
         // Diagnostic('error', 'syntax', 'expected num', span=(19, 19), line=2, column=9)
         var pos: usize = 0;
-        pos += copySlice(buf, pos, "Diagnostic('");
-        pos += copySlice(buf, pos, utf8(self._severity));
-        pos += copySlice(buf, pos, "', '");
-        pos += copySlice(buf, pos, utf8(self._code));
-        pos += copySlice(buf, pos, "', '");
-        const msg = utf8(self._message);
-        pos += copySlice(buf, pos, msg[0..@min(msg.len, 120)]);
-        pos += copySlice(buf, pos, "', span=(");
+        pos += copySlice(buf, pos, "Diagnostic(");
+        pos += copyRepr(buf, pos, self._severity);
+        pos += copySlice(buf, pos, ", ");
+        pos += copyRepr(buf, pos, self._code);
+        pos += copySlice(buf, pos, ", ");
+        pos += copyRepr(buf, pos, self._message);
+        pos += copySlice(buf, pos, ", span=(");
         pos += fmtInt(buf, pos, self._start);
         pos += copySlice(buf, pos, ", ");
         pos += fmtInt(buf, pos, self._end);
@@ -354,6 +353,11 @@ const Compiled = struct {
     validate_fn: std.atomic.Value(?abi.ParseFn) = .init(null),
     validate_resource: jit_compiler.ResourceHandle = null,
     validate_lock: std.atomic.Value(bool) = .init(false),
+    /// Error-recovering parser, compiled the first time a parse with
+    /// recover=True fails (see recoverer())
+    recover_fn: std.atomic.Value(?abi.ParseFn) = .init(null),
+    recover_resource: jit_compiler.ResourceHandle = null,
+    recover_lock: std.atomic.Value(bool) = .init(false),
 
     fn build(grammar_text: []const u8) !*Compiled {
         // Grammar IR and codegen scratch live only for this call
@@ -478,9 +482,30 @@ const Compiled = struct {
         return jit.parse_fn;
     }
 
+    /// The error-recovering parser for this grammar, compiled on first call:
+    /// a grammar whose input always parses never pays for it.
+    fn recoverer(self: *Compiled) !abi.ParseFn {
+        if (self.recover_fn.load(.acquire)) |f| return f;
+        while (self.recover_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+        defer self.recover_lock.store(false, .release);
+        if (self.recover_fn.load(.acquire)) |f| return f;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const grammar = try grammar_parser.parseGrammar(arena.allocator(), self.text);
+        const module = jit_codegen.generateModule(arena.allocator(), grammar, .recover) catch return error.CompilationFailed;
+        const jit = jit_compiler.jitCompile(module.module, module.context) catch return error.CompilationFailed;
+        self.recover_resource = jit.resource;
+        self.recover_fn.store(jit.parse_fn, .release);
+        return jit.parse_fn;
+    }
+
     fn release(self: *Compiled) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         if (self.validate_resource != null) jit_compiler.releaseGrammar(self.validate_resource);
+        if (self.recover_resource != null) jit_compiler.releaseGrammar(self.recover_resource);
         jit_compiler.releaseGrammar(self.resource);
         allocator.free(self.rule_names);
         allocator.free(self.field_names);
@@ -594,7 +619,11 @@ fn compileCompiled(grammar_text: []const u8) !*Compiled {
 /// Rule names indexed by rule id, as interned Python strings (returned by
 /// Node.rule() without allocating) plus their UTF-8 bytes. Created under the
 /// GIL on a parser's first parse.
+/// The rule name of error nodes: not an identifier, so no grammar rule has it
+const ERROR_RULE_NAME = "<error>";
+
 const RuleTable = struct {
+    /// Interned rule names by rule id, and ERROR_RULE_NAME after them
     names: []*pyoz.PyObject,
     bytes: []const []const u8,
     /// Label names indexed by field id - 1, interned likewise
@@ -607,7 +636,13 @@ const RuleTable = struct {
     fn create(rule_names: []const []const u8, field_names: []const []const u8) !*RuleTable {
         const table = try allocator.create(RuleTable);
         errdefer allocator.destroy(table);
-        const names = try intern(rule_names);
+        // One name more than the grammar's rules: the rule id after the last
+        // one is that of error nodes (parse_tree(recover=True))
+        const with_error = try allocator.alloc([]const u8, rule_names.len + 1);
+        defer allocator.free(with_error);
+        @memcpy(with_error[0..rule_names.len], rule_names);
+        with_error[rule_names.len] = ERROR_RULE_NAME;
+        const names = try intern(with_error);
         errdefer release(names);
         const fields = try intern(field_names);
         errdefer release(fields);
@@ -660,6 +695,8 @@ const RuleTable = struct {
         for (self.bytes, 0..) |b, i| {
             if (std.mem.eql(u8, b, name)) return @intCast(i);
         }
+        // Error nodes' rule: the id after the grammar's rules
+        if (std.mem.eql(u8, name, ERROR_RULE_NAME)) return @intCast(self.bytes.len);
         return null;
     }
 };
@@ -697,6 +734,20 @@ const Tree = struct {
     _parser_ptr: ?*GrammarParser = null,
     /// What `capsule` points to, filled in on first use
     _view: abi.TreeView = .{},
+    /// With recover=True: the syntax errors recovered from (a list of
+    /// Diagnostic); null when the input had none
+    _errors: ?*pyoz.PyObject = null,
+
+    /// The syntax errors this tree was recovered from, in source order: empty
+    /// unless the input had errors and was parsed with recover=True. Their
+    /// text is in the tree as error nodes (rule "<error>").
+    pub fn get_errors(self: *const Tree) pyoz.Signature(?*pyoz.PyObject, "list[Diagnostic]") {
+        if (self._errors) |e| {
+            py.Py_IncRef(e);
+            return .{ .value = e };
+        }
+        return .{ .value = py.c.PyList_New(0) };
+    }
 
     /// The root node.
     pub fn get_root(self: *const Tree) Node {
@@ -743,7 +794,8 @@ const Tree = struct {
 
     /// Rule names by rule id.
     pub fn get_rules(self: *const Tree) pyoz.Signature(?*pyoz.PyObject, "list[str]") {
-        return .{ .value = nameList(if (self._rules) |r| r.names else &.{}) };
+        // The grammar's rules by id (error nodes' "<error>" is not one of them)
+        return .{ .value = nameList(if (self._rules) |r| r.names[0..r.bytes.len] else &.{}) };
     }
 
     /// Label names by field id - 1.
@@ -790,6 +842,8 @@ const Tree = struct {
         self._nodes = null;
         if (self._input_obj) |obj| py.Py_DecRef(obj);
         self._input_obj = null;
+        if (self._errors) |e| py.Py_DecRef(e);
+        self._errors = null;
     }
 
     fn flat(self: *const Tree, idx: u32) ?abi.FlatNode {
@@ -822,6 +876,7 @@ const Tree = struct {
     fn ruleName(self: *const Tree, f: abi.FlatNode) []const u8 {
         const rules = self._rules orelse return "";
         const rid = f.rule_id();
+        if (rid == rules.bytes.len) return ERROR_RULE_NAME;
         return if (rid < rules.bytes.len) rules.bytes[rid] else "";
     }
 
@@ -1276,6 +1331,16 @@ fn copySlice(buf: []u8, pos: usize, src: []const u8) usize {
     return n;
 }
 
+/// Python's repr() of `obj` (quotes escaped as Python does)
+fn copyRepr(buf: []u8, pos: usize, obj: ?*pyoz.PyObject) usize {
+    const r = py.c.PyObject_Repr(obj orelse py.Py_None()) orelse {
+        py.c.PyErr_Clear();
+        return copySlice(buf, pos, "?");
+    };
+    defer py.Py_DecRef(r);
+    return copySlice(buf, pos, Diagnostic.utf8(r));
+}
+
 fn fmtInt(buf: []u8, pos: usize, val: i64) usize {
     var tmp: [20]u8 = undefined;
     var v: u64 = if (val < 0) @intCast(-val) else @intCast(val);
@@ -1448,11 +1513,49 @@ const GrammarParser = struct {
         return null;
     }
 
+    /// A Tree object that takes over `output`'s node buffer (trimmed if it's
+    /// mostly unused), and its root Node. `errors`, a list of Diagnostic, is
+    /// the tree's to keep.
+    fn adoptTree(self: *GrammarParser, output: *abi.ParseOutput, input: *pyoz.PyObject, ptr: [*]const u8, input_len: usize, errors: ?*pyoz.PyObject) !?Node {
+        var nodes = output.nodes_ptr.?[0..output.node_capacity];
+        if (output.node_count < output.node_capacity / 2) {
+            nodes = allocator.realloc(nodes, output.node_count) catch nodes;
+        }
+        output.nodes_ptr = null;
+
+        var tree = Tree{
+            ._nodes = nodes.ptr,
+            ._count = output.node_count,
+            ._alloc_len = @intCast(nodes.len),
+            ._input_obj = input,
+            ._input_ptr = ptr,
+            ._input_len = input_len,
+            ._rules = try self.ruleTable(),
+            ._compiled = self._compiled,
+            ._parser_ptr = self,
+            ._errors = errors,
+        };
+        py.Py_IncRef(input);
+        tree._parser.set(Module.selfObject(GrammarParser, self));
+
+        const tree_obj = Module.toPy(Tree, tree) orelse {
+            tree._parser.clear();
+            tree.__del__();
+            return error.AllocationFailed;
+        };
+        // The root Node takes its own reference to the tree
+        defer py.Py_DecRef(tree_obj);
+        const t = Module.fromPy(*Tree, tree_obj) catch return error.AllocationFailed;
+        return makeNode(t, 0);
+    }
+
     /// Run the compiled parser. On success returns the root Node; on failure
     /// records the error and returns null (raising only if `raise_on_fail`).
-    fn run(self: *GrammarParser, input: *pyoz.PyObject, start: ?*pyoz.PyObject, flags: u32, raise_on_fail: bool) !?Node {
+    /// With `recover`, a syntax error doesn't fail the parse: see recoverParse().
+    fn run(self: *GrammarParser, input: *pyoz.PyObject, start: ?*pyoz.PyObject, flags: u32, raise_on_fail: bool, recover: bool) !?Node {
         const compiled = self._compiled orelse return error.ParserNotLoaded;
-        const table = try self.ruleTable();
+        // (made here, with the GIL: the tree needs it)
+        _ = try self.ruleTable();
 
         // Parse the str/bytes object's own UTF-8 buffer in place: the Tree
         // keeps a reference to the object, so the buffer outlives the Nodes.
@@ -1525,36 +1628,7 @@ const GrammarParser = struct {
                 output.nodes_ptr = null;
                 return raise(py.PyExc_ValueError(), "the start rule matched but produced no nodes (is it @silent?)");
             }
-            // Hand the node buffer to the tree, trimmed if it's mostly unused
-            var nodes = output.nodes_ptr.?[0..output.node_capacity];
-            if (output.node_count < output.node_capacity / 2) {
-                nodes = allocator.realloc(nodes, output.node_count) catch nodes;
-            }
-            output.nodes_ptr = null;
-
-            var tree = Tree{
-                ._nodes = nodes.ptr,
-                ._count = output.node_count,
-                ._alloc_len = @intCast(nodes.len),
-                ._input_obj = input,
-                ._input_ptr = ptr,
-                ._input_len = input_len,
-                ._rules = table,
-                ._compiled = compiled,
-                ._parser_ptr = self,
-            };
-            py.Py_IncRef(input);
-            tree._parser.set(Module.selfObject(GrammarParser, self));
-
-            const tree_obj = Module.toPy(Tree, tree) orelse {
-                tree._parser.clear();
-                tree.__del__();
-                return error.AllocationFailed;
-            };
-            // The root Node takes its own reference to the tree
-            defer py.Py_DecRef(tree_obj);
-            const t = Module.fromPy(*Tree, tree_obj) catch return error.AllocationFailed;
-            return makeNode(t, 0);
+            return self.adoptTree(&output, input, ptr, input_len, null);
         }
 
         allocator.free(output.nodes_ptr.?[0..output.node_capacity]);
@@ -1567,15 +1641,297 @@ const GrammarParser = struct {
             .rule_id = output.error_rule_id,
         };
         if (self._last_error.kind == .out_of_memory) return error.OutOfMemory;
+
+        // A syntax error: with recover=True, parse again and skip the broken
+        // text. Its errors are diagnosed around each one, in the recovered
+        // tree, not by re-running the whole input (refineError).
+        if (recover and !too_deep) {
+            return self.recoverParse(compiled, input, ptr, input_len, start_rule, output.error_offset, output.error_rule_id);
+        }
         if (!too_deep) self.refineError(compiled, ptr[0..input_len], start_rule);
         if (!raise_on_fail) return null;
+        return self.raiseLastError();
+    }
 
+    /// Raise ParseError for the last failed parse. Always null.
+    fn raiseLastError(self: *GrammarParser) ?Node {
         var msg_buf: [320]u8 = undefined;
         const msg = self.formatError(self._last_error, msg_buf[0 .. msg_buf.len - 1]);
         msg_buf[msg.len] = 0;
         Module.getException(0).raise(msg_buf[0..msg.len :0]);
         self.annotateException();
         return null;
+    }
+
+    /// Most syntax errors recovered from in one parse; past them, the rest
+    /// of the input is one error node
+    const MAX_RECOVERED = 100;
+
+    /// The parse failed with a syntax error at `first` (the generated
+    /// parser's furthest failure, where it expected `first_rule`). Parse
+    /// again with the recovering parser: a repetition whose element runs into
+    /// a known error skips the broken text into an error node and goes on.
+    /// Each round knows the errors found so far; a round that stops at a new
+    /// one adds it and runs again, until the input parses to its end, up to
+    /// MAX_RECOVERED errors. A round that finds nothing new raises the
+    /// recover level (ParseOutput.recover_level) for the rounds after it.
+    /// What can't be recovered from (an error no repetition reaches) ends
+    /// the tree with an error node for the rest of the input. Returns the
+    /// root of a tree whose `errors` lists them all.
+    fn recoverParse(self: *GrammarParser, compiled: *Compiled, input: *pyoz.PyObject, ptr: [*]const u8, input_len: usize, start_rule: u32, first: u32, first_rule: u16) !?Node {
+        const parse_fn = try pyoz.allowThreadsTry(Compiled.recoverer, .{compiled});
+        // The errors known so far: their positions (sorted, for the parser),
+        // and per position what was expected there, and whether it is only a
+        // more precise position of an error already listed (where a literal
+        // was missing), which recovery uses but which isn't reported again
+        var known: std.ArrayList(u32) = .empty;
+        defer known.deinit(allocator);
+        var info: std.ArrayList(KnownError) = .empty;
+        defer info.deinit(allocator);
+        _ = try addKnown(&known, &info, first, .{ .rule = first_rule });
+        var reported: usize = 1;
+        var recovered: [MAX_RECOVERED * 4]abi.Recovered = undefined;
+        var level: u8 = 0;
+
+        while (true) {
+            var output = abi.ParseOutput{};
+            defer jit_helpers.memoFree(&output);
+            defer if (output.nodes_ptr) |n| allocator.free(n[0..output.node_capacity]);
+            const initial_cap: u32 = @intCast(std.math.clamp(input_len / 4 + 16, 16, 64 * 1024));
+            output.nodes_ptr = (try allocator.alloc(abi.FlatNode, initial_cap)).ptr;
+            output.node_capacity = initial_cap;
+            output.stack_limit = native_stack.limit(@frameAddress());
+            output.known_errors = known.items.ptr;
+            output.known_count = @intCast(known.items.len);
+            output.error_rule = @intCast(compiled.rule_names.len);
+            output.recover_level = level;
+            output.recovered = &recovered;
+            output.recovered_capacity = recovered.len;
+            _ = if (input_len >= GIL_RELEASE_BYTES)
+                pyoz.allowThreads(callParse, .{ parse_fn, ptr, input_len, &output, start_rule, 0 })
+            else
+                parse_fn(ptr, input_len, &output, start_rule, 0);
+
+            const kind: abi.ErrorKind = @enumFromInt(output.error_kind);
+            if (kind == .out_of_memory) return error.OutOfMemory;
+            if (kind == .too_deep) {
+                const at = @min(@as(usize, output.max_pos), input_len);
+                const where = abi.lineCol(ptr[0..input_len], at);
+                self._last_error = .{ .kind = .too_deep, .offset = @intCast(at), .line = where.line, .col = where.col };
+                return self.raiseLastError();
+            }
+            const recovered_list = recovered[0..output.recovered_count];
+            if (output.status == 1 and output.node_count > 0) {
+                return self.finishRecovery(&output, input, ptr, input_len, known.items, info.items, recovered_list);
+            }
+
+            // Stopped at an error: a new one is added and the parse runs
+            // again; so is the precise place a literal was missing there, if
+            // further on (where a `=` or `}` can be inserted)
+            const at = output.error_offset;
+            const literal: ?[]const u8 = if (output.lit_text) |t| t[0..output.lit_len] else null;
+            const new_error = try addKnown(&known, &info, at, .{ .rule = output.error_rule_id, .literal = if (output.lit_pos == at) literal else null });
+            if (new_error) reported += 1;
+            const new_position = output.lit_pos > at and try addKnown(&known, &info, output.lit_pos, .{ .rule = output.error_rule_id, .alias = true, .literal = literal });
+            if ((new_error or new_position) and reported <= MAX_RECOVERED) continue;
+            // Nothing new: from now on skip more freely (skipped text may run
+            // to the end of the input; then elements that ran into a known
+            // error may be skipped even if they failed further on)
+            if (level < abi.RECOVER_LOOSE and reported <= MAX_RECOVERED) {
+                level += 1;
+                continue;
+            }
+
+            // No way on: the rest of the input becomes one error node
+            try endWithError(&output, input_len);
+            return self.finishRecovery(&output, input, ptr, input_len, known.items, info.items, recovered_list);
+        }
+    }
+
+    /// The nodes of the tree in `output` whose text contains `at`, innermost
+    /// first, as (start, rule) to diagnose from; and the start of the error
+    /// node `at` is in, if it is in one. Found by descending from the root,
+    /// so it costs the depth, not the tree.
+    fn nodesAround(output: *const abi.ParseOutput, at: u32, out: []abi.Recovered) struct { count: usize, error_start: ?u32 } {
+        const nodes = (output.nodes_ptr orelse return .{ .count = 0, .error_start = null })[0..output.node_count];
+        if (nodes.len == 0) return .{ .count = 0, .error_start = null };
+        var error_start: ?u32 = null;
+        var chain: [64]u32 = undefined;
+        var depth: usize = 0;
+        var idx: u32 = 0;
+        descend: while (depth < chain.len) {
+            const node = nodes[idx];
+            if (node.text_start > at or node.text_end < at) break;
+            if (node.rule_id() == output.error_rule) {
+                error_start = node.text_start;
+            } else {
+                chain[depth] = idx;
+                depth += 1;
+            }
+            // Into the child that contains it
+            const end = idx + 1 + node.subtree_size;
+            var child = idx + 1;
+            while (child < end) : (child += nodes[child].subtree_size + 1) {
+                if (nodes[child].text_start <= at and at <= nodes[child].text_end) {
+                    idx = child;
+                    continue :descend;
+                }
+            }
+            break;
+        }
+        var n: usize = 0;
+        while (depth > 0 and n < out.len) : (n += 1) {
+            depth -= 1;
+            const node = nodes[chain[depth]];
+            out[n] = .{ .start = node.text_start, .rule = node.rule_id() };
+        }
+        return .{ .count = n, .error_start = error_start };
+    }
+
+    /// A known syntax error (see recoverParse)
+    const KnownError = struct {
+        /// What the generated parser expected there
+        rule: u16,
+        alias: bool = false,
+        /// The literal found missing there, if one was (in the compiled
+        /// grammar's memory)
+        literal: ?[]const u8 = null,
+    };
+
+    /// Add a known error position in order; false if it was known already.
+    fn addKnown(known: *std.ArrayList(u32), info: *std.ArrayList(KnownError), at: u32, what: KnownError) !bool {
+        const index = std.sort.lowerBound(u32, known.items, at, orderU32);
+        if (index < known.items.len and known.items[index] == at) return false;
+        try known.insert(allocator, index, at);
+        try info.insert(allocator, index, what);
+        return true;
+    }
+
+    fn orderU32(a: u32, b: u32) std.math.Order {
+        return std.math.order(a, b);
+    }
+
+    /// A tree for a parse that stopped at an error it couldn't recover
+    /// from: the start rule matched part of the input (its node gets an error
+    /// node for the rest as its last child), or nothing (the whole input is
+    /// one error node).
+    fn endWithError(output: *abi.ParseOutput, input_len: usize) !void {
+        const error_rule: u16 = @intCast(output.error_rule);
+        const end: u32 = @intCast(input_len);
+        // The start rule matched a prefix exactly when it left its node (a
+        // failed rule takes its nodes back); the error kind can't tell,
+        // since input left over is reported where the furthest failure was
+        if (output.node_count > 0) {
+            if (jit_helpers.zgram_ensure_capacity(output, output.node_count + 1) == 0) return error.OutOfMemory;
+            const nodes = output.nodes_ptr.?;
+            const root = &nodes[0];
+            nodes[output.node_count] = .{
+                .text_start = root.text_end,
+                .text_end = end,
+                .subtree_size = 0,
+                .meta = abi.FlatNode.packMeta(0, error_rule),
+            };
+            output.node_count += 1;
+            root.subtree_size += 1;
+            root.text_end = end;
+            // One more child (the stored count saturates)
+            if (root.child_count() < abi.CHILD_COUNT_MANY) root.meta += 1;
+            return;
+        }
+        output.node_count = 1;
+        output.nodes_ptr.?[0] = .{ .text_start = 0, .text_end = end, .subtree_size = 0, .meta = abi.FlatNode.packMeta(0, error_rule) };
+    }
+
+    /// The tree of a recovered parse, with a Diagnostic per error: the first
+    /// with the message a plain parse gives it; each later one with what the
+    /// rule its broken text begins with expected (diagnose.zig, run from the
+    /// start of the skipped text), or else the rule the parser expected there.
+    fn finishRecovery(self: *GrammarParser, output: *abi.ParseOutput, input: *pyoz.PyObject, ptr: [*]const u8, input_len: usize, known: []const u32, info: []const KnownError, recovered: []const abi.Recovered) !?Node {
+        const compiled = self._compiled.?;
+        const text = ptr[0..input_len];
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const grammar = grammar_parser.parseGrammar(arena.allocator(), compiled.text) catch null;
+
+        const Entry = struct { offset: u32, message: []const u8 };
+        var entries: std.ArrayList(Entry) = .empty;
+        for (known, info) |at, what| {
+            // (only a more precise position of an error listed on its own)
+            if (what.alias) continue;
+            const rule = what.rule;
+            // What to diagnose from, most specific first: the skipped element
+            // that broke here, then the nodes
+            // of the tree around the error, innermost first (an inserted `;`
+            // leaves a statement node rather than a skipped element)
+            var candidates: [10]abi.Recovered = undefined;
+            var n: usize = 0;
+            var around: [9]abi.Recovered = undefined;
+            const found_around = nodesAround(output, at, &around);
+            // The skipped element: the one recorded at the start of the error
+            // node the error is in (records of nodes that backtracking
+            // dropped don't count)
+            if (found_around.error_start) |error_start| {
+                var i = recovered.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (recovered[i].start != error_start) continue;
+                    if (recovered[i].rule != abi.NO_RULE) {
+                        candidates[n] = recovered[i];
+                        n += 1;
+                    }
+                    break;
+                }
+            }
+            @memcpy(candidates[n..][0..found_around.count], around[0..found_around.count]);
+            n += found_around.count;
+            const found: ?diagnose.Result = if (grammar) |g| blk: {
+                for (candidates[0..n]) |c| {
+                    // (a diagnosis that stops short of the error is of another one)
+                    if (diagnose.diagnoseAt(allocator, g, text, c.rule, c.start)) |r| {
+                        if (r.pos >= at) break :blk r;
+                    }
+                }
+                break :blk null;
+            } else null;
+            if (found) |r| {
+                var buf: [200]u8 = undefined;
+                try entries.append(arena.allocator(), .{ .offset = @intCast(r.pos), .message = try arena.allocator().dupe(u8, r.message(&buf)) });
+                continue;
+            }
+            // Else the literal the parser would have inserted there, or the
+            // rule it expected
+            var buf: [200]u8 = undefined;
+            const message = if (what.literal) |lit|
+                diagnose.expectedLiteral(lit, &buf)
+            else
+                try std.fmt.bufPrint(&buf, "expected {s}", .{if (rule < compiled.display_names.len) compiled.display_names[rule] else "input"});
+            try entries.append(arena.allocator(), .{ .offset = at, .message = try arena.allocator().dupe(u8, message) });
+        }
+
+        // In source order, one per position
+        std.sort.pdq(Entry, entries.items, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                return a.offset < b.offset;
+            }
+        }.lt);
+        const list = py.c.PyList_New(0) orelse return null;
+        errdefer py.Py_DecRef(list);
+        var last: ?u32 = null;
+        for (entries.items) |e| {
+            if (last != null and last.? == e.offset) continue;
+            last = e.offset;
+            const where = abi.lineCol(text, e.offset);
+            var err = LastError{ .kind = .expected_rule, .offset = e.offset, .line = where.line, .col = where.col };
+            const n = @min(e.message.len, err.text.len);
+            @memcpy(err.text[0..n], e.message[0..n]);
+            err.text_len = @intCast(n);
+            // parser.error: the first of them
+            if (py.c.PyList_Size(list) == 0) self._last_error = err;
+            const d = syntaxDiagnostic(e.message, err) orelse return null;
+            defer py.Py_DecRef(d);
+            if (py.c.PyList_Append(list, d) != 0) return null;
+        }
+        return self.adoptTree(output, input, ptr, input_len, list);
     }
 
     /// Attach line/column/offset/message attributes to the ParseError being raised.
@@ -1670,9 +2026,11 @@ const GrammarParser = struct {
         return .{ .value = py.Py_None() };
     }
 
-    /// Parse the whole input and return the Tree (see Node.tree).
-    pub fn parse_tree(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null })) pyoz.Signature(anyerror!?*pyoz.PyObject, "Tree") {
-        const root = (self.run(args.value.input, args.value.start, 0, true) catch |e| return .{ .value = e }) orelse return .{ .value = null };
+    /// Parse the whole input and return the Tree (see Node.tree). With
+    /// recover=True a syntax error doesn't raise: the broken text becomes
+    /// error nodes and tree.errors lists the errors.
+    pub fn parse_tree(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null, recover: bool = false })) pyoz.Signature(anyerror!?*pyoz.PyObject, "Tree") {
+        const root = (self.run(args.value.input, args.value.start, 0, true, args.value.recover) catch |e| return .{ .value = e }) orelse return .{ .value = null };
         var node = root;
         defer node._tree.clear();
         const obj = Module.selfObject(Tree, root._t.?);
@@ -1681,9 +2039,10 @@ const GrammarParser = struct {
     }
 
     /// Parse the whole input and convert the tree to values, bottom-up, as
-    /// the rules' `-> name` actions say.
-    pub fn parse_ast(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null, spans: bool = true })) pyoz.Signature(anyerror!?*pyoz.PyObject, "object") {
-        const root = (self.run(args.value.input, args.value.start, 0, true) catch |e| return .{ .value = e }) orelse return .{ .value = null };
+    /// the rules' `-> name` actions say. With recover=True a syntax error
+    /// doesn't raise, and the broken text is None in the result.
+    pub fn parse_ast(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null, spans: bool = true, recover: bool = false })) pyoz.Signature(anyerror!?*pyoz.PyObject, "object") {
+        const root = (self.run(args.value.input, args.value.start, 0, true, args.value.recover) catch |e| return .{ .value = e }) orelse return .{ .value = null };
         var node = root;
         defer node._tree.clear();
         return .{ .value = self.buildAst(root._t.?, root._idx, args.value.spans) };
@@ -1831,7 +2190,12 @@ const GrammarParser = struct {
     fn convert(self: *GrammarParser, compiled: *const Compiled, t: *Tree, i: u32, kids: []const ?*pyoz.PyObject, spans: bool) BuildError!?*pyoz.PyObject {
         const n = t._nodes.?[i];
         const rid = n.rule_id();
-        if (rid >= compiled.actions.len) {
+        // An error node (recover=True): None, where the broken text was
+        if (rid == compiled.actions.len) {
+            py.Py_IncRef(py.Py_None());
+            return py.Py_None();
+        }
+        if (rid > compiled.actions.len) {
             py.PyErr_SetString(py.PyExc_RuntimeError(), "corrupt parse tree");
             return error.PythonError;
         }
@@ -2000,15 +2364,16 @@ const GrammarParser = struct {
         return f(ptr, len, out, start_rule, flags);
     }
 
-    /// Parse the whole input. Returns the root Node; raises ParseError on failure.
-    pub fn parse(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null })) pyoz.Signature(anyerror!?Node, "Node") {
-        return .{ .value = self.run(args.value.input, args.value.start, 0, true) };
+    /// Parse the whole input. Returns the root Node; raises ParseError on
+    /// failure, unless recover=True (see parse_tree).
+    pub fn parse(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null, recover: bool = false })) pyoz.Signature(anyerror!?Node, "Node") {
+        return .{ .value = self.run(args.value.input, args.value.start, 0, true, args.value.recover) };
     }
 
     /// Match a prefix of the input. Returns the root Node (its end() is where
     /// the match stopped), or None if the start rule doesn't match.
     pub fn match(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, start: ?*pyoz.PyObject = null })) !?Node {
-        return self.run(args.value.input, args.value.start, abi.FLAG_PREFIX, false);
+        return self.run(args.value.input, args.value.start, abi.FLAG_PREFIX, false, false);
     }
 
     /// Does the whole input match? Runs a separate accept/reject-only parser
@@ -2070,7 +2435,7 @@ const GrammarParser = struct {
         // Rejected: let the tree parser explain why (sets `error`). It
         // agrees with the validator, so it returns no node; if it ever did,
         // release the node's reference to its tree.
-        const node = self.run(input, start, 0, false) catch {
+        const node = self.run(input, start, 0, false, false) catch {
             py.c.PyErr_Clear();
             return false;
         };
@@ -2103,8 +2468,10 @@ const GrammarParser = struct {
             py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
             return .{ .value = null };
         };
-        const list = py.c.PyList_New(@intCast(tbl.names.len)) orelse return .{ .value = null };
-        for (tbl.names, 0..) |n, i| {
+        // (not the name error nodes get, after the grammar's rules)
+        const rule_names = tbl.names[0..tbl.bytes.len];
+        const list = py.c.PyList_New(@intCast(rule_names.len)) orelse return .{ .value = null };
+        for (rule_names, 0..) |n, i| {
             py.Py_IncRef(n);
             _ = py.c.PyList_SetItem(list, @intCast(i), n);
         }
@@ -2155,13 +2522,13 @@ const GrammarParser = struct {
     }
 
     pub const __doc__: [*:0]const u8 = "A compiled grammar parser. Call .parse(input) to parse a string.";
-    pub const parse__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes), which must match completely. start= names the start rule (default: the first). Returns the root Node, raises ParseError on failure.";
+    pub const parse__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes), which must match completely. start= names the start rule (default: the first). Returns the root Node, raises ParseError on failure; with recover=True a syntax error doesn't raise: the broken text becomes error nodes (rule '<error>') and node.tree.errors lists the errors.";
     pub const match__doc__: [*:0]const u8 = "Match the start rule at the beginning of the input without requiring it to consume everything. Returns the root Node (see end()), or None if it doesn't match.";
     pub const rules__doc__: [*:0]const u8 = "Names of the grammar's rules, in definition order.";
-    pub const parse_tree__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and return the Tree: root, nodes, input, rules, fields, and a capsule for native code. Raises ParseError on failure.";
+    pub const parse_tree__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and return the Tree: root, nodes, input, rules, fields, and a capsule for native code. Raises ParseError on failure; with recover=True a syntax error doesn't raise: the broken text becomes error nodes (rule '<error>') and tree.errors lists the errors.";
     pub const bind__doc__: [*:0]const u8 = "Supply the classes named by `-> Class` actions: a dict, or an object with them as attributes (a module).";
     pub const bind__params__ = "ast";
-    pub const parse_ast__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and convert the tree to values as the rules' `-> name` actions say. Objects built by `-> Class` get __zspan__ = (start, end) and __znode__ = the node's index, unless spans=False. Raises ParseError on failure.";
+    pub const parse_ast__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and convert the tree to values as the rules' `-> name` actions say. Objects built by `-> Class` get __zspan__ = (start, end) and __znode__ = the node's index, unless spans=False. Raises ParseError on failure; with recover=True a syntax error doesn't raise and the broken text is None in the result.";
     pub const actions__doc__: [*:0]const u8 = "The `-> name` action of each rule, by rule id: a built-in, a class name, or None for a rule without an action.";
     pub const fields__doc__: [*:0]const u8 = "Names of the grammar's labels (label:rule), in order of first use.";
     pub const matches__doc__: [*:0]const u8 = "Does the whole input match the grammar? Several times faster than parse(): builds no tree. On False, `error` explains the rejection. start= names the start rule.";

@@ -373,6 +373,11 @@ pub const Builder = struct {
         return c.LLVMBuildXor(self.b, lhs, rhs, name);
     }
 
+    /// `cond ? a : b`
+    pub fn select(self: *Builder, cond: Value, a: Value, b_val: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildSelect(self.b, cond, a, b_val, name);
+    }
+
     // ── Switch ──
 
     /// Build a switch on `val`; add cases with `addCase`.

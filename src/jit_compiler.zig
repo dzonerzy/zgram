@@ -22,6 +22,10 @@ extern fn zgram_memo_lookup(output: *abi.ParseOutput, rule_id: u32, pos: u64) ca
 extern fn zgram_tag_field(output: *abi.ParseOutput, from: u32, field: u32) callconv(.c) void;
 extern fn zgram_fold(output: *abi.ParseOutput, first: u32, rule_id: u32, kind: u32, k: u32, start: u32, end: u32) callconv(.c) i32;
 extern fn zgram_memo_store(output: *abi.ParseOutput, rule_id: u32, pos: u64, result: i64, node_start: u32) callconv(.c) void;
+extern fn zgram_recover_error(output: *abi.ParseOutput, start: u64, reach: u64) callconv(.c) i64;
+extern fn zgram_recover_begin(output: *abi.ParseOutput, input_ptr: [*]const u8, start: u64, err: u64) callconv(.c) void;
+extern fn zgram_recover_step(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: u64) callconv(.c) i64;
+extern fn zgram_error_node(output: *abi.ParseOutput, start: u64, end: u64, rule: u32) callconv(.c) i32;
 
 // X86 target init (macro-generated in Target.h, must declare manually)
 extern fn LLVMInitializeX86TargetInfo() void;
@@ -96,7 +100,11 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
     else
         0;
 
-    var syms: [10]c.LLVMOrcCSymbolMapPair = .{
+    var syms: [14]c.LLVMOrcCSymbolMapPair = .{
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_recover_error"), .Sym = .{ .Address = @intFromPtr(&zgram_recover_error), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_recover_begin"), .Sym = .{ .Address = @intFromPtr(&zgram_recover_begin), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_recover_step"), .Sym = .{ .Address = @intFromPtr(&zgram_recover_step), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_error_node"), .Sym = .{ .Address = @intFromPtr(&zgram_error_node), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_reserve_node"), .Sym = .{ .Address = @intFromPtr(&zgram_reserve_node), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_fill_node"), .Sym = .{ .Address = @intFromPtr(&zgram_fill_node), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_set_error_trailing"), .Sym = .{ .Address = @intFromPtr(&zgram_set_error_trailing), .Flags = exported_flags } },

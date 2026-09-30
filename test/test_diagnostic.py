@@ -53,6 +53,9 @@ def test_equality():
 def test_repr():
     d = Diagnostic("error", "syntax", "expected num", (19, 19), 2, 9)
     assert repr(d) == "Diagnostic('error', 'syntax', 'expected num', span=(19, 19), line=2, column=9)"
+    # the strings are Python reprs: quotes inside them are escaped
+    d = Diagnostic("error", "syntax", "expected '='", (6, 6), 1, 7)
+    assert repr(d) == """Diagnostic('error', 'syntax', "expected '='", span=(6, 6), line=1, column=7)"""
 
 
 @pytest.mark.parametrize(

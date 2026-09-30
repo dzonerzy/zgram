@@ -69,6 +69,120 @@ pub export fn zgram_fill_node(
     };
 }
 
+// ── Error recovery (the parser compiled in recover mode) ──
+
+/// A repetition's element failed at `start` after reaching `reach`: if a
+/// known syntax error lies in between, that's the error it ran into, and
+/// its position is returned (recovery skips the broken text from `start`).
+/// Otherwise -1: an ordinary end of the repetition.
+pub export fn zgram_recover_error(output: *abi.ParseOutput, start: u64, reach: u64) callconv(.c) i64 {
+    const known = (output.known_errors orelse return -1)[0..output.known_count];
+    // The first known error at or after `start`
+    var lo: usize = 0;
+    var hi: usize = known.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (known[mid] < start) lo = mid + 1 else hi = mid;
+    }
+    if (lo == known.len or known[lo] > reach) return -1;
+    // An attempt that failed furthest at a place no error is known at may
+    // have run into a new error there, after the known one: the parse
+    // stops there instead, and the next round knows it (skipping the whole
+    // element now would hide it)
+    if (output.recover_level < abi.RECOVER_LOOSE and std.sort.binarySearch(u32, known[lo..], @as(u32, @intCast(reach)), orderU32) == null) return -1;
+    return known[lo];
+}
+
+fn orderU32(a: u32, b: u32) std.math.Order {
+    return std.math.order(a, b);
+}
+
+fn opens(ch: u8) bool {
+    return ch == '(' or ch == '[' or ch == '{';
+}
+
+fn closes(ch: u8) bool {
+    return ch == ')' or ch == ']' or ch == '}';
+}
+
+/// A letter, digit or `_`: resuming between two of them would split a word
+fn isWord(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80;
+}
+
+/// Start looking for where to resume after the broken text that begins at
+/// `start`: from the error at `err`, with the brackets opened in between
+/// counted (a place to resume must be outside them).
+pub export fn zgram_recover_begin(output: *abi.ParseOutput, input_ptr: [*]const u8, start: u64, err: u64) callconv(.c) void {
+    var depth: i64 = 0;
+    for (input_ptr[start..err]) |ch| {
+        if (opens(ch)) depth += 1 else if (closes(ch) and depth > 0) depth -= 1;
+    }
+    output.scan_pos = err;
+    output.scan_depth = depth;
+    output.scan_start = err;
+    output.scan_ignoring_opens = false;
+}
+
+/// The next place recovery may resume at: a position outside the brackets
+/// the broken text opened. Returns -(p + 1) to stop at p instead: a closing
+/// bracket the broken text didn't open (it belongs to the construct around
+/// the repetition, which resumes there), or the end of the input (from
+/// recover level RECOVER_TO_END; before it -1, no recovery). If the end is
+/// reached inside brackets the broken text opened and never closed, the
+/// look starts over ignoring them.
+pub export fn zgram_recover_step(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: u64) callconv(.c) i64 {
+    var p = output.scan_pos;
+    var depth = output.scan_depth;
+    while (true) {
+        while (p < input_len) {
+            const ch = input_ptr[p];
+            if (depth == 0) {
+                if (closes(ch)) return -@as(i64, @intCast(p)) - 1;
+                output.scan_pos = p + 1;
+                output.scan_depth = if (opens(ch) and !output.scan_ignoring_opens) 1 else 0;
+                // Not in the middle of a word
+                if (p > 0 and isWord(ch) and isWord(input_ptr[p - 1])) {
+                    p += 1;
+                    depth = output.scan_depth;
+                    continue;
+                }
+                return @intCast(p);
+            }
+            if (opens(ch)) depth += 1 else if (closes(ch)) depth -= 1;
+            p += 1;
+        }
+        if (depth == 0 or output.scan_ignoring_opens) break;
+        // Never closed: look again, as if they weren't there
+        output.scan_ignoring_opens = true;
+        p = output.scan_start;
+        depth = 0;
+    }
+    output.scan_pos = p;
+    output.scan_depth = depth;
+    // The end of the input: rather than swallow the rest here, let a
+    // repetition around this one resume at its next element, unless an
+    // earlier round found no way on (-1 = stop at 0: no recovery)
+    if (output.recover_level < abi.RECOVER_TO_END) return -1;
+    return -@as(i64, @intCast(input_len)) - 1;
+}
+
+/// Add an error node for the skipped text [start, end): a leaf of the
+/// grammar's error rule; and note `rule`, what the broken element begins
+/// with, for its message. 1 on success, 0 if the node buffer can't grow.
+pub export fn zgram_error_node(output: *abi.ParseOutput, start: u64, end: u64, rule: u32) callconv(.c) i32 {
+    const idx = zgram_reserve_node(output);
+    if (idx < 0) return 0;
+    zgram_fill_node(output, @intCast(idx), @intCast(output.error_rule), @intCast(start), @intCast(end), 0, 0);
+    if (output.recovered) |list| {
+        if (output.recovered_count < output.recovered_capacity) {
+            list[output.recovered_count] = .{ .start = @intCast(start), .rule = rule };
+            output.recovered_count += 1;
+        }
+    }
+    return 1;
+}
+
 /// Set the field id of every top-level node from index `from` to the end of
 /// the node buffer (the nodes a labelled reference to a @silent rule produced).
 pub export fn zgram_tag_field(output: *abi.ParseOutput, from: u32, field: u32) callconv(.c) void {
