@@ -180,8 +180,20 @@ const Interp = struct {
     /// Lowest address a frame may be at (see stack.zig)
     stack_limit: usize = 0,
     result: Result = .{},
+    /// expectedLiterals(): every literal that fails at `collect_at` (not
+    /// in a predicate or a skipped rule), as it is, each once
+    collect: ?*std.ArrayList([]const u8) = null,
+    collect_at: usize = 0,
 
     fn fail(self: *Interp, expr: *const gp.Expr, pos: usize) void {
+        if (self.collect) |list| {
+            if (self.quiet == 0 and pos == self.collect_at and expr.tag == .literal) {
+                const lit = expr.literal_value orelse "";
+                for (list.items) |seen| {
+                    if (std.mem.eql(u8, seen, lit)) break;
+                } else list.append(self.allocator, lit) catch {};
+            }
+        }
         if (self.quiet != 0 or pos < self.result.pos) return;
         if (pos > self.result.pos) self.result = .{ .pos = pos };
         self.expect(describe(expr));
@@ -354,6 +366,50 @@ pub fn diagnose(allocator: Allocator, grammar: *const gp.Grammar, input: []const
 /// it stopping at the error); the caller checks the position is the error's.
 pub fn diagnoseAt(allocator: Allocator, grammar: *const gp.Grammar, input: []const u8, rule: usize, pos: usize) ?Result {
     return run(allocator, grammar, input, rule, pos, false);
+}
+
+/// The literals the grammar could take at the end of `input`: those tried
+/// there when it is parsed from `start_rule` (`'while'`, `'let'` after a
+/// complete statement; `'-'`, `'('` after `let x =`), as they are, in the
+/// order they were tried, copied into `out`. Not the literals of
+/// lookaheads (`!keyword`) or of rules that can match nothing (whitespace).
+/// Empty if the parse doesn't get to the end (an error before it), null if
+/// it was abandoned.
+pub fn expectedLiterals(allocator: Allocator, out: Allocator, grammar: *const gp.Grammar, input: []const u8, start_rule: usize) ?[]const []const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var found: std.ArrayList([]const u8) = .empty;
+    var interp = newInterp(arena.allocator(), grammar, input) orelse return null;
+    interp.collect = &found;
+    interp.collect_at = input.len;
+    if (start_rule >= grammar.rules.len) return null;
+    _ = interp.rule(start_rule, 0) catch return null;
+    const copy = out.alloc([]const u8, found.items.len) catch return null;
+    for (copy, found.items) |*slot, lit| slot.* = out.dupe(u8, lit) catch return null;
+    return copy;
+}
+
+/// An interpreter for `grammar` over `input` (its tables in `alloc`).
+fn newInterp(alloc: Allocator, grammar: *const gp.Grammar, input: []const u8) ?Interp {
+    const n = grammar.rules.len;
+    var interp = Interp{
+        .allocator = alloc,
+        .grammar = grammar,
+        .input = input,
+        .skip = alloc.alloc(bool, n) catch return null,
+        .token = alloc.alloc(bool, n) catch return null,
+        .stack_limit = @import("stack.zig").limit(@frameAddress()),
+    };
+    interp.index.ensureTotalCapacity(alloc, @intCast(n)) catch return null;
+    for (grammar.rules, 0..) |r, i| interp.index.putAssumeCapacity(r.name, i);
+    const state = alloc.alloc(u8, n) catch return null;
+    @memset(state, 0);
+    for (grammar.rules, 0..) |r, i| {
+        const ref = gp.Expr{ .tag = .reference, .ref_name = r.name };
+        interp.skip[i] = r.silent and nullable(grammar, &interp.index, state, &ref);
+        interp.token[i] = !r.silent and !gp.ruleHasChildren(grammar, r);
+    }
+    return interp;
 }
 
 fn run(allocator: Allocator, grammar: *const gp.Grammar, input: []const u8, start_rule: usize, pos: usize, whole: bool) ?Result {

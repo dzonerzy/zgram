@@ -2588,6 +2588,63 @@ const GrammarParser = struct {
         return .{ .value = list };
     }
 
+    /// The literals the grammar could take at byte `offset` of `input` (its
+    /// end by default), given the text before it: what an editor completes
+    /// there (`'while'`, `'let'` after a statement; `'-'`, `'('` after
+    /// `let x =`). Empty when the text before has an error the parse can't
+    /// get past.
+    pub fn expected(self: *GrammarParser, args: pyoz.Args(struct { input: *pyoz.PyObject, offset: ?i64 = null, start: ?*pyoz.PyObject = null })) pyoz.Signature(?*pyoz.PyObject, "list[str]") {
+        const compiled = self._compiled orelse {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
+            return .{ .value = null };
+        };
+        const input = args.value.input;
+        var len: py.Py_ssize_t = 0;
+        const ptr: [*]const u8 = blk: {
+            if (py.PyUnicode_Check(input)) break :blk py.c.PyUnicode_AsUTF8AndSize(input, &len) orelse return .{ .value = null };
+            if (py.PyBytes_Check(input)) {
+                var p: [*]u8 = undefined;
+                if (py.PyBytes_AsStringAndSize(input, &p, &len) < 0) return .{ .value = null };
+                break :blk p;
+            }
+            py.PyErr_SetString(py.PyExc_TypeError(), "input must be str or bytes");
+            return .{ .value = null };
+        };
+        const total: usize = @intCast(len);
+        const offset: usize = if (args.value.offset) |o| @intCast(std.math.clamp(o, 0, @as(i64, @intCast(total)))) else total;
+        var start_rule: usize = 0;
+        if (args.value.start) |s| {
+            if (s != py.Py_None()) {
+                if (!py.PyUnicode_Check(s)) {
+                    py.PyErr_SetString(py.PyExc_TypeError(), "start must be a rule name (str)");
+                    return .{ .value = null };
+                }
+                var slen: py.Py_ssize_t = 0;
+                const sptr = py.c.PyUnicode_AsUTF8AndSize(s, &slen) orelse return .{ .value = null };
+                start_rule = compiled.ruleId(sptr[0..@intCast(slen)]) orelse {
+                    py.PyErr_SetString(py.PyExc_ValueError(), "unknown start rule");
+                    return .{ .value = null };
+                };
+            }
+        }
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const grammar = grammar_parser.parseGrammar(arena.allocator(), compiled.text) catch {
+            _ = py.c.PyErr_NoMemory();
+            return .{ .value = null };
+        };
+        const found = diagnose.expectedLiterals(allocator, arena.allocator(), grammar, ptr[0..offset], start_rule) orelse &.{};
+        const list = py.c.PyList_New(@intCast(found.len)) orelse return .{ .value = null };
+        for (found, 0..) |lit, i| {
+            const item = py.c.PyUnicode_DecodeUTF8(lit.ptr, @intCast(lit.len), "replace") orelse {
+                py.Py_DecRef(list);
+                return .{ .value = null };
+            };
+            _ = py.c.PyList_SetItem(list, @intCast(i), item);
+        }
+        return .{ .value = list };
+    }
+
     fn collectLiterals(arena: std.mem.Allocator, expr: *const grammar_parser.Expr, out: *std.ArrayList([]const u8)) !void {
         switch (expr.tag) {
             .literal => {
@@ -2633,6 +2690,7 @@ const GrammarParser = struct {
     pub const match__doc__: [*:0]const u8 = "Match the start rule at the beginning of the input without requiring it to consume everything. Returns the root Node (see end()), or None if it doesn't match.";
     pub const rules__doc__: [*:0]const u8 = "Names of the grammar's rules, in definition order.";
     pub const literals__doc__: [*:0]const u8 = "The grammar's literals ('let', ';', '=='), each once, in the order they first appear: an editor's keywords and operators.";
+    pub const expected__doc__: [*:0]const u8 = "expected(input, offset=None, start=None): the literals the grammar could take at byte `offset` of `input` (its end by default), given the text before it: what an editor completes there. Empty when the text before has an error the parse can't get past.";
     pub const parse_tree__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and return the Tree: root, nodes, input, rules, fields, and a capsule for native code. Raises ParseError on failure; with recover=True a syntax error doesn't raise: the broken text becomes error nodes (rule '<error>') and tree.errors lists the errors.";
     pub const bind__doc__: [*:0]const u8 = "Supply the classes named by `-> Class` actions: a dict, or an object with them as attributes (a module).";
     pub const bind__params__ = "ast";

@@ -5,6 +5,11 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-10-01
+
+### Added
+- **`parser.expected(input, offset=None, start=None)`**: the literals the grammar could take at a position, given the text before it, in the order they are tried: an editor's keyword completion (`else` only after an `if`'s block, `{` after a `while`'s condition). Lookaheads' literals (`!keyword`) and those of rules that can match nothing (whitespace) aren't included.
+
 ## [0.3.3] - 2026-10-01
 
 ### Added

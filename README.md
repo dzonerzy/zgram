@@ -324,6 +324,7 @@ tree = parser.parse("hello")
 - **`rules() -> list[str]`** -- The grammar's rule names, in definition order.
 - **`fields() -> list[str]`** -- The grammar's labels, in order of first use.
 - **`literals() -> list[str]`** -- The grammar's literals (`'let'`, `';'`, `'=='`), each once, in order of first appearance: an editor's keywords and operators.
+- **`expected(input, offset=None, start=None) -> list[str]`** -- The literals the grammar could take at byte `offset` of `input` (its end by default), given the text before it, in the order they are tried: what an editor completes there (`let`, `if` after a statement; `else` after an `if`'s block; `-` after `let x =`). Empty when the text before has an error the parse can't get past.
 - **`actions() -> list[str | None]`** -- Each rule's `-> name` action, by rule id (`None` for a rule without one).
 - **`error -> ParseErrorInfo | None`** -- Property with error details from the last failed `parse()`/`match()`.
 

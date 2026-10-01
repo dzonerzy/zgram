@@ -459,3 +459,34 @@ def test_literals():
     )
     assert p.literals() == ["let", "=", ";", "if", "{", "}", ".", " ", "é"]
     assert zgram.compile("a = [a-z]+").literals() == []
+
+
+def test_expected():
+    p = zgram.compile(
+        r"""
+        program = ws (stmt ws)*
+        @silent stmt = let_stmt | if_stmt
+        let_stmt = 'let' kw ws name ws '=' ws value ws ';'
+        if_stmt = 'if' kw ws name ws block (ws 'else' kw ws block)?
+        block = '{' ws (stmt ws)* '}'
+        @silent value = num | '-' num | name
+        name = !(('let' | 'if' | 'else') kw) [a-z]+
+        num = [0-9]+
+        @silent kw = ![a-z]
+        @silent ws = ' '*
+        """
+    )
+    # what could come next, in the order tried; not the lookaheads' literals
+    assert p.expected("") == ["let", "if"]
+    assert p.expected("let x = ") == ["-"]
+    assert p.expected("if x { let y = 1; } ") == ["else", "let", "if"]
+    assert p.expected("if x { ") == ["let", "if", "}"]
+    # at an offset: the text before it counts, not what follows
+    text = "let a = 1; let b = 2;"
+    assert p.expected(text, offset=11) == ["let", "if"]
+    assert p.expected(b"let a = ") == ["-"]
+    # past an error: nothing
+    assert p.expected("let = ") == []
+    with pytest.raises(ValueError, match="unknown start rule"):
+        p.expected("", start="nope")
+    assert p.expected("", start="block") == ["{"]
