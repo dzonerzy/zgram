@@ -2744,7 +2744,6 @@ const GrammarParser = struct {
 // Module-level functions
 // ============================================================================
 
-/// Return zgram version
 /// zgram.llvm_capsule(): the "zgram.llvm.v1" capsule (llvm_capsule.zig):
 /// zgram's LLVM for native code in other packages.
 fn llvm_capsule() pyoz.Signature(?*pyoz.PyObject, "object") {
@@ -2859,7 +2858,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("clear_cache", clear_cache, "Drop cached compiled grammars"),
         pyoz.func("dump_ir", dump_ir, "Dump LLVM IR text for a grammar").withParams("grammar"),
         pyoz.func("version", version, "Return zgram version string"),
-        pyoz.func("llvm_capsule", llvm_capsule, "The 'zgram.llvm.v1' capsule: zgram's LLVM for native code in other packages (compile LLVM IR text and JIT it, or emit an object file). See src/llvm_capsule.zig for its layout."),
+        pyoz.func("llvm_capsule", llvm_capsule, "The 'zgram.llvm.v1' capsule: zgram's LLVM for native code in other packages (LLVM's C API to build modules in memory; zgram's JIT to compile them, or an object file). See src/llvm_capsule.zig for its layout."),
     },
     .classes = &.{
         pyoz.class("Node", Node),
