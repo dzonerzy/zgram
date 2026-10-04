@@ -120,6 +120,26 @@ const Codegen = struct {
     helper_recover_step_type: LB.Type = null,
     helper_error_node: LB.Value = null,
     helper_error_node_type: LB.Type = null,
+    helper_insert_guess: LB.Value = null,
+    helper_insert_guess_type: LB.Type = null,
+    helper_guesses_since: LB.Value = null,
+    helper_guesses_since_type: LB.Type = null,
+    /// The optional groups whose first literal may be guessed, in the
+    /// sequence being emitted (see emitSequence)
+    guess_sites: []const GuessSite = &.{},
+    /// The next site id (shared by every rule's Codegen)
+    next_site: *u32 = undefined,
+};
+
+/// An optional group `(ws '=' ws value)?` whose first item, a literal, may
+/// be guessed at a known error: its group sequence, its site id, its bit in
+/// `disabled` (the guesses the sequence around it turned off after failing
+/// with them).
+const GuessSite = struct {
+    group: *const gp.Expr,
+    site: u32,
+    bit: u32,
+    disabled: LB.Value,
 };
 
 /// Generate an LLVM module from a parsed grammar.
@@ -272,7 +292,18 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
     var helper_recover_step: LB.Value = null;
     var helper_error_node: LB.Value = null;
     var helper_insert_here: LB.Value = null;
+    // i32 zgram_insert_guess(ptr output, ptr input, i64 pos, ptr text, i32 len, i32 site)
+    const helper_insert_guess_type = b.fnType(b.i32, &.{ b.ptr, b.ptr, b.i64, b.ptr, b.i32, b.i32 });
+    // i32 zgram_guesses_since(ptr output, i32 from, i32 lo)
+    const helper_guesses_since_type = b.fnType(b.i32, &.{ b.ptr, b.i32, b.i32 });
+    var helper_insert_guess: LB.Value = null;
+    var helper_guesses_since: LB.Value = null;
+    var next_site: u32 = 1;
     if (mode == .recover) {
+        helper_insert_guess = b.addFunction("zgram_insert_guess", helper_insert_guess_type);
+        helper_guesses_since = b.addFunction("zgram_guesses_since", helper_guesses_since_type);
+        b.addFnAttr(helper_insert_guess, "nounwind");
+        b.addFnAttr(helper_guesses_since, "nounwind");
         helper_recover_error = b.addFunction("zgram_recover_error", helper_recover_error_type);
         helper_recover_begin = b.addFunction("zgram_recover_begin", helper_recover_begin_type);
         helper_recover_step = b.addFunction("zgram_recover_step", helper_recover_step_type);
@@ -318,6 +349,11 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
             .nullable = nullable,
             .helper_insert_here = helper_insert_here,
             .helper_insert_here_type = helper_insert_here_type,
+            .helper_insert_guess = helper_insert_guess,
+            .helper_insert_guess_type = helper_insert_guess_type,
+            .helper_guesses_since = helper_guesses_since,
+            .helper_guesses_since_type = helper_guesses_since_type,
+            .next_site = &next_site,
             .helper_recover_error = helper_recover_error,
             .helper_recover_error_type = helper_recover_error_type,
             .helper_recover_begin = helper_recover_begin,
@@ -913,6 +949,92 @@ fn emitReference(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: 
 
 /// Emit sequence: match each child in order, fail if any fails.
 fn emitSequence(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
+    if (cg.mode != .recover) return emitItems(cg, expr, null, pos, fail_block);
+    // (an optional group of the sequence around: its first literal may be
+    // guessed; looked up before this sequence's own groups replace them)
+    const guess = for (cg.guess_sites) |*s| {
+        if (s.group == expr) break s;
+    } else null;
+    var groups: [32]*const gp.Expr = undefined;
+    const n = guessGroups(cg, expr, &groups);
+    if (n == 0) return emitItems(cg, expr, guess, pos, fail_block);
+    return emitGuessing(cg, expr, groups[0..n], guess, pos, fail_block);
+}
+
+/// The optional groups of a sequence whose first item may be guessed
+/// (recover mode): `(ws '=' ws value)?`, its first consuming item a
+/// literal of punctuation that opens no bracket. At most 32; none in a
+/// folding rule's sequence (its iterations' state isn't rolled back).
+fn guessGroups(cg: *const Codegen, expr: *const gp.Expr, out: *[32]*const gp.Expr) usize {
+    var n: usize = 0;
+    for (expr.children orelse return 0) |child| {
+        if (cg.fold_rep == child) return 0;
+        if (n == out.len) break;
+        if (child.tag != .repetition or child.rep_kind != '?') continue;
+        const group = child.rep_expr orelse continue;
+        if (group.tag != .sequence) continue;
+        const first = for (group.children orelse continue) |item| {
+            if (consumes(cg, item)) break item;
+        } else continue;
+        const lit = first.literal_value orelse continue;
+        if (first.tag != .literal or !isPunctuation(lit) or opensBracket(lit)) continue;
+        out[n] = group;
+        n += 1;
+    }
+    return n;
+}
+
+/// A sequence with optional groups whose first literal may be guessed at a
+/// known error (`let end start.plus(3);`: is `start.plus(3)` a type after a
+/// missing `:`, or a value after a missing `=`?). The guesses are tried in
+/// order; if the sequence fails after some, it is tried again without them,
+/// until it matches or fails without a guess: then `=` wins, the `:` reading
+/// failing at `.`.
+fn emitGuessing(cg: *Codegen, expr: *const gp.Expr, groups: []const *const gp.Expr, guess: ?*const GuessSite, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
+    const b = cg.b;
+    const entry = b.getCurrentBlock();
+    const nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "guess_nc_ptr");
+    const saved_nc = b.load(b.i32, nc_ptr, 4, "guess_saved_nc");
+    const saved_cc = saveChildCount(cg);
+    const ins_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_INSERTED_COUNT)}, "guess_ins_ptr");
+    const from = b.load(b.i32, ins_ptr, 4, "guess_from");
+    const attempt = try b.newBlock("guess_attempt");
+    const failed = try b.newBlock("guess_failed");
+    const again = try b.newBlock("guess_again");
+    _ = b.br(attempt);
+
+    b.positionAtEnd(attempt);
+    const disabled = b.phi(b.i32, "guess_disabled");
+    const lo = cg.next_site.*;
+    cg.next_site.* += @intCast(groups.len);
+    var sites: [32]GuessSite = undefined;
+    for (groups, 0..) |g, i| sites[i] = .{ .group = g, .site = lo + @as(u32, @intCast(i)), .bit = @as(u32, 1) << @intCast(i), .disabled = disabled };
+    const saved_sites = cg.guess_sites;
+    cg.guess_sites = sites[0..groups.len];
+    const end = try emitItems(cg, expr, guess, pos, failed);
+    cg.guess_sites = saved_sites;
+    const done = b.getCurrentBlock();
+
+    // Failed: again without the guesses it made, if any is new
+    b.positionAtEnd(failed);
+    const used = b.call(cg.helper_guesses_since_type, cg.helper_guesses_since, &.{ cg.output_ptr, from, b.constInt(b.i32, lo) }, "guess_used");
+    const fresh = b.@"and"(used, b.xor(disabled, b.constInt(b.i32, 0xFFFF_FFFF), "guess_enabled"), "guess_fresh");
+    _ = b.condBr(b.icmp(.ne, fresh, b.constInt(b.i32, 0), "guess_retry"), again, fail_block);
+
+    b.positionAtEnd(again);
+    restoreState(cg, nc_ptr, saved_nc, saved_cc);
+    _ = b.store(from, ins_ptr, 4);
+    const next = b.@"or"(disabled, used, "guess_next");
+    _ = b.br(attempt);
+    b.addIncoming(disabled, &.{ b.constInt(b.i32, 0), next }, &.{ entry, again });
+
+    b.positionAtEnd(done);
+    return end;
+}
+
+/// The items of a sequence, in order; `guess`: the sequence is an optional
+/// group whose first literal may be guessed.
+fn emitItems(cg: *Codegen, expr: *const gp.Expr, guess: ?*const GuessSite, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
     const children = expr.children orelse return CodegenError.InvalidGrammar;
     var cur_pos = pos;
     // Whether an earlier item must have consumed input
@@ -930,10 +1052,15 @@ fn emitSequence(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: L
         // repetition: `f(a 2)` is missing a `,`.
         // Nor is an opening bracket inserted: `(` would start a construct
         // that then needs its own closing one (`a 2)` read as a call `a (2)`)
+        // And in an optional group, its first literal may be guessed (see
+        // emitGuessing)
         const insertable = child.tag == .literal and !opensBracket(child.literal_value orelse "") and
             (started or (repeated and isPunctuation(child.literal_value orelse "")));
-        if (cg.mode == .recover and insertable) {
-            cur_pos = try emitInsertableLiteral(cg, child, cur_pos, fail_block);
+        const guessed = guess != null and !started and child.tag == .literal and consumes(cg, child);
+        if (cg.mode == .recover and guessed) {
+            cur_pos = try emitInsertableLiteral(cg, child, cur_pos, fail_block, guess);
+        } else if (cg.mode == .recover and insertable) {
+            cur_pos = try emitInsertableLiteral(cg, child, cur_pos, fail_block, null);
         } else {
             cur_pos = try emitExpr(cg, child, cur_pos, fail_block);
         }
@@ -979,8 +1106,9 @@ fn consumes(cg: *const Codegen, expr: *const gp.Expr) bool {
     };
 }
 
-/// A literal that recovery may insert: see emitSequence.
-fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!LB.Value {
+/// A literal that recovery may insert: see emitSequence. `guess`: it is
+/// guessed, unless the sequence around turned that guess off.
+fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB.Block, guess: ?*const GuessSite) CodegenError!LB.Value {
     const b = cg.b;
     const missing = try b.newBlock("ins_missing");
     const inserted = try b.newBlock("ins_inserted");
@@ -1007,8 +1135,17 @@ fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail
     const text_len = b.constInt(b.i32, @intCast(text.len));
     _ = b.store(b.select(further, text_len, len_cur, "ins_len_new"), len_ptr, 4);
     _ = b.store(b.select(further, text_global, text_cur, "ins_text_new"), text_ptr, 8);
-    const here = b.call(cg.helper_insert_here_type, cg.helper_insert_here, &.{ cg.output_ptr, cg.input_ptr, pos, text_global, text_len }, "ins_here");
-    _ = b.condBr(b.icmp(.ne, here, b.constInt(b.i32, 0), "ins_known"), inserted, fail_block);
+    if (guess) |g| {
+        const allowed = try b.newBlock("ins_guess_allowed");
+        const off = b.@"and"(g.disabled, b.constInt(b.i32, g.bit), "ins_guess_off");
+        _ = b.condBr(b.icmp(.eq, off, b.constInt(b.i32, 0), "ins_guess_on"), allowed, fail_block);
+        b.positionAtEnd(allowed);
+        const here = b.call(cg.helper_insert_guess_type, cg.helper_insert_guess, &.{ cg.output_ptr, cg.input_ptr, pos, text_global, text_len, b.constInt(b.i32, g.site) }, "ins_guess");
+        _ = b.condBr(b.icmp(.ne, here, b.constInt(b.i32, 0), "ins_known"), inserted, fail_block);
+    } else {
+        const here = b.call(cg.helper_insert_here_type, cg.helper_insert_here, &.{ cg.output_ptr, cg.input_ptr, pos, text_global, text_len }, "ins_here");
+        _ = b.condBr(b.icmp(.ne, here, b.constInt(b.i32, 0), "ins_known"), inserted, fail_block);
+    }
 
     b.positionAtEnd(inserted);
     _ = b.br(merge);
@@ -1844,6 +1981,18 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
             saved_cc = saveChildCount(cg);
         }
 
+        // (a group whose first literal may be guessed: a guess it made goes
+        // if it fails)
+        const guessing = for (cg.guess_sites) |s| {
+            if (s.group == sub) break true;
+        } else false;
+        var ins_ptr: LB.Value = null;
+        var saved_ins: LB.Value = null;
+        if (guessing) {
+            ins_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_INSERTED_COUNT)}, "opt_ins_ptr");
+            saved_ins = b.load(b.i32, ins_ptr, 4, "opt_saved_ins");
+        }
+
         const result_pos = try emitExpr(cg, sub, pos, try_fail);
         const success_block = b.getCurrentBlock();
         _ = b.br(merge);
@@ -1851,6 +2000,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         // Fail: restore node_count if needed, use original pos
         b.positionAtEnd(try_fail);
         if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
+        if (guessing) _ = b.store(saved_ins, ins_ptr, 4);
         _ = b.br(merge);
 
         // Merge

@@ -192,12 +192,40 @@ def typed():
 
 
 class TestWhatIsInserted:
-    def test_not_what_begins_an_optional_part(self, typed):
-        # `:` begins the optional type after the whitespace: inventing it
-        # would make `start` a type and leave `.plus` unparseable
+    def test_what_begins_an_optional_part_is_guessed(self, typed):
+        # `:` begins the optional type: guessed, `start` is the type, and
+        # the statement keeps its `;`
         t = typed.parse_tree("let a = 1;\nlet b start;\nlet c = 3;\n", recover=True)
-        assert [(n.rule(), n.text()) for n in t.root] == [("let_stmt", "let a = 1;"), ("let_stmt", "let b "), ("ident", "start"), ("let_stmt", "let c = 3;")]
-        assert len(t.errors) == 1
+        assert [(n.rule(), n.text()) for n in t.root] == [("let_stmt", "let a = 1;"), ("let_stmt", "let b start;"), ("let_stmt", "let c = 3;")]
+        assert t.root[1].get("type").text() == "start"
+        assert errors(t) == [(2, 7, "expected ':', '=' or ';'")]
+
+    def test_a_guess_the_rest_of_the_statement_refutes(self):
+        # `:` first: `start` would be the type, and then `.plus` can't
+        # follow; the statement is tried again without that guess, and `=`
+        # makes all of it the value
+        p = zgram.compile(
+            r"""
+            program = ws (stmt ws)*
+            @silent stmt = let_stmt | expr_stmt
+            let_stmt = 'let' kw ws name:ident (ws ':' ws type:ident)? (ws '=' ws value:expr)? ws ';'
+            @silent expr_stmt = expr ws ';'
+            @postfix expr = target:ident (member | args)*
+            member = '.' name:ident
+            args = '(' ws (expr (ws ',' ws expr)*)? ws ')'
+            ident = !('let' kw) [a-z]+ / [0-9]+
+            @silent kw = ![a-z]
+            @silent ws = [ \n]*
+            """
+        )
+        t = p.parse_tree("let end start.plus(3);\nlet x = 2;\n", recover=True)
+        assert [(n.rule(), n.text()) for n in t.root] == [("let_stmt", "let end start.plus(3);"), ("let_stmt", "let x = 2;")]
+        stmt = t.root[0]
+        assert stmt.get("type") is None and stmt.get("value").text() == "start.plus(3)"
+        assert errors(t) == [(1, 9, "expected ':', '=' or ';'")]
+        # and a missing `:` is guessed where a type fits
+        t = p.parse_tree("let x int;\nlet y = 2;\n", recover=True)
+        assert t.root[0].get("type").text() == "int" and len(t.errors) == 1
 
     def test_a_closing_bracket_before_whitespace(self, typed):
         # the furthest failure is at the space before `->`; the `)` is missing after it

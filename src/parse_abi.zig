@@ -190,11 +190,14 @@ pub const ParseOutput = extern struct {
     inserted_capacity: u32 = 0,
 };
 
-/// A literal recovery took as present (zero-width) at `pos`
+/// A literal recovery took as present (zero-width) at `pos`. `site`: for
+/// a guessed one (the first item of an optional group, see emitSequence),
+/// the place in the grammar it was guessed at; 0 for the others
 pub const Inserted = extern struct {
     pos: u32,
     len: u32,
     text: [*]const u8,
+    site: u32 = 0,
 };
 
 /// An error node's start, and the rule the broken element begins with
@@ -222,6 +225,7 @@ pub const OFF_LIT_POS = @offsetOf(ParseOutput, "lit_pos");
 pub const OFF_LIT_LEN = @offsetOf(ParseOutput, "lit_len");
 pub const OFF_LIT_TEXT = @offsetOf(ParseOutput, "lit_text");
 pub const OFF_STACK_LIMIT = @offsetOf(ParseOutput, "stack_limit");
+pub const OFF_INSERTED_COUNT = @offsetOf(ParseOutput, "inserted_count");
 
 // Compile-time ABI assertions
 comptime {

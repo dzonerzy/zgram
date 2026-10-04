@@ -106,11 +106,36 @@ pub export fn zgram_insert_here(output: *abi.ParseOutput, input_ptr: [*]const u8
     if (!near) return 0;
     if (output.inserted) |list| {
         if (output.inserted_count < output.inserted_capacity) {
-            list[output.inserted_count] = .{ .pos = @intCast(pos), .len = len, .text = text };
+            list[output.inserted_count] = .{ .pos = @intCast(pos), .len = len, .text = text, .site = 0 };
             output.inserted_count += 1;
         }
     }
     return 1;
+}
+
+/// May the first literal of an optional group, missing at `pos`, be
+/// guessed there (at the grammar's place `site`)? As zgram_insert_here, but
+/// only if the guess can be noted: the sequence around the group learns
+/// from the note (zgram_guesses_since) that a failure came after a guess.
+pub export fn zgram_insert_guess(output: *abi.ParseOutput, input_ptr: [*]const u8, pos: u64, text: [*]const u8, len: u32, site: u32) callconv(.c) i32 {
+    const list = output.inserted orelse return 0;
+    if (output.inserted_count >= output.inserted_capacity) return 0;
+    if (zgram_insert_here(output, input_ptr, pos, text, len) == 0) return 0;
+    list[output.inserted_count - 1].site = site;
+    return 1;
+}
+
+/// The guesses noted since the `from`-th insertion at the sites lo ..
+/// lo + 31, as bits (site lo: bit 0).
+pub export fn zgram_guesses_since(output: *abi.ParseOutput, from: u32, lo: u32) callconv(.c) u32 {
+    const list = output.inserted orelse return 0;
+    var mask: u32 = 0;
+    var i = from;
+    while (i < output.inserted_count) : (i += 1) {
+        const site = list[i].site;
+        if (site >= lo and site - lo < 32) mask |= @as(u32, 1) << @intCast(site - lo);
+    }
+    return mask;
 }
 
 fn allSpace(text: []const u8) bool {
