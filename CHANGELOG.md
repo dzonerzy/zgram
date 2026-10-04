@@ -5,6 +5,12 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`parser.labels()`**: each rule's labels, as `(label, many)` pairs, `many` when the label is a list in the AST (inside `*`/`+`, on a silent rule that repeats, or used twice). For tools that read labelled fields without building the AST (zrun).
+- **`zgram.llvm_capsule()`** (`"zgram.llvm.v1"`, `zgram.LLVM_ABI`): zgram's LLVM for native code in other packages, so a package generating code (zrun) uses the LLVM zgram carries instead of a second copy. LLVM IR as text in: compiled (parsed, verified, optimized for this CPU) into zgram's JIT, with native functions callable by name and each module's code freed on its own; or emitted as an object file for any x86-64 target. The layout is `src/llvm_capsule.zig`.
+
 ## [0.3.5] - 2026-10-04
 
 ### Fixed

@@ -45,7 +45,7 @@ pub const JitError = error{
 };
 
 /// Global LLJIT instance — created once, reused across all grammar compilations.
-var global_jit: ?c.LLVMOrcLLJITRef = null;
+pub var global_jit: ?c.LLVMOrcLLJITRef = null;
 var jit_initialized: bool = false;
 /// Counter for creating unique entry point names per grammar compilation.
 var dylib_counter: u64 = 0;
@@ -56,18 +56,18 @@ var dylib_counter: u64 = 0;
 /// and rarely overlap.
 var jit_lock: std.atomic.Value(bool) = .init(false);
 
-fn lockJit() void {
+pub fn lockJit() void {
     while (jit_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
         std.Thread.yield() catch {};
     }
 }
 
-fn unlockJit() void {
+pub fn unlockJit() void {
     jit_lock.store(false, .release);
 }
 
 /// Initialize the LLVM JIT subsystem. Called once on first compile.
-fn initJit() JitError!void {
+pub fn initJit() JitError!void {
     if (jit_initialized) return;
 
     // Initialize native target
@@ -130,6 +130,12 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
 /// Run the full LLVM optimization pipeline on a module.
 /// Uses the new pass manager with O3 + vectorization + loop opts targeting the host CPU.
 fn optimizeModule(jit: c.LLVMOrcLLJITRef, module: c.LLVMModuleRef) JitError!void {
+    return optimizeModuleWith(jit, module, "default<O3>");
+}
+
+/// The same with another pass pipeline ("default<O1>"...), for the
+/// zgram.llvm.v1 capsule.
+pub fn optimizeModuleWith(jit: c.LLVMOrcLLJITRef, module: c.LLVMModuleRef, pipeline: [*:0]const u8) JitError!void {
     // Target the JIT's own triple (the process it runs in), with the host
     // CPU and its features. LLVMGetDefaultTargetTriple
     // is fixed when LLVM is built, and the bundled Windows LLVM was built on
@@ -177,8 +183,7 @@ fn optimizeModule(jit: c.LLVMOrcLLJITRef, module: c.LLVMModuleRef) JitError!void
     c.LLVMPassBuilderOptionsSetMergeFunctions(opts, 1);
     c.LLVMPassBuilderOptionsSetInlinerThreshold(opts, 500);
 
-    // Run the full O3 pipeline
-    try handleError(c.LLVMRunPasses(module, "default<O3>", tm, opts));
+    try handleError(c.LLVMRunPasses(module, pipeline, tm, opts));
 }
 
 /// Opaque handle for tracking JIT resources associated with a compiled grammar.

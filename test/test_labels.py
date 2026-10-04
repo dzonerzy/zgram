@@ -25,6 +25,19 @@ def test_fields_in_order_of_first_use(parser):
     assert parser.fields() == ["cond", "then", "else_", "body", "name", "args"]
 
 
+def test_labels_per_rule(parser):
+    # (label, many): many inside * / +, or on a silent rule that repeats
+    # (args:arglist, each argument gets the label); else one child or none
+    by_rule = dict(zip(parser.rules(), parser.labels()))
+    assert by_rule["if_stmt"] == [("cond", False), ("then", False), ("else_", False)]
+    assert by_rule["block"] == [("body", True)]
+    assert by_rule["call"] == [("name", False), ("args", True)]
+    assert by_rule["num"] == [] and len(parser.labels()) == len(parser.rules())
+    # a label used twice is many too
+    p = zgram.compile("pair = a:x ',' a:x\nx = [a-z]")
+    assert p.labels()[0] == [("a", True)]
+
+
 def test_no_labels():
     p = zgram.compile("root = item+\nitem = [a-z]")
     assert p.fields() == []

@@ -6,6 +6,7 @@ const abi = @import("parse_abi.zig");
 const grammar_parser = @import("grammar_parser.zig");
 const jit_codegen = @import("jit_codegen.zig");
 const jit_compiler = @import("jit_compiler.zig");
+const llvm_capsule_mod = @import("llvm_capsule.zig");
 const jit_helpers = @import("jit_helpers.zig");
 const diagnose = @import("diagnose.zig");
 const native_stack = @import("stack.zig");
@@ -2341,10 +2342,10 @@ const GrammarParser = struct {
             raiseNamed(py.PyExc_ValueError(), "the grammar uses `-> ", compiled.action_names[rid], "`: compile with ast=... (or call bind()) before parse_ast()");
             return error.PythonError;
         };
-        const labels = compiled.labels[compiled.label_start[rid]..compiled.label_start[rid + 1]];
+        const rule_labels = compiled.labels[compiled.label_start[rid]..compiled.label_start[rid + 1]];
         const table = t._rules.?;
 
-        var any_labelled = labels.len != 0;
+        var any_labelled = rule_labels.len != 0;
         var ci: u32 = i + 1;
         for (0..kids.len) |_| {
             if (t._nodes.?[ci].field_id() != 0) any_labelled = true;
@@ -2359,7 +2360,7 @@ const GrammarParser = struct {
         } else if (any_labelled) {
             const kwargs = py.c.PyDict_New() orelse return error.PythonError;
             defer py.Py_DecRef(kwargs);
-            for (labels) |l| {
+            for (rule_labels) |l| {
                 const initial = if (l.many) py.c.PyList_New(0) orelse return error.PythonError else py.Py_None();
                 defer if (l.many) py.Py_DecRef(initial);
                 if (py.PyDict_SetItem(kwargs, table.fields[l.field - 1], initial) != 0) return error.PythonError;
@@ -2373,7 +2374,7 @@ const GrammarParser = struct {
                 if (field == 0 or field > table.fields.len) continue;
                 const key = table.fields[field - 1];
                 var many = false;
-                for (labels) |l| {
+                for (rule_labels) |l| {
                     if (l.field == field) many = l.many;
                 }
                 if (many) {
@@ -2557,6 +2558,43 @@ const GrammarParser = struct {
         return .{ .value = list };
     }
 
+    /// The labels of each rule, by rule id: `(label, many)` pairs, `many`
+    /// when the label is inside `*`/`+` or used twice (a list in the AST).
+    pub fn labels(self: *GrammarParser) pyoz.Signature(?*pyoz.PyObject, "list[list[tuple[str, bool]]]") {
+        const compiled = self._compiled orelse {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
+            return .{ .value = null };
+        };
+        const tbl = self.ruleTable() catch {
+            py.PyErr_SetString(py.PyExc_RuntimeError(), "parser not loaded");
+            return .{ .value = null };
+        };
+        const n = compiled.label_start.len - 1;
+        const list = py.c.PyList_New(@intCast(n)) orelse return .{ .value = null };
+        for (0..n) |r| {
+            const uses = compiled.labels[compiled.label_start[r]..compiled.label_start[r + 1]];
+            const inner = py.c.PyList_New(@intCast(uses.len)) orelse {
+                py.Py_DecRef(list);
+                return .{ .value = null };
+            };
+            _ = py.c.PyList_SetItem(list, @intCast(r), inner);
+            for (uses, 0..) |l, i| {
+                const pair = py.c.PyTuple_New(2) orelse {
+                    py.Py_DecRef(list);
+                    return .{ .value = null };
+                };
+                const name = tbl.fields[l.field - 1];
+                py.Py_IncRef(name);
+                _ = py.c.PyTuple_SetItem(pair, 0, name);
+                const many = if (l.many) py.Py_True() else py.Py_False();
+                py.Py_IncRef(many);
+                _ = py.c.PyTuple_SetItem(pair, 1, many);
+                _ = py.c.PyList_SetItem(inner, @intCast(i), pair);
+            }
+        }
+        return .{ .value = list };
+    }
+
     /// The grammar's literals (`'let'`, `';'`, `'=='`), each once, in the
     /// order they first appear: an editor's keywords and operators.
     pub fn literals(self: *GrammarParser) pyoz.Signature(?*pyoz.PyObject, "list[str]") {
@@ -2697,6 +2735,7 @@ const GrammarParser = struct {
     pub const parse_ast__doc__: [*:0]const u8 = "Parse a str (or UTF-8 bytes) and convert the tree to values as the rules' `-> name` actions say. Objects built by `-> Class` get __zspan__ = (start, end) and __znode__ = the node's index, unless spans=False. Raises ParseError on failure; with recover=True a syntax error doesn't raise and the broken text is None in the result.";
     pub const actions__doc__: [*:0]const u8 = "The `-> name` action of each rule, by rule id: a built-in, a class name, or None for a rule without an action.";
     pub const fields__doc__: [*:0]const u8 = "Names of the grammar's labels (label:rule), in order of first use.";
+    pub const labels__doc__: [*:0]const u8 = "The labels of each rule, by rule id: a list of (label, many) pairs, many when the label is inside * / + or used twice (a list in the AST).";
     pub const matches__doc__: [*:0]const u8 = "Does the whole input match the grammar? Several times faster than parse(): builds no tree. On False, `error` explains the rejection. start= names the start rule.";
     pub const error__doc__: [*:0]const u8 = "ParseError from the last failed parse (message, line, column, offset), or None.";
 };
@@ -2706,6 +2745,12 @@ const GrammarParser = struct {
 // ============================================================================
 
 /// Return zgram version
+/// zgram.llvm_capsule(): the "zgram.llvm.v1" capsule (llvm_capsule.zig):
+/// zgram's LLVM for native code in other packages.
+fn llvm_capsule() pyoz.Signature(?*pyoz.PyObject, "object") {
+    return .{ .value = py.c.PyCapsule_New(@ptrCast(@constCast(&llvm_capsule_mod.view)), llvm_capsule_mod.CAPSULE_NAME, null) };
+}
+
 fn version() []const u8 {
     return @import("build_options").version;
 }
@@ -2806,6 +2851,7 @@ pub const Module = pyoz.module(.{
     .doc = "zgram - PEG parser generator. Compiles grammars to native code via LLVM JIT.",
     .consts = &.{
         pyoz.constant("TREE_ABI", @as(i64, abi.TREE_ABI)),
+        pyoz.constant("LLVM_ABI", @as(i64, llvm_capsule_mod.LLVM_ABI)),
     },
     .funcs = &.{
         pyoz.func("compile", compile, "Compile a grammar string into a native parser. ast= supplies the classes named by `-> Class` actions."),
@@ -2813,6 +2859,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("clear_cache", clear_cache, "Drop cached compiled grammars"),
         pyoz.func("dump_ir", dump_ir, "Dump LLVM IR text for a grammar").withParams("grammar"),
         pyoz.func("version", version, "Return zgram version string"),
+        pyoz.func("llvm_capsule", llvm_capsule, "The 'zgram.llvm.v1' capsule: zgram's LLVM for native code in other packages (compile LLVM IR text and JIT it, or emit an object file). See src/llvm_capsule.zig for its layout."),
     },
     .classes = &.{
         pyoz.class("Node", Node),

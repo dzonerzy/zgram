@@ -308,6 +308,11 @@ zgram.version() -> str
 ```
 Return the zgram version string.
 
+```python
+zgram.llvm_capsule() -> PyCapsule   # "zgram.llvm.v1"
+```
+zgram's LLVM for native code in other packages, so a package that generates code (zrun) doesn't carry a second copy. LLVM IR goes in as text: `compile` parses, verifies and optimizes it for this CPU and adds it to zgram's JIT (`lookup` then gives a function's address, `release` frees the module's code), `define` makes native functions callable from the IR by name, and `emit_object` compiles it to an object file for this or another x86-64 target. Every function is thread-safe and needs no GIL. The layout is `LlvmView` in [`src/llvm_capsule.zig`](https://github.com/dzonerzy/zgram/blob/main/src/llvm_capsule.zig); check its `abi` against `zgram.LLVM_ABI` (currently `1`) first.
+
 ### GrammarParser
 
 ```python
@@ -323,6 +328,7 @@ tree = parser.parse("hello")
 - **`bind(ast) -> None`** -- Supply (or replace) the classes named by `-> Name` actions.
 - **`rules() -> list[str]`** -- The grammar's rule names, in definition order.
 - **`fields() -> list[str]`** -- The grammar's labels, in order of first use.
+- **`labels() -> list[list[tuple[str, bool]]]`** -- Each rule's labels, by rule id, as `(label, many)` pairs: `many` when the label is a list in the AST (inside `*`/`+`, on a silent rule that repeats, or used twice).
 - **`literals() -> list[str]`** -- The grammar's literals (`'let'`, `';'`, `'=='`), each once, in order of first appearance: an editor's keywords and operators.
 - **`expected(input, offset=None, start=None) -> list[str]`** -- The literals the grammar could take at byte `offset` of `input` (its end by default), given the text before it, in the order they are tried: what an editor completes there (`let`, `if` after a statement; `else` after an `if`'s block; `-` after `let x =`). Empty when the text before has an error the parse can't get past.
 - **`actions() -> list[str | None]`** -- Each rule's `-> name` action, by rule id (`None` for a rule without one).
