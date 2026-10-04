@@ -5,7 +5,7 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.5] - 2026-10-04
 
 ### Fixed
 - **Recovery picks the repair the rest of the statement agrees with.** The punctuation that begins an optional part (`(ws '=' ws value)?`, `(ws ':' ws type)?`) is now guessed when it's missing at an error, and a sequence that fails after a guess is tried again without it. `let end start.plus(3);` was `let end` with a `;` made up and `start.plus(3);` a statement of its own; it is now one statement with the value `start.plus(3)` (a missing `=`), and `let x int;` one with the type `int` (a missing `:`). Parsing without recovery is unchanged; recovering from errors costs about 5% more.
