@@ -17,6 +17,8 @@ const c = @cImport({
     @cInclude("llvm-c/TargetMachine.h");
     @cInclude("llvm-c/Transforms/PassBuilder.h");
     @cInclude("llvm-c/IRReader.h");
+    @cInclude("llvm-c/BitWriter.h");
+    @cInclude("llvm-c/BitReader.h");
     @cInclude("llvm-c/Analysis.h");
 });
 

@@ -77,7 +77,8 @@ pub const view = LlvmView{
 /// The C API functions the capsule exports: building modules (contexts,
 /// types, constants, globals, functions, blocks, instructions, attributes,
 /// intrinsics), checking and printing them, reading IR text (for tests and
-/// debugging).
+/// debugging), copying a module into a context of its own (as bitcode: to
+/// compile it on another thread).
 pub const api_names = [_][]const u8{
     // Contexts and modules
     "LLVMContextCreate",                 "LLVMContextDispose",              "LLVMModuleCreateWithNameInContext",
@@ -86,6 +87,8 @@ pub const api_names = [_][]const u8{
     "LLVMDisposeMessage",                "LLVMVerifyModule",                "LLVMVerifyFunction",
     "LLVMSetTarget",                     "LLVMSetDataLayout",               "LLVMGetNamedFunction",
     "LLVMGetNamedGlobal",                "LLVMCreateMemoryBufferWithMemoryRangeCopy", "LLVMParseIRInContext",
+    // Bitcode (a module copied into another context)
+    "LLVMWriteBitcodeToMemoryBuffer",    "LLVMParseBitcodeInContext2",      "LLVMDisposeMemoryBuffer",
     // The host (what object files emit_object makes for it are for: a
     // consumer keeping them notes it)
     "LLVMGetHostCPUName",                "LLVMGetHostCPUFeatures",
