@@ -23,6 +23,7 @@ class LlvmView(ctypes.Structure):
         ("free_bytes", ctypes.CFUNCTYPE(None, P)),
         ("triple", ctypes.CFUNCTYPE(ctypes.c_char_p)),
         ("data_layout", ctypes.CFUNCTYPE(ctypes.c_char_p)),
+        ("load_object", ctypes.CFUNCTYPE(P, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t)),
     ]
 
 
@@ -69,7 +70,7 @@ def llvm():
     get.restype = P
     get.argtypes = [ctypes.py_object, ctypes.c_char_p]
     view = ctypes.cast(get(capsule, b"zgram.llvm.v1"), ctypes.POINTER(LlvmView)).contents
-    assert view.abi == zgram.LLVM_ABI == 1
+    assert view.abi == zgram.LLVM_ABI == 2
     view._capsule = capsule  # (keep it alive)
     view.api = Api(view)
     return view
@@ -158,3 +159,34 @@ def test_target_and_object(llvm):
     assert ptr, err.value
     assert ctypes.string_at(ptr, 2) == b"\x64\x86"  # COFF, x86-64
     llvm.free_bytes(ptr)
+
+
+def test_object_loaded(llvm):
+    # an object file made before (a cache of compiled code), into the JIT,
+    # calling a native function defined by name
+    names = (ctypes.c_char_p * 1)(b"zgram_capsule_obj_base")
+    base = ctypes.c_int64(35)
+    addrs = (ctypes.c_uint64 * 1)(ctypes.addressof(base))
+    err = ctypes.create_string_buffer(ERR)
+    assert llvm.define(names, addrs, 1, err, ERR) == 0, err.value
+    ir = """
+@zgram_capsule_obj_base = external global i64
+define i64 @zgram_capsule_obj_answer(i64 %x) {
+  %b = load i64, ptr @zgram_capsule_obj_base
+  %r = add i64 %b, %x
+  ret i64 %r
+}
+"""
+    n = ctypes.c_size_t(0)
+    ptr = llvm.emit_object(llvm.api.parse(ir), 2, None, None, None, ctypes.byref(n), err, ERR)
+    assert ptr, err.value
+    data = ctypes.string_at(ptr, n.value)
+    llvm.free_bytes(ptr)
+    handle = llvm.load_object(data, len(data), err, ERR)
+    assert handle, err.value
+    f = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_int64)(llvm.lookup(b"zgram_capsule_obj_answer"))
+    assert f(7) == 42
+    llvm.release(handle)
+    assert llvm.lookup(b"zgram_capsule_obj_answer") == 0
+    # bytes that aren't an object: an error
+    assert not llvm.load_object(b"nonsense", 8, err, ERR) and err.value

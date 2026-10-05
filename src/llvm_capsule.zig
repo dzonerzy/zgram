@@ -14,7 +14,7 @@ const jc = @import("jit_compiler.zig");
 const LB = @import("llvm_builder.zig");
 const c = LB.llvm;
 
-pub const LLVM_ABI: u32 = 1;
+pub const LLVM_ABI: u32 = 2;
 pub const CAPSULE_NAME = "zgram.llvm.v1";
 
 /// What the capsule points to. The JIT functions are safe to call from any
@@ -53,6 +53,11 @@ pub const LlvmView = extern struct {
     /// null if the JIT can't start (then compile() says why).
     triple: *const fn () callconv(.c) ?[*:0]const u8,
     data_layout: *const fn () callconv(.c) ?[*:0]const u8,
+    /// Add an object file emit_object() made for this process (compiled
+    /// code kept from before: a cache) to the JIT, as compile() adds a
+    /// module; the bytes are copied. Returns a handle for release(), or
+    /// null with the error in `err`. (ABI 2)
+    load_object: *const fn (bytes: [*]const u8, len: usize, err: [*]u8, err_cap: usize) callconv(.c) ?*anyopaque,
 };
 
 pub const view = LlvmView{
@@ -66,6 +71,7 @@ pub const view = LlvmView{
     .free_bytes = &freeBytes,
     .triple = &triple,
     .data_layout = &dataLayout,
+    .load_object = &loadObject,
 };
 
 /// The C API functions the capsule exports: building modules (contexts,
@@ -80,6 +86,9 @@ pub const api_names = [_][]const u8{
     "LLVMDisposeMessage",                "LLVMVerifyModule",                "LLVMVerifyFunction",
     "LLVMSetTarget",                     "LLVMSetDataLayout",               "LLVMGetNamedFunction",
     "LLVMGetNamedGlobal",                "LLVMCreateMemoryBufferWithMemoryRangeCopy", "LLVMParseIRInContext",
+    // The host (what object files emit_object makes for it are for: a
+    // consumer keeping them notes it)
+    "LLVMGetHostCPUName",                "LLVMGetHostCPUFeatures",
     // Types
     "LLVMInt1TypeInContext",             "LLVMInt8TypeInContext",           "LLVMInt16TypeInContext",
     "LLVMInt32TypeInContext",            "LLVMInt64TypeInContext",          "LLVMIntTypeInContext",
@@ -335,6 +344,22 @@ fn emitObject(module_opt: ?*anyopaque, opt_level: u32, triple_opt: ?[*:0]const u
     @memcpy(out, start[0..size]);
     out_len.* = size;
     return out.ptr;
+}
+
+fn loadObject(bytes: [*]const u8, len: usize, err: [*]u8, err_cap: usize) callconv(.c) ?*anyopaque {
+    const j = jit(err, err_cap) orelse return null;
+    // (the JIT takes the buffer)
+    const buf = c.LLVMCreateMemoryBufferWithMemoryRangeCopy(bytes, len, "zgram.object");
+    jc.lockJit();
+    defer jc.unlockJit();
+    const dylib = c.LLVMOrcLLJITGetMainJITDylib(j);
+    const tracker = c.LLVMOrcJITDylibCreateResourceTracker(dylib);
+    if (c.LLVMOrcLLJITAddObjectFileWithRT(j, tracker, buf)) |e| {
+        setLlvmError(err, err_cap, e);
+        c.LLVMOrcReleaseResourceTracker(tracker);
+        return null;
+    }
+    return @ptrCast(tracker);
 }
 
 fn freeBytes(bytes: ?[*]u8) callconv(.c) void {
