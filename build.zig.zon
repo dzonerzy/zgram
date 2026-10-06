@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .PyOZ = .{
-            .url = "https://github.com/pyozig/PyOZ/archive/refs/tags/v0.13.7.tar.gz",
-            .hash = "PyOZ-0.13.7-ntlpPsAZFQC7KgaLCHdY1Lg3wtMevglufs5ZoJmaw55B",
+            .url = "https://github.com/pyozig/PyOZ/archive/refs/tags/v0.13.9.tar.gz",
+            .hash = "PyOZ-0.13.9-ntlpPv9CFQCcoHQO42xtnvRWM4OphBbj4oABUJLH3ONC",
         },
         .llvm_x86_64_linux = .{
             .url = "https://github.com/dzonerzy/zgram-llvm/releases/download/v21.1.8/llvm-21.1.8-x86_64-linux.tar.xz",
