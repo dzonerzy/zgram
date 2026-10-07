@@ -5,6 +5,11 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-10-07
+
+### Fixed
+- **Windows: Python's exceptions as PyOZ maps errors to them.** The Windows wheel held, for each `PyExc_*` exception, the address of its import slot instead of the exception (PyOZ took the address of Python's data for known while compiling, and the linker filled a table of them with the slots'): raising one of them from that table handed Python a bad pointer. Built with PyOZ 0.13.10, which loads Python's data at run time on Windows and refuses a build with such constants.
+
 ## [0.4.1] - 2026-10-07
 
 ### Changed

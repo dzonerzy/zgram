@@ -59,7 +59,7 @@ jobs:
                   restore-keys: zig-build-${{ matrix.platform }}-
 
             - name: Install PyOZ
-              run: python -m pip install "pyoz>=0.13.7"
+              run: python -m pip install "pyoz>=0.13.10"
 
             - name: Build wheel
               run: pyoz build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
