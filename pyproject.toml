@@ -5,7 +5,7 @@ build-backend = "pyoz.backend"
 [project]
 # "zgram" is taken on PyPI; the import name stays `zgram` (module-name below)
 name = "zgram-py"
-version = "0.5.0"
+version = "0.5.1"
 description = "JIT-compiled PEG parser generator: grammars compile to native SIMD code via LLVM, in-process."
 requires-python = ">=3.10"
 readme = "README.md"

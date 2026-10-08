@@ -5,7 +5,7 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.1] - 2026-10-08
 
 ### Changed
 - **A character class of a few punctuation characters is named by them in error messages**: a separator `[,;]` reads `expected ',', ';' or '}'`, not left out because literals were expected too (up to four printable punctuation characters; other classes as before).
