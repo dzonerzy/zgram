@@ -438,6 +438,119 @@ class TestGrammarFeatures:
         assert parser.match("let a = 1; @@@").text() == "let a = 1; "
 
 
+BLOCKS = r"""
+chunk = ws block
+block = (stmt ws)* (retstat ws)?
+@silent stmt = local_stmt | do_stmt | func_stmt | exprstat
+local_stmt = 'local' kw ws name:ident ws '=' ws value:exp
+do_stmt = 'do' kw ws block 'end' kw
+func_stmt = 'function' kw ws name:ident ws '(' ws ')' ws block 'end' kw
+retstat = 'return' kw (ws exp)?
+exprstat = target:suffixed (ws '=' !'=' ws value:exp)?
+@left exp = left:term (ws op:or_op ws right:term)*
+or_op = 'or' kw
+@silent term = suffixed | num | str | table
+suffixed = name:ident (call | member)*
+call = '(' ws (args:exp (ws ',' ws args:exp)*)? ws ')'
+member = '.' ident
+table = '{' ws (field (ws [,;] ws field)*)? ws '}'
+field = name:ident ws '=' ws value:exp
+num = [0-9]+
+str = '"' [^"\n]* '"'
+ident = !(('local' | 'do' | 'end' | 'function' | 'return' | 'or') kw) [a-z_]+
+@silent kw = ![a-z_]
+@silent ws = ([ \n] | '--' [^\n]*)*
+"""
+
+
+@pytest.fixture(scope="module")
+def blocks():
+    return zgram.compile(BLOCKS)
+
+
+def error_texts(tree):
+    """The text of every error node, in order."""
+    out = []
+
+    def walk(n):
+        if n.rule() == "<error>":
+            out.append(n.text())
+        for c in n:
+            walk(c)
+
+    walk(tree.root)
+    return out
+
+
+class TestBlocks:
+    """Lists of statements in blocks that end with a word (`end`), comments
+    and strings: a stray `)` (the kind of error typing makes) is one error,
+    the rest of the file keeping its structure."""
+
+    def test_brackets_in_comments_and_strings_dont_count(self, blocks):
+        # (a comment's `(` opens nothing: the stray `)` after it is stray)
+        src = '-- see (the notes\nlocal a = "x (y"\n) local b = 2\nlocal c = 3\n'
+        t = blocks.parse_tree(src, recover=True)
+        assert len(t.errors) == 1 and error_texts(t) == [") "]
+        assert [n.rule() for n in t.root[0]] == ["local_stmt", "<error>", "local_stmt", "local_stmt"]
+
+    def test_nothing_resumes_inside_a_comment(self, blocks):
+        src = "do\n  local a = 1\n) -- http: words (here\n  local b = 2\nend\nlocal c = 3\n"
+        t = blocks.parse_tree(src, recover=True)
+        assert len(t.errors) == 1
+        assert error_texts(t) == [") -- http: words (here\n  "]
+        assert [n.rule() for n in t.root[0]] == ["do_stmt", "local_stmt"]
+
+    def test_nothing_resumes_inside_a_string(self, blocks):
+        src = 'function f()\n  local a = 1\n) g("the end of (it)")\n  local b = 2\nend\nlocal c = 3\n'
+        t = blocks.parse_tree(src, recover=True)
+        assert len(t.errors) == 1
+        assert [n.rule() for n in t.root[0]] == ["func_stmt", "local_stmt"]
+
+    def test_a_shorter_statement_matched_is_undone(self, blocks):
+        # (`x` alone is a statement; `x = ) 5` is the broken one)
+        t = blocks.parse_tree("do\n  x = ) 5\n  local b = 2\nend\nlocal c = 3\n", recover=True)
+        assert len(t.errors) == 1 and error_texts(t) == ["x = ) 5\n  "]
+        assert [n.rule() for n in t.root[0]] == ["do_stmt", "local_stmt"]
+
+    def test_a_chain_leaves_the_error_after_it_to_the_list(self, blocks):
+        # (the call's suffixes end before the stray `)`: they don't skip to
+        # the next `.` they'd take)
+        src = "do\n  local a = f(x)\n) local b = 2\n  y = t.z\nend\nlocal c = 3\n"
+        t = blocks.parse_tree(src, recover=True)
+        assert len(t.errors) == 1 and error_texts(t) == [") "]
+        do = t.root[0][0]
+        assert [n.rule() for n in do[0]] == ["local_stmt", "<error>", "local_stmt", "exprstat"]
+
+    def test_a_list_ends_at_a_word_its_element_cant_start_with(self, blocks):
+        src = "function f()\n  local a = 1\n  ) )\n  return a\nend\nlocal c = 3\n"
+        t = blocks.parse_tree(src, recover=True)
+        assert len(t.errors) == 1
+        assert [n.rule() for n in t.root[0]] == ["func_stmt", "local_stmt"]
+
+    def test_broken_text_before_a_closing_word_on_its_line(self, blocks):
+        # (after a return, no list to recover in: the `end` it should be)
+        t = blocks.parse_tree("function f()\n  return 1\n) end\nlocal c = 3\n", recover=True)
+        assert len(t.errors) == 1 and error_texts(t) == [") "]
+        assert [n.rule() for n in t.root[0]] == ["func_stmt", "local_stmt"]
+
+    def test_broken_text_before_a_lists_first_element(self, blocks):
+        src = "local t = {\n  -- fields\n) -- a (comment\n  a = 1,\n  b = 2\n}\nlocal c = 3\n"
+        t = blocks.parse_tree(src, recover=True)
+        assert len(t.errors) == 1 and error_texts(t) == [") -- a (comment\n  "]
+        table = t.root[0][0].get("value")
+        assert [n.rule() for n in table] == ["<error>", "field", "field"]
+
+    def test_several_errors_in_a_big_input(self, blocks):
+        # (each a stray `)`, alone in its statement list: one error each)
+        unit = "function f()\n  local a = g(1, 2) -- a (note\n  local b = \"s (t\"\n{bad}  return a\nend\n"
+        src = "".join(unit.format(bad=") " if i % 50 == 7 else "") for i in range(2000))
+        t = blocks.parse_tree(src, recover=True)
+        assert len(t.errors) == 40
+        assert len(t.root[0].children()) == 2000
+        assert all(n.rule() == "func_stmt" for n in t.root[0])
+
+
 class TestThreads:
     def test_recovering_parser_compiled_once_from_several_threads(self):
         p = zgram.compile(GRAMMAR + "\n# threads\n")

@@ -1695,6 +1695,10 @@ const GrammarParser = struct {
         var recovered: [MAX_RECOVERED * 4]abi.Recovered = undefined;
         var inserted: [MAX_RECOVERED * 4]abi.Inserted = undefined;
         var level: u8 = 0;
+        // The grammar's words (where a list may end: ParseOutput.keywords)
+        var words_arena = std.heap.ArenaAllocator.init(allocator);
+        defer words_arena.deinit();
+        const words = try grammarWords(words_arena.allocator(), compiled.text);
 
         while (true) {
             var output = abi.ParseOutput{};
@@ -1712,6 +1716,13 @@ const GrammarParser = struct {
             output.recovered_capacity = recovered.len;
             output.inserted = &inserted;
             output.inserted_capacity = inserted.len;
+            // (where the code's brackets are: those the parser matches)
+            const brackets = try allocator.alloc(u8, (input_len + 7) / 8);
+            defer allocator.free(brackets);
+            @memset(brackets, 0);
+            output.brackets = brackets.ptr;
+            output.keywords = words.ptr;
+            output.keywords_len = @intCast(words.len);
             _ = if (input_len >= GIL_RELEASE_BYTES)
                 pyoz.allowThreads(callParse, .{ parse_fn, ptr, input_len, &output, start_rule, 0 })
             else
@@ -2698,6 +2709,27 @@ const GrammarParser = struct {
             .not_predicate, .and_predicate => if (expr.pred_expr) |sub| try collectLiterals(arena, sub, out),
             .reference, .char_class, .any_char => {},
         }
+    }
+
+    /// The grammar's words: its literals of two or more letters, digits and
+    /// `_` with a letter among them (`end`, `return`, `elif`), each followed
+    /// by a 0 byte (ParseOutput.keywords).
+    fn grammarWords(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+        const grammar = try grammar_parser.parseGrammar(arena, text);
+        var found: std.ArrayList([]const u8) = .empty;
+        for (grammar.rules) |rule| try collectLiterals(arena, rule.expr, &found);
+        var out: std.ArrayList(u8) = .empty;
+        for (found.items) |lit| {
+            if (lit.len < 2) continue;
+            var letter = false;
+            const word = for (lit) |ch| {
+                if (std.ascii.isAlphabetic(ch)) letter = true else if (!std.ascii.isDigit(ch) and ch != '_') break false;
+            } else letter;
+            if (!word) continue;
+            try out.appendSlice(arena, lit);
+            try out.append(arena, 0);
+        }
+        return out.items;
     }
 
     /// Names of the grammar's labels, in order of first use.

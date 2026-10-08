@@ -113,6 +113,41 @@ pub export fn zgram_insert_here(output: *abi.ParseOutput, input_ptr: [*]const u8
     return 1;
 }
 
+/// A literal that closes something (`end`, `)`, `then`) is missing at
+/// `pos`, where a known syntax error is (or just after whitespace): if the
+/// literal comes later on the same line, after broken text with no bracket
+/// it closes that the text didn't open, where it does (the broken text
+/// becomes an error node, the literal matched there: `)   end,` closes the
+/// function); else -1 (inserting it, or recovering around, may do).
+pub export fn zgram_skip_to(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: u64, pos: u64, text: [*]const u8, len: u32) callconv(.c) i64 {
+    const known = (output.known_errors orelse return -1)[0..output.known_count];
+    const at = std.sort.lowerBound(u32, known, @as(u32, @intCast(pos)), orderU32);
+    if (at == known.len or !allSpace(input_ptr[pos..known[at]])) return -1;
+    const lit = text[0..len];
+    const word = isWord(lit[0]);
+    var p: u64 = known[at];
+    var depth: i32 = 0;
+    while (p < input_len) {
+        const ch = input_ptr[p];
+        if (ch == '\n') return -1;
+        if (quotedEnd(input_ptr, input_len, p)) |end| {
+            p = end;
+            continue;
+        }
+        if (depth == 0 and p > known[at] and p + len <= input_len and std.mem.eql(u8, input_ptr[p .. p + len], lit) and
+            (!word or ((p == 0 or !isWord(input_ptr[p - 1])) and (p + len == input_len or !isWord(input_ptr[p + len])))))
+            return @intCast(p);
+        if (opens(ch)) depth += 1 else if (closes(ch)) {
+            // (a bracket the broken text didn't open: what's around's,
+            // unless a stray one at the error itself)
+            if (depth == 0 and p != known[at]) return -1;
+            if (depth > 0) depth -= 1;
+        }
+        p += 1;
+    }
+    return -1;
+}
+
 /// May the first literal of an optional group, missing at `pos`, be
 /// guessed there (at the grammar's place `site`)? As zgram_insert_here, but
 /// only if the guess can be noted: the sequence around the group learns
@@ -157,31 +192,80 @@ fn closes(ch: u8) bool {
     return ch == ')' or ch == ']' or ch == '}';
 }
 
+/// A literal's bracket matched at `pos` (the recovering parser tells every
+/// one): a bracket of the code, counted by isStray and zgram_recover_begin.
+pub export fn zgram_bracket_at(output: *abi.ParseOutput, pos: u64) callconv(.c) void {
+    const bits = output.brackets orelse return;
+    bits[pos >> 3] |= @as(u8, 1) << @intCast(pos & 7);
+}
+
+/// Is the bracket at `q` one of the code's: a literal of the grammar matched
+/// it (not one in a comment or a string). Every one is when nothing tells.
+fn isCode(output: *const abi.ParseOutput, q: u64) bool {
+    const bits = output.brackets orelse return true;
+    return bits[q >> 3] & (@as(u8, 1) << @intCast(q & 7)) != 0;
+}
+
+fn countBracket(bal: *[3]i32, ch: u8) void {
+    switch (ch) {
+        '(' => bal[0] += 1,
+        '[' => bal[1] += 1,
+        '{' => bal[2] += 1,
+        ')' => bal[0] -= 1,
+        ']' => bal[1] -= 1,
+        '}' => bal[2] -= 1,
+        else => {},
+    }
+}
+
 /// Is the closing bracket at `p` stray: no bracket of its kind open before
 /// it in the input? The construct around a repetition can't be what it
-/// closes, so recovery doesn't stop there. (A running count, from where the
-/// last question was asked: recovery mostly moves forward.)
+/// closes, so recovery doesn't stop there. The text parsed before the
+/// broken text (up to scan_start) counts the code's brackets only (those
+/// in comments and strings don't open anything); the broken text, not
+/// parsed, every bracket. (A running count for the parsed text, from where
+/// the last question was asked: recovery mostly moves forward.)
 fn isStray(output: *abi.ParseOutput, input_ptr: [*]const u8, p: u64) bool {
-    if (p < output.bal_pos) {
+    const parsed = @min(p, output.scan_start);
+    if (parsed < output.bal_pos) {
         output.bal_pos = 0;
         output.bal = .{ 0, 0, 0 };
     }
-    for (input_ptr[output.bal_pos..p]) |ch| switch (ch) {
-        '(' => output.bal[0] += 1,
-        '[' => output.bal[1] += 1,
-        '{' => output.bal[2] += 1,
-        ')' => output.bal[0] -= 1,
-        ']' => output.bal[1] -= 1,
-        '}' => output.bal[2] -= 1,
-        else => {},
-    };
-    output.bal_pos = p;
+    for (input_ptr[output.bal_pos..parsed], output.bal_pos..) |ch, q| {
+        if ((opens(ch) or closes(ch)) and isCode(output, q)) countBracket(&output.bal, ch);
+    }
+    output.bal_pos = parsed;
+    var bal = output.bal;
+    for (input_ptr[parsed..p]) |ch| countBracket(&bal, ch);
     const kind: usize = switch (input_ptr[p]) {
         ')' => 0,
         ']' => 1,
         else => 2,
     };
-    return output.bal[kind] <= 0;
+    return bal[kind] <= 0;
+}
+
+/// If a quote (`"`, `'`, `` ` ``) at `p` begins a string closed on the same
+/// line (a backslash escaping the character after it), the position after
+/// it: broken text not parsed yet is scanned as text, and a string's words
+/// and brackets aren't the code's. Null otherwise (a quote alone on its
+/// line is a character like the others).
+fn quotedEnd(input_ptr: [*]const u8, input_len: u64, p: u64) ?u64 {
+    const q = input_ptr[p];
+    if (q != '"' and q != '\'' and q != '`') return null;
+    // (inside a word it's no quote: `don't`)
+    if (p > 0 and isWord(input_ptr[p - 1]) and q == '\'') return null;
+    var i = p + 1;
+    while (i < input_len) : (i += 1) {
+        const ch = input_ptr[i];
+        if (ch == '\n') return null;
+        if (ch == '\\') {
+            i += 1;
+            continue;
+        }
+        if (ch == q) return i + 1;
+    }
+    return null;
 }
 
 /// A letter, digit or `_`: resuming between two of them would split a word
@@ -193,8 +277,11 @@ fn isWord(ch: u8) bool {
 /// `start`: from the error at `err`, with the brackets opened in between
 /// counted (a place to resume must be outside them).
 pub export fn zgram_recover_begin(output: *abi.ParseOutput, input_ptr: [*]const u8, start: u64, err: u64) callconv(.c) void {
+    // (parsed up to the error: the code's brackets, not those of its
+    // comments and strings)
     var depth: i64 = 0;
-    for (input_ptr[start..err]) |ch| {
+    for (input_ptr[start..err], start..) |ch, q| {
+        if (!isCode(output, q)) continue;
         if (opens(ch)) depth += 1 else if (closes(ch) and depth > 0) depth -= 1;
     }
     output.scan_pos = err;
@@ -216,6 +303,19 @@ pub export fn zgram_recover_step(output: *abi.ParseOutput, input_ptr: [*]const u
     while (true) {
         while (p < input_len) {
             const ch = input_ptr[p];
+            // (a quoted string on the line, likely: one thing, nothing
+            // resumes inside it, nor do its brackets count; outside the
+            // brackets, a place to resume at itself (a list's item may be a
+            // string), the look going on after it)
+            if (quotedEnd(input_ptr, input_len, p)) |end| {
+                if (depth == 0) {
+                    output.scan_pos = end;
+                    output.scan_depth = 0;
+                    return @intCast(p);
+                }
+                p = end;
+                continue;
+            }
             if (depth == 0) {
                 // (a stray one, which nothing before it opened, is skipped)
                 if (closes(ch) and !isStray(output, input_ptr, p)) return -@as(i64, @intCast(p)) - 1;
@@ -245,6 +345,31 @@ pub export fn zgram_recover_step(output: *abi.ParseOutput, input_ptr: [*]const u
     // earlier round found no way on (-1 = stop at 0: no recovery)
     if (output.recover_level < abi.RECOVER_TO_END) return -1;
     return -@as(i64, @intCast(input_len)) - 1;
+}
+
+/// Does one of the grammar's words (ParseOutput.keywords) begin at `p`, a
+/// whole word? Where the repetition's element can't start, that's what
+/// comes after the list (`end`, `return`, `until`, `else`): the list ends
+/// there, rather than the look going on into what isn't its own. 1 or 0.
+pub export fn zgram_recover_keyword(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: u64, p: u64) callconv(.c) i32 {
+    const list = (output.keywords orelse return 0)[0..output.keywords_len];
+    if (p >= input_len or !isWord(input_ptr[p]) or (p > 0 and isWord(input_ptr[p - 1]))) return 0;
+    var end = p;
+    while (end < input_len and isWord(input_ptr[end])) end += 1;
+    const word = input_ptr[p..end];
+    var it = std.mem.splitScalar(u8, list, 0);
+    while (it.next()) |kw| {
+        if (std.mem.eql(u8, kw, word)) return 1;
+    }
+    return 0;
+}
+
+/// The look for a place to resume goes on from `end`: the text before it,
+/// from where it was, is what follows an element (whitespace, comments),
+/// matched as the element's trailing part: no element starts inside it,
+/// nor do its brackets count.
+pub export fn zgram_recover_skip(output: *abi.ParseOutput, end: u64) callconv(.c) void {
+    if (end > output.scan_pos) output.scan_pos = end;
 }
 
 /// Add an error node for the skipped text [start, end): a leaf of the

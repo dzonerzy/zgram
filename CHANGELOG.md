@@ -5,6 +5,18 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Recovery on real files.** One stray token could end recovery and make the rest of a large file an error node; measured over nmap's Lua library joined into one 3 MB file with errors injected (a stray `)` at the start of random lines), each error is now one error, the file's structure kept:
+  - Brackets in comments and strings no longer count as the code's: a `(` in a comment made a later stray `)` look like the closing bracket of something, so recovery stopped there instead of skipping it. The recovering parser notes where it matched brackets as literals and counts those.
+  - The look for a place to resume skips what follows an element (whitespace, comments: `(stmt ws)*`) and quoted strings, so it no longer resumes in the middle of a comment or a string (a `http:` in a comment read as a statement, and every line after it).
+  - A list of statements ends at a word of the grammar where no statement starts (`end`, `return`, `until`, `else`): broken text before a block's `end` no longer swallows the `end`.
+  - A statement that matched short of a known error (`x` of `x = ) 5`, where `x` alone is a statement) is undone, and the whole broken statement skipped, rather than the block around failing.
+  - Chains (operators, suffixes, arguments) recover from an error inside one of their elements only: one where their next element would begin is the next statement's (`f(x)` then a stray `)` on the next line no longer let the call's suffixes skip to the next `.`).
+  - A missing closing literal (`end`, `)`, `}`) found later on its line is matched there, the broken text before it an error node (`)   end,` closes the function).
+  - A list's first element in brackets (a table's first field) recovers as the others do (a stray `)` before it no longer closes the table).
+
 ## [0.4.2] - 2026-10-07
 
 ### Fixed

@@ -124,6 +124,26 @@ const Codegen = struct {
     helper_insert_guess_type: LB.Type = null,
     helper_guesses_since: LB.Value = null,
     helper_guesses_since_type: LB.Type = null,
+    /// Recover mode: zgram_bracket_at, told where a literal's bracket
+    /// matched (brackets of the code, not of comments or strings)
+    helper_bracket_at: LB.Value = null,
+    helper_bracket_at_type: LB.Type = null,
+    /// Recover mode: zgram_recover_skip, the look for a place to resume
+    /// moved past what follows an element (whitespace, comments)
+    helper_recover_skip: LB.Value = null,
+    /// Recover mode: zgram_recover_keyword, a grammar's word at a place
+    helper_recover_keyword: LB.Value = null,
+    helper_recover_keyword_type: LB.Type = null,
+    /// Recover mode: zgram_skip_to, a missing closing literal found past
+    /// broken text on its line
+    helper_skip_to: LB.Value = null,
+    helper_skip_to_type: LB.Type = null,
+    /// Recover mode, while a sequence's items are emitted: the item is just
+    /// after an opening bracket (whitespace between), in this sequence or
+    /// the one around (emitItems)
+    after_open: bool = false,
+    /// And the whitespace between (the last such item), if any
+    open_skipper: ?*const gp.Expr = null,
     /// The optional groups whose first literal may be guessed, in the
     /// sequence being emitted (see emitSequence)
     guess_sites: []const GuessSite = &.{},
@@ -298,8 +318,27 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
     const helper_guesses_since_type = b.fnType(b.i32, &.{ b.ptr, b.i32, b.i32 });
     var helper_insert_guess: LB.Value = null;
     var helper_guesses_since: LB.Value = null;
+    // void zgram_bracket_at(ptr output, i64 pos)
+    const helper_bracket_at_type = b.fnType(b.void, &.{ b.ptr, b.i64 });
+    var helper_bracket_at: LB.Value = null;
+    // void zgram_recover_skip(ptr output, i64 end): the same type
+    var helper_recover_skip: LB.Value = null;
+    // i32 zgram_recover_keyword(ptr output, ptr input, i64 len, i64 pos)
+    const helper_recover_keyword_type = b.fnType(b.i32, &.{ b.ptr, b.ptr, b.i64, b.i64 });
+    var helper_recover_keyword: LB.Value = null;
+    // i64 zgram_skip_to(ptr output, ptr input, i64 len, i64 pos, ptr text, i32 len)
+    const helper_skip_to_type = b.fnType(b.i64, &.{ b.ptr, b.ptr, b.i64, b.i64, b.ptr, b.i32 });
+    var helper_skip_to: LB.Value = null;
     var next_site: u32 = 1;
     if (mode == .recover) {
+        helper_skip_to = b.addFunction("zgram_skip_to", helper_skip_to_type);
+        b.addFnAttr(helper_skip_to, "nounwind");
+        helper_recover_keyword = b.addFunction("zgram_recover_keyword", helper_recover_keyword_type);
+        b.addFnAttr(helper_recover_keyword, "nounwind");
+        helper_bracket_at = b.addFunction("zgram_bracket_at", helper_bracket_at_type);
+        b.addFnAttr(helper_bracket_at, "nounwind");
+        helper_recover_skip = b.addFunction("zgram_recover_skip", helper_bracket_at_type);
+        b.addFnAttr(helper_recover_skip, "nounwind");
         helper_insert_guess = b.addFunction("zgram_insert_guess", helper_insert_guess_type);
         helper_guesses_since = b.addFunction("zgram_guesses_since", helper_guesses_since_type);
         b.addFnAttr(helper_insert_guess, "nounwind");
@@ -353,6 +392,13 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
             .helper_insert_guess_type = helper_insert_guess_type,
             .helper_guesses_since = helper_guesses_since,
             .helper_guesses_since_type = helper_guesses_since_type,
+            .helper_bracket_at = helper_bracket_at,
+            .helper_bracket_at_type = helper_bracket_at_type,
+            .helper_recover_skip = helper_recover_skip,
+            .helper_recover_keyword = helper_recover_keyword,
+            .helper_recover_keyword_type = helper_recover_keyword_type,
+            .helper_skip_to = helper_skip_to,
+            .helper_skip_to_type = helper_skip_to_type,
             .next_site = &next_site,
             .helper_recover_error = helper_recover_error,
             .helper_recover_error_type = helper_recover_error_type,
@@ -831,6 +877,16 @@ fn emitLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block: LB
         }
     }
 
+    // (recovering: the literal's brackets noted, as the code's: recovery
+    // counts brackets to know where the broken text ends, and those in
+    // comments and strings, never matched as literals, don't count)
+    if (cg.helper_bracket_at != null) {
+        for (lit, 0..) |ch, i| switch (ch) {
+            '(', ')', '[', ']', '{', '}' => _ = b.call(cg.helper_bracket_at_type, cg.helper_bracket_at, &.{ cg.output_ptr, b.add(pos, b.constInt(b.i64, i), "brk") }, ""),
+            else => {},
+        };
+    }
+
     return end_pos;
 }
 
@@ -1041,7 +1097,40 @@ fn emitItems(cg: *Codegen, expr: *const gp.Expr, guess: ?*const GuessSite, pos: 
     var started = false;
     // The items of a list: `(ws ',' ws item)*`
     const repeated = cg.rep_body == expr;
-    for (children) |child| {
+    // (whether the item emitted is just after an opening bracket, only
+    // whitespace between: a list in brackets; what this sequence's first
+    // item is after is the sequence around's)
+    const outer_open = cg.after_open;
+    const outer_skipper = cg.open_skipper;
+    defer {
+        cg.after_open = outer_open;
+        cg.open_skipper = outer_skipper;
+    }
+    var open = outer_open;
+    var open_skipper = outer_skipper;
+    for (children, 0..) |child, ci| {
+        cg.after_open = open;
+        cg.open_skipper = open_skipper;
+        // (recover mode only: the others have no nullable rules to tell
+        // whitespace by)
+        defer if (cg.mode == .recover) {
+            if (child.tag == .literal and opensBracket(child.literal_value orelse "")) {
+                open = true;
+                open_skipper = null;
+            } else if (isSkipper(cg, child)) {
+                if (open) open_skipper = child;
+            } else open = false;
+        };
+        // Recover mode: a list's first element in brackets (`'{' ws (field
+        // (ws ',' ws field)*)?`) recovers as the list's other elements do,
+        // the look for where it is skipping what the whitespace before it
+        // matches. (Not a list a statement begins with, `a, b = 1, 2`: the
+        // list of statements recovers from what breaks it)
+        if (cg.mode == .recover and open and isListHead(cg, children, ci)) {
+            cur_pos = try emitListHead(cg, child, cur_pos, fail_block, open_skipper);
+            if (!started) started = consumes(cg, child);
+            continue;
+        }
         // Recover mode: a literal after the start of a sequence (a closing
         // `}`, a `;`, an `=`) that's missing at a known error is taken as
         // there, zero-width, so what surrounds it keeps its structure. The
@@ -1067,6 +1156,67 @@ fn emitItems(cg: *Codegen, expr: *const gp.Expr, guess: ?*const GuessSite, pos: 
         if (cg.mode == .recover and !started) started = consumes(cg, child);
     }
     return cur_pos;
+}
+
+/// Is item `i` of a sequence the first element of a list: a rule that
+/// makes nodes, followed by a repetition of elements ending with the same
+/// rule (`field (ws ',' ws field)*`)?
+fn isListHead(cg: *const Codegen, items: []const *const gp.Expr, i: usize) bool {
+    const head = items[i];
+    if (head.tag != .reference or i + 1 >= items.len or !exprAllocatesNodes(cg, head)) return false;
+    const rep = items[i + 1];
+    if (rep.tag != .repetition or rep.rep_kind == '?') return false;
+    const sub = rep.rep_expr orelse return false;
+    if (sub.tag != .sequence) return false;
+    const elems = sub.children orelse return false;
+    const last = elems[elems.len - 1];
+    return last.tag == .reference and std.mem.eql(u8, last.ref_name orelse return false, head.ref_name orelse return false);
+}
+
+/// Is `expr` whitespace: a reference to a @silent rule that may match
+/// nothing?
+fn isSkipper(cg: *const Codegen, expr: *const gp.Expr) bool {
+    if (expr.tag != .reference) return false;
+    const r = ruleIndex(cg, expr.ref_name orelse return false) orelse return false;
+    return cg.grammar.rules[r].silent and cg.nullable[r];
+}
+
+/// A list's first element, recovering as the list's others do: where it
+/// fails at a known error (a stray `)` before a table's first field), the
+/// broken text becomes an error node, and it's tried again where it
+/// matches (or starts to); with `skipper` (the whitespace before it), the
+/// look for that place skips comments. Gives up (to `fail_block`) where
+/// no known error is in its way, as the item it is would.
+fn emitListHead(cg: *Codegen, item: *const gp.Expr, pos: LB.Value, fail_block: LB.Block, skipper: ?*const gp.Expr) CodegenError!LB.Value {
+    const b = cg.b;
+    const entry = b.getCurrentBlock();
+    const try_block = try b.newBlock("head_try");
+    const failed = try b.newBlock("head_fail");
+    const give_up = try b.newBlock("head_give_up");
+    _ = b.br(try_block);
+
+    b.positionAtEnd(try_block);
+    const at = b.phi(b.i64, "head_pos");
+    const nc_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_NODE_COUNT)}, "head_nc_ptr");
+    const saved_nc = b.load(b.i32, nc_ptr, 4, "head_saved_nc");
+    const saved_cc = saveChildCount(cg);
+    const hwm_saved = hwmRestart(cg, at);
+    const end = try emitExpr(cg, item, at, failed);
+    _ = hwmMerge(cg, hwm_saved);
+    const done = b.getCurrentBlock();
+
+    b.positionAtEnd(failed);
+    restoreState(cg, nc_ptr, saved_nc, saved_cc);
+    const reach = hwmMerge(cg, hwm_saved);
+    const r = try emitRecovery(cg, item, at, reach, give_up, .{ .skipper = skipper, .at_start = true });
+    _ = b.br(try_block);
+    b.addIncoming(at, &.{ pos, r[0] }, &.{ entry, r[1] });
+
+    b.positionAtEnd(give_up);
+    _ = b.br(fail_block);
+
+    b.positionAtEnd(done);
+    return end;
 }
 
 /// Is `lit` punctuation only (`,`, `;`, `|`), no word?
@@ -1143,6 +1293,34 @@ fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail
         const here = b.call(cg.helper_insert_guess_type, cg.helper_insert_guess, &.{ cg.output_ptr, cg.input_ptr, pos, text_global, text_len, b.constInt(b.i32, g.site) }, "ins_guess");
         _ = b.condBr(b.icmp(.ne, here, b.constInt(b.i32, 0), "ins_known"), inserted, fail_block);
     } else {
+        // A literal closing something (`end`, `)`): first, whether it's
+        // there later on the line, after broken text (zgram_skip_to)
+        if (closesSomething(text)) {
+            const found = b.call(cg.helper_skip_to_type, cg.helper_skip_to, &.{ cg.output_ptr, cg.input_ptr, cg.input_len, pos, text_global, text_len }, "ins_skip_to");
+            const skip_block = try b.newBlock("ins_skip");
+            const no_skip = try b.newBlock("ins_no_skip");
+            _ = b.condBr(b.icmp(.sge, found, b.constSInt(b.i64, 0), "ins_skip_found"), skip_block, no_skip);
+            b.positionAtEnd(skip_block);
+            const made = b.call(cg.helper_error_node_type, cg.helper_error_node, &.{ cg.output_ptr, pos, found, b.constInt(b.i32, abi.NO_RULE) }, "ins_skip_node");
+            const counted = try b.newBlock("ins_skip_counted");
+            _ = b.condBr(b.icmp(.ne, made, b.constInt(b.i32, 0), "ins_skip_node_ok"), counted, fail_block);
+            b.positionAtEnd(counted);
+            if (cg.child_count_ptr != null) {
+                const cc = b.load(b.i32, cg.child_count_ptr, 4, "ins_skip_cc");
+                _ = b.store(b.add(cc, b.constInt(b.i32, 1), "ins_skip_cc1"), cg.child_count_ptr, 4);
+            }
+            const after = b.add(found, b.constInt(b.i64, text.len), "ins_skip_after");
+            _ = b.br(merge);
+            b.positionAtEnd(no_skip);
+            const here = b.call(cg.helper_insert_here_type, cg.helper_insert_here, &.{ cg.output_ptr, cg.input_ptr, pos, text_global, text_len }, "ins_here");
+            _ = b.condBr(b.icmp(.ne, here, b.constInt(b.i32, 0), "ins_known"), inserted, fail_block);
+            b.positionAtEnd(inserted);
+            _ = b.br(merge);
+            b.positionAtEnd(merge);
+            const result = b.phi(b.i64, "ins_pos");
+            b.addIncoming(result, &.{ end, pos, after }, &.{ matched, inserted, counted });
+            return result;
+        }
         const here = b.call(cg.helper_insert_here_type, cg.helper_insert_here, &.{ cg.output_ptr, cg.input_ptr, pos, text_global, text_len }, "ins_here");
         _ = b.condBr(b.icmp(.ne, here, b.constInt(b.i32, 0), "ins_known"), inserted, fail_block);
     }
@@ -1154,6 +1332,17 @@ fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail
     const result = b.phi(b.i64, "ins_pos");
     b.addIncoming(result, &.{ end, pos }, &.{ matched, inserted });
     return result;
+}
+
+/// Does `lit` close something: a word (`end`, `then`, `until`) or a closing
+/// bracket (`)`, `]`, `}`)? Recovery looks for it past broken text.
+fn closesSomething(lit: []const u8) bool {
+    if (lit.len == 0) return false;
+    if (lit.len == 1) return lit[0] == ')' or lit[0] == ']' or lit[0] == '}';
+    for (lit) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    }
+    return std.ascii.isAlphabetic(lit[0]);
 }
 
 /// Check if an expression can allocate nodes when evaluated.
@@ -2038,6 +2227,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         // Loop header: phi for current position
         b.positionAtEnd(loop_header);
         const pos_phi = b.phi(b.i64, "rep_pos");
+        const prev = if (rec) prevPhis(cg, nc_ptr) else null;
 
         // Branch to body
         _ = b.br(loop_body);
@@ -2052,7 +2242,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         }
         const hwm_saved = if (rec) hwmRestart(cg, pos_phi) else undefined;
         const body_result = try emitExpr(cg, sub, pos_phi, loop_fail);
-        if (rec) _ = hwmMerge(cg, hwm_saved);
+        const body_reach = if (rec) hwmMerge(cg, hwm_saved) else null;
         const body_end_block = b.getCurrentBlock();
         if (always_consumes) {
             // Sub-expr always consumes >=1 byte, no need for zero-length check
@@ -2065,11 +2255,16 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         // Loop fail: restore node_count if needed, exit loop (or recover)
         b.positionAtEnd(loop_fail);
         if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
-        const fail_exit = try endIteration(cg, rec, sub, pos_phi, hwm_saved, loop_header, loop_exit);
+        const fail_exit = try endIteration(cg, rec, sub, pos_phi, hwm_saved, loop_header, loop_exit, prev);
 
         // Finish phi: incoming from entry (first result) and from body (next result)
         b.addIncoming(pos_phi, &.{ first_result, body_result }, &.{ first_block, body_end_block });
         if (fail_exit.recovered) |r| b.addIncoming(pos_phi, &.{r[0]}, &.{r[1]});
+        if (prev) |p| {
+            addNoPrev(cg, p, first_block);
+            addPrev(cg, p, body_end_block, pos_phi, body_reach.?, saved_nc, saved_cc);
+            if (fail_exit.recovered) |r| addNoPrev(cg, p, r[1]);
+        }
 
         // Exit
         b.positionAtEnd(loop_exit);
@@ -2089,6 +2284,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         // Loop header: phi for current position
         b.positionAtEnd(loop_header);
         const pos_phi = b.phi(b.i64, "rep_pos");
+        const prev = if (rec) prevPhis(cg, nc_ptr) else null;
         _ = b.br(loop_body);
 
         // Loop body
@@ -2101,7 +2297,7 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         }
         const hwm_saved = if (rec) hwmRestart(cg, pos_phi) else undefined;
         const body_result = try emitExpr(cg, sub, pos_phi, loop_fail);
-        if (rec) _ = hwmMerge(cg, hwm_saved);
+        const body_reach = if (rec) hwmMerge(cg, hwm_saved) else null;
         const body_end_block = b.getCurrentBlock();
         if (always_consumes) {
             _ = b.br(loop_header);
@@ -2113,11 +2309,16 @@ fn emitRepetition(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block:
         // Loop fail: restore nc if needed, exit (or recover)
         b.positionAtEnd(loop_fail);
         if (needs_nc_save) restoreState(cg, nc_ptr, saved_nc, saved_cc);
-        const fail_exit = try endIteration(cg, rec, sub, pos_phi, hwm_saved, loop_header, loop_exit);
+        const fail_exit = try endIteration(cg, rec, sub, pos_phi, hwm_saved, loop_header, loop_exit, prev);
 
         // Finish phi
         b.addIncoming(pos_phi, &.{ pos, body_result }, &.{ entry_block, body_end_block });
         if (fail_exit.recovered) |r| b.addIncoming(pos_phi, &.{r[0]}, &.{r[1]});
+        if (prev) |p| {
+            addNoPrev(cg, p, entry_block);
+            addPrev(cg, p, body_end_block, pos_phi, body_reach.?, saved_nc, saved_cc);
+            if (fail_exit.recovered) |r| addNoPrev(cg, p, r[1]);
+        }
 
         // Exit
         b.positionAtEnd(loop_exit);
@@ -2144,7 +2345,7 @@ const IterationEnd = struct {
 /// node count is restored): exit the loop, or with `rec` try recovering first.
 /// Every way out of the loop through here leaves from one block, so the
 /// exit's phi keeps a single incoming edge for it.
-fn endIteration(cg: *Codegen, rec: bool, sub: *const gp.Expr, start: LB.Value, hwm_saved: HwmSave, loop_header: LB.Block, loop_exit: LB.Block) CodegenError!IterationEnd {
+fn endIteration(cg: *Codegen, rec: bool, sub: *const gp.Expr, start: LB.Value, hwm_saved: HwmSave, loop_header: LB.Block, loop_exit: LB.Block, prev: ?PrevElement) CodegenError!IterationEnd {
     const b = cg.b;
     if (!rec) {
         const here = b.getCurrentBlock();
@@ -2152,11 +2353,97 @@ fn endIteration(cg: *Codegen, rec: bool, sub: *const gp.Expr, start: LB.Value, h
         return .{ .block = here };
     }
     const rec_exit = try b.newBlock("rec_exit");
-    const recovered = try emitRecovery(cg, sub, start, hwmMerge(cg, hwm_saved), rec_exit);
+    var from = start;
+    var reach = hwmMerge(cg, hwm_saved);
+    // (statement lists only: a chain's element runs into what follows the
+    // chain all the time; see emitRecovery)
+    if (if (trailingSkipper(cg, sub) != null) prev else null) |p| {
+        // An element that failed with no known error in its way, after one
+        // that matched but whose attempt ran into a known error further on
+        // than where it ended (`x = ) 1`: the assignment failed at `)`, and
+        // `x` alone is a statement too; then `= ) 1` is no statement):
+        // that one is the broken element, its match a shorter construct
+        // than the broken one. It's undone, and skipped from its start.
+        const own = b.call(cg.helper_recover_error_type, cg.helper_recover_error, &.{ cg.output_ptr, start, reach }, "rec_own_err");
+        const check_prev = try b.newBlock("rec_check_prev");
+        const undo_prev = try b.newBlock("rec_undo_prev");
+        const chosen = try b.newBlock("rec_chosen");
+        const here = b.getCurrentBlock();
+        const prev_further = b.@"and"(
+            b.icmp(.ne, p.start, b.constInt(b.i64, no_prev), "rec_has_prev"),
+            b.icmp(.ugt, p.reach, start, "rec_prev_further"),
+            "rec_prev_candidate",
+        );
+        const try_prev = b.@"and"(b.icmp(.slt, own, b.constSInt(b.i64, 0), "rec_own_none"), prev_further, "rec_try_prev");
+        _ = b.condBr(try_prev, check_prev, chosen);
+        b.positionAtEnd(check_prev);
+        const prev_err = b.call(cg.helper_recover_error_type, cg.helper_recover_error, &.{ cg.output_ptr, p.start, p.reach }, "rec_prev_err");
+        // (and this element failed before getting to that error: it's what
+        // the shorter match left, not an element running into the error
+        // itself, which recovers on its own once its failure is known)
+        const before = b.icmp(.slt, reach, prev_err, "rec_failed_before");
+        _ = b.condBr(b.@"and"(b.icmp(.sge, prev_err, b.constSInt(b.i64, 0), "rec_prev_found"), before, "rec_undo"), undo_prev, chosen);
+        b.positionAtEnd(undo_prev);
+        restoreState(cg, p.nc_ptr, p.nc, p.cc);
+        _ = b.br(chosen);
+        b.positionAtEnd(chosen);
+        const from_phi = b.phi(b.i64, "rec_from");
+        b.addIncoming(from_phi, &.{ start, start, p.start }, &.{ here, check_prev, undo_prev });
+        const reach_phi = b.phi(b.i64, "rec_from_reach");
+        b.addIncoming(reach_phi, &.{ reach, reach, p.reach }, &.{ here, check_prev, undo_prev });
+        from = from_phi;
+        reach = reach_phi;
+    }
+    const recovered = try emitRecovery(cg, sub, from, reach, rec_exit, recoverHowOf(cg, sub));
     _ = b.br(loop_header);
     b.positionAtEnd(rec_exit);
     _ = b.br(loop_exit);
     return .{ .block = rec_exit, .recovered = recovered };
+}
+
+/// A recovering repetition's last element that matched (loop-carried):
+/// where it began (no_prev: none, or an error node came after it), how far
+/// its attempt got, and the node and child counts before it.
+const PrevElement = struct {
+    start: LB.Value,
+    reach: LB.Value,
+    nc: LB.Value,
+    cc: ?LB.Value,
+    nc_ptr: LB.Value,
+};
+
+const no_prev: u64 = std.math.maxInt(u64);
+
+/// The loop header's phis for the previous element (PrevElement); their
+/// incoming values are added once the loop's blocks exist (addPrev,
+/// addNoPrev).
+fn prevPhis(cg: *Codegen, nc_ptr: LB.Value) PrevElement {
+    const b = cg.b;
+    return .{
+        .start = b.phi(b.i64, "rep_prev_start"),
+        .reach = b.phi(b.i64, "rep_prev_reach"),
+        .nc = b.phi(b.i32, "rep_prev_nc"),
+        .cc = if (cg.child_count_ptr != null) b.phi(b.i32, "rep_prev_cc") else null,
+        .nc_ptr = nc_ptr,
+    };
+}
+
+/// Into the loop from `from` with no previous element.
+fn addNoPrev(cg: *Codegen, p: PrevElement, from: LB.Block) void {
+    const b = cg.b;
+    b.addIncoming(p.start, &.{b.constInt(b.i64, no_prev)}, &.{from});
+    b.addIncoming(p.reach, &.{b.constInt(b.i64, 0)}, &.{from});
+    b.addIncoming(p.nc, &.{b.constInt(b.i32, 0)}, &.{from});
+    if (p.cc) |cc| b.addIncoming(cc, &.{b.constInt(b.i32, 0)}, &.{from});
+}
+
+/// Into the loop from `from`, after an element that matched from `start`.
+fn addPrev(cg: *Codegen, p: PrevElement, from: LB.Block, start: LB.Value, reach: LB.Value, nc: LB.Value, cc: ?LB.Value) void {
+    const b = cg.b;
+    b.addIncoming(p.start, &.{start}, &.{from});
+    b.addIncoming(p.reach, &.{reach}, &.{from});
+    b.addIncoming(p.nc, &.{nc}, &.{from});
+    if (p.cc) |c_| b.addIncoming(c_, &.{cc.?}, &.{from});
 }
 
 /// Does this repetition recover from syntax errors? In recover mode, the
@@ -2234,6 +2521,33 @@ fn elementRule(cg: *const Codegen, sub: *const gp.Expr) ?usize {
     return ruleIndex(cg, e.ref_name orelse return null);
 }
 
+/// What follows a repetition's element in it, if the element ends with it:
+/// a reference to a @silent rule that may match nothing (whitespace and
+/// comments: `(stmt ws)*`).
+fn trailingSkipper(cg: *const Codegen, sub: *const gp.Expr) ?*const gp.Expr {
+    if (sub.tag != .sequence) return null;
+    const items = sub.children orelse return null;
+    if (items.len < 2) return null;
+    const last = items[items.len - 1];
+    if (last.tag != .reference) return null;
+    const r = ruleIndex(cg, last.ref_name orelse return null) orelse return null;
+    if (!cg.grammar.rules[r].silent or !cg.nullable[r]) return null;
+    return last;
+}
+
+/// What a repetition's element begins with, if it's whitespace: a reference
+/// to a @silent rule that may match nothing (`(ws op ws operand)*`).
+fn leadingSkipper(cg: *const Codegen, sub: *const gp.Expr) ?*const gp.Expr {
+    if (sub.tag != .sequence) return null;
+    const items = sub.children orelse return null;
+    if (items.len < 2) return null;
+    const first = items[0];
+    if (first.tag != .reference) return null;
+    const r = ruleIndex(cg, first.ref_name orelse return null) orelse return null;
+    if (!cg.grammar.rules[r].silent or !cg.nullable[r]) return null;
+    return first;
+}
+
 /// The @recover(sync) of that rule.
 fn syncOf(cg: *const Codegen, sub: *const gp.Expr) ?*const gp.Expr {
     return cg.grammar.rules[elementRule(cg, sub) orelse return null].recover;
@@ -2253,11 +2567,65 @@ fn syncOf(cg: *const Codegen, sub: *const gp.Expr) ?*const gp.Expr {
 /// rule, the broken element ends after the first match of `sync` instead,
 /// and the look for the element goes on from there. It stops at a closing
 /// bracket the broken text didn't open, or at the end of the input.
-fn emitRecovery(cg: *Codegen, sub: *const gp.Expr, start: LB.Value, reach: LB.Value, loop_exit: LB.Block) CodegenError!struct { LB.Value, LB.Block } {
+/// How a repetition (or a list's first element: emitListHead) recovers
+const RecoverHow = struct {
+    /// What may come between elements (whitespace, comments): matched where
+    /// the look for a place to resume is, and skipped, nothing resuming
+    /// inside a comment
+    skipper: ?*const gp.Expr = null,
+    /// A list of statements (elements followed by whitespace): it ends at
+    /// a word of the grammar where no element starts
+    statements: bool = false,
+    /// It recovers from an error where its element begins (a statement
+    /// list's, a list's first element's); a chain's only from one inside
+    /// an element
+    at_start: bool = false,
+};
+
+/// A repetition's way of recovering, from its element.
+fn recoverHowOf(cg: *const Codegen, sub: *const gp.Expr) RecoverHow {
+    const trailing = trailingSkipper(cg, sub);
+    return .{
+        .skipper = trailing orelse leadingSkipper(cg, sub),
+        .statements = trailing != null,
+        .at_start = trailing != null,
+    };
+}
+
+fn emitRecovery(cg: *Codegen, sub: *const gp.Expr, start: LB.Value, reach: LB.Value, loop_exit: LB.Block, how: RecoverHow) CodegenError!struct { LB.Value, LB.Block } {
     const b = cg.b;
     const err = b.call(cg.helper_recover_error_type, cg.helper_recover_error, &.{ cg.output_ptr, start, reach }, "rec_err");
     const begin_block = try b.newBlock("rec_begin");
-    _ = b.condBr(b.icmp(.sge, err, b.constSInt(b.i64, 0), "rec_found"), begin_block, loop_exit);
+    var found = b.icmp(.sge, err, b.constSInt(b.i64, 0), "rec_found");
+    // A chain (operators, suffixes, arguments: not a list of statements,
+    // whose elements end with whitespace) recovers from an error in one of
+    // its elements, not from one where the next would begin: that's what
+    // comes after the chain (`f(x)` then a stray `)`: the call's suffixes
+    // end there, the statement after is broken), which an outer list
+    // recovers from. Where an element begins: after its leading whitespace.
+    if (!how.at_start) {
+        var lead_end = start;
+        if (leadingSkipper(cg, sub)) |lead| {
+            const lead_fail = try b.newBlock("rec_lead_fail");
+            const lead_done = try b.newBlock("rec_lead_done");
+            const here = b.getCurrentBlock();
+            const lead_saved = hwmRestart(cg, start);
+            const matched = try emitProbe(cg, lead, start, lead_fail);
+            _ = hwmRestore(cg, lead_saved);
+            const matched_block = b.getCurrentBlock();
+            _ = b.br(lead_done);
+            b.positionAtEnd(lead_fail);
+            _ = hwmRestore(cg, lead_saved);
+            _ = b.br(lead_done);
+            b.positionAtEnd(lead_done);
+            const phi = b.phi(b.i64, "rec_lead_end");
+            b.addIncoming(phi, &.{ matched, start }, &.{ matched_block, lead_fail });
+            _ = here;
+            lead_end = phi;
+        }
+        found = b.@"and"(found, b.icmp(.sgt, err, lead_end, "rec_inside_element"), "rec_found_inside");
+    }
+    _ = b.condBr(found, begin_block, loop_exit);
 
     b.positionAtEnd(begin_block);
     _ = b.call(cg.helper_recover_begin_type, cg.helper_recover_begin, &.{ cg.output_ptr, cg.input_ptr, start, err }, "");
@@ -2310,9 +2678,29 @@ fn emitRecovery(cg: *Codegen, sub: *const gp.Expr, start: LB.Value, reach: LB.Va
     n_resume += 1;
     _ = b.br(make_block);
 
+    // What follows an element (its trailing whitespace, comments: `(stmt
+    // ws)*`), matched here: the look goes on after it, no element starting
+    // inside a comment
+    b.positionAtEnd(probe_block);
+    if (how.skipper) |skipper| {
+        const skip_fail = try b.newBlock("rec_skip_fail");
+        const skip_saved = hwmRestart(cg, cand);
+        const skip_end = try emitProbe(cg, skipper, cand, skip_fail);
+        _ = hwmRestore(cg, skip_saved);
+        const skipped = try b.newBlock("rec_skipped");
+        const element_here = try b.newBlock("rec_element_here");
+        _ = b.condBr(b.icmp(.ugt, skip_end, cand, "rec_skip_some"), skipped, element_here);
+        b.positionAtEnd(skipped);
+        _ = b.call(cg.helper_bracket_at_type, cg.helper_recover_skip, &.{ cg.output_ptr, skip_end }, "");
+        _ = b.br(elem_scan);
+        b.positionAtEnd(skip_fail);
+        _ = hwmRestore(cg, skip_saved);
+        _ = b.br(element_here);
+        b.positionAtEnd(element_here);
+    }
+
     // Does the element match here, or start to? (how far a failed attempt
     // got is the furthest-failure mark, restarted for it)
-    b.positionAtEnd(probe_block);
     const probe_fail = try b.newBlock("rec_probe_fail");
     const hwm_saved = hwmRestart(cg, cand);
     _ = try emitProbe(cg, sub, cand, probe_fail);
@@ -2332,16 +2720,32 @@ fn emitRecovery(cg: *Codegen, sub: *const gp.Expr, start: LB.Value, reach: LB.Va
     // A broken element starting here: resume here too (the loop stops at it,
     // and the next round, knowing its error, skips it)
     const started_block = try b.newBlock("rec_started_here");
-    _ = b.condBr(started, started_block, elem_scan);
+    const keyword_check = try b.newBlock("rec_keyword_check");
+    _ = b.condBr(started, started_block, keyword_check);
     b.positionAtEnd(started_block);
     _ = b.br(make_block);
     // (the same position as a match: add it to the phi below)
     const started_val = cand;
+    // Nor that, but a word of the grammar here (`end`, `return`), in a list
+    // of statements (elements followed by whitespace: `(stmt ws)*`): what
+    // comes after the list, which ends here (the loop tries the element
+    // here, which fails, and leaves). Not in a chain of operators (`(ws
+    // op ws operand)*`): there a word (`or`) is the chain around's.
+    b.positionAtEnd(keyword_check);
+    var keyword_block: ?LB.Block = null;
+    if (how.statements) {
+        const is_keyword = b.call(cg.helper_recover_keyword_type, cg.helper_recover_keyword, &.{ cg.output_ptr, cg.input_ptr, cg.input_len, cand }, "rec_is_keyword");
+        keyword_block = try b.newBlock("rec_keyword");
+        _ = b.condBr(b.icmp(.ne, is_keyword, b.constInt(b.i32, 0), "rec_keyword_here"), keyword_block.?, elem_scan);
+        b.positionAtEnd(keyword_block.?);
+        _ = b.br(make_block);
+    } else _ = b.br(elem_scan);
 
     b.positionAtEnd(make_block);
     const resume_pos = b.phi(b.i64, "rec_resume");
     b.addIncoming(resume_pos, resume_vals[0..n_resume], resume_blocks[0..n_resume]);
     b.addIncoming(resume_pos, &.{started_val}, &.{started_block});
+    if (keyword_block) |kb| b.addIncoming(resume_pos, &.{cand}, &.{kb});
     // No progress: the loop ends here, with no error node (skipping nothing
     // would loop forever)
     const node_block = try b.newBlock("rec_node");

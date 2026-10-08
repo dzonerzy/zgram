@@ -188,6 +188,17 @@ pub const ParseOutput = extern struct {
     inserted: ?[*]Inserted = null,
     inserted_count: u32 = 0,
     inserted_capacity: u32 = 0,
+    /// A bit per byte of the input: where a literal's bracket matched
+    /// (zgram_bracket_at), a bracket of the code; the others (in comments,
+    /// strings) aren't counted (isStray). A caller-provided buffer of
+    /// (input length + 7) / 8 bytes, zeroed; null: every bracket counts.
+    brackets: ?[*]u8 = null,
+    /// The grammar's words (literals of letters, digits and `_`: `end`,
+    /// `return`), each followed by a 0 byte: where recovery's look for a
+    /// place to resume may end a list (zgram_recover_keyword). Set by the
+    /// caller; null: none.
+    keywords: ?[*]const u8 = null,
+    keywords_len: u32 = 0,
 };
 
 /// A literal recovery took as present (zero-width) at `pos`. `site`: for

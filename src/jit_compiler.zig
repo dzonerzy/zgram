@@ -29,6 +29,10 @@ extern fn zgram_error_node(output: *abi.ParseOutput, start: u64, end: u64, rule:
 extern fn zgram_insert_here(output: *abi.ParseOutput, input_ptr: [*]const u8, pos: u64, text: [*]const u8, len: u32) callconv(.c) i32;
 extern fn zgram_insert_guess(output: *abi.ParseOutput, input_ptr: [*]const u8, pos: u64, text: [*]const u8, len: u32, site: u32) callconv(.c) i32;
 extern fn zgram_guesses_since(output: *abi.ParseOutput, from: u32, lo: u32) callconv(.c) u32;
+extern fn zgram_bracket_at(output: *abi.ParseOutput, pos: u64) callconv(.c) void;
+extern fn zgram_recover_skip(output: *abi.ParseOutput, end: u64) callconv(.c) void;
+extern fn zgram_recover_keyword(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: u64, p: u64) callconv(.c) i32;
+extern fn zgram_skip_to(output: *abi.ParseOutput, input_ptr: [*]const u8, input_len: u64, pos: u64, text: [*]const u8, len: u32) callconv(.c) i64;
 
 // X86 target init (macro-generated in Target.h, must declare manually)
 extern fn LLVMInitializeX86TargetInfo() void;
@@ -103,7 +107,11 @@ fn registerHelperSymbols(jit: c.LLVMOrcLLJITRef, dylib: c.LLVMOrcJITDylibRef) Ji
     else
         0;
 
-    var syms: [17]c.LLVMOrcCSymbolMapPair = .{
+    var syms: [21]c.LLVMOrcCSymbolMapPair = .{
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_skip_to"), .Sym = .{ .Address = @intFromPtr(&zgram_skip_to), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_recover_keyword"), .Sym = .{ .Address = @intFromPtr(&zgram_recover_keyword), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_bracket_at"), .Sym = .{ .Address = @intFromPtr(&zgram_bracket_at), .Flags = exported_flags } },
+        .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_recover_skip"), .Sym = .{ .Address = @intFromPtr(&zgram_recover_skip), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_insert_here"), .Sym = .{ .Address = @intFromPtr(&zgram_insert_here), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_insert_guess"), .Sym = .{ .Address = @intFromPtr(&zgram_insert_guess), .Flags = exported_flags } },
         .{ .Name = c.LLVMOrcExecutionSessionIntern(es, "zgram_guesses_since"), .Sym = .{ .Address = @intFromPtr(&zgram_guesses_since), .Flags = exported_flags } },
