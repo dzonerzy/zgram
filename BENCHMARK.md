@@ -29,26 +29,26 @@ Time per parse; in parentheses, how many times longer than zgram.
 
 | Library | Output | Small (43 B) | Medium (1.2 KB) | Large (15 KB) | Strings (75 KB) |
 |---|---|---|---|---|---|
-| **zgram** | flat node array | **0.04us** | **0.94us** | **15.86us** | **10.31us** |
-| Spirit X3 | flat node array (custom directive, zgram's design) | 0.06us (1.5x) | 1.41us (1.5x) | 20.36us (1.3x) | 51.79us (5.0x) |
-| rust-peg | tree via actions | 0.13us (3.2x) | 3.71us (3.9x) | 66.91us (4.2x) | 113us (11.0x) |
-| Spirit X3 | typed AST (`variant` / `vector` / `map`) | 0.16us (4.0x) | 4.32us (4.6x) | 60.76us (3.8x) | 108us (10.5x) |
-| lexy | typed AST (official JSON example) | 0.19us (4.8x) | 5.78us (6.1x) | 83.70us (5.3x) | 105us (10.2x) |
-| pest | token pair queue | 0.76us (19.0x) | 18.41us (19.6x) | 171us (10.8x) | 1,043us (101.2x) |
-| PEGTL | built-in `parse_tree` | 0.77us (19.2x) | 17.50us (18.6x) | 242us (15.3x) | 588us (57.0x) |
-| lexy | built-in `parse_as_tree` (tokens included) | 0.35us (8.8x) | 18.17us (19.3x) | 252us (15.9x) | 291us (28.2x) |
+| **zgram** | flat node array | **0.04us** | **0.84us** | **12.45us** | **9.20us** |
+| Spirit X3 | flat node array (custom directive, zgram's design) | 0.07us (1.8x) | 1.46us (1.7x) | 21.50us (1.7x) | 53.67us (5.8x) |
+| rust-peg | tree via actions | 0.13us (3.2x) | 3.79us (4.5x) | 70.41us (5.7x) | 115us (12.6x) |
+| Spirit X3 | typed AST (`variant` / `vector` / `map`) | 0.16us (4.0x) | 4.49us (5.3x) | 69.11us (5.6x) | 113us (12.3x) |
+| lexy | typed AST (official JSON example) | 0.19us (4.8x) | 5.26us (6.3x) | 75.90us (6.1x) | 104us (11.3x) |
+| pest | token pair queue | 0.78us (19.5x) | 19.37us (23.1x) | 182us (14.7x) | 1,112us (120.9x) |
+| PEGTL | built-in `parse_tree` | 0.78us (19.5x) | 17.86us (21.3x) | 258us (20.7x) | 607us (66.0x) |
+| lexy | built-in `parse_as_tree` (tokens included) | 0.29us (7.2x) | 61.49us (73.2x) | 284us (22.8x) | 260us (28.3x) |
 
 ### Validation only
 
 | Library | Output | Small (43 B) | Medium (1.2 KB) | Large (15 KB) | Strings (75 KB) |
 |---|---|---|---|---|---|
-| **zgram** | `matches()` | **0.02us** | **0.47us** | **6.86us** | **5.67us** |
-| lexy | `lexy::match` | 0.02us (1.0x) | 0.68us (1.4x) | 9.56us (1.4x) | 31.72us (5.6x) |
-| Spirit X3 | parse without attribute | 0.03us (1.5x) | 0.74us (1.6x) | 8.85us (1.3x) | 40.45us (7.1x) |
-| rust-peg | rules return `()` | 0.08us (4.0x) | 1.88us (4.0x) | 22.29us (3.2x) | 96.17us (17.0x) |
-| PEGTL | `parse` without actions | 0.18us (9.0x) | 5.55us (11.8x) | 45.39us (6.6x) | 431us (76.1x) |
-| PackCC | generated C parser | 2.45us (122.5x) | 70.65us (150.3x) | 592us (86.3x) | 14,833us (2616.1x) |
-| cpp-peglib | runtime interpreter | 7.30us (365.0x) | 242us (514.2x) | 2,007us (292.6x) | 15,341us (2705.7x) |
+| **zgram** | `matches()` | **0.02us** | **0.49us** | **7.13us** | **5.81us** |
+| lexy | `lexy::match` | 0.02us (1.0x) | 0.66us (1.3x) | 9.96us (1.4x) | 31.40us (5.4x) |
+| Spirit X3 | parse without attribute | 0.03us (1.5x) | 0.78us (1.6x) | 9.29us (1.3x) | 41.84us (7.2x) |
+| rust-peg | rules return `()` | 0.08us (4.0x) | 1.92us (3.9x) | 23.10us (3.2x) | 98.86us (17.0x) |
+| PEGTL | `parse` without actions | 0.19us (9.5x) | 6.13us (12.5x) | 47.58us (6.7x) | 444us (76.4x) |
+| PackCC | generated C parser | 2.58us (129.0x) | 75.48us (154.0x) | 690us (96.8x) | 15,957us (2746.5x) |
+| cpp-peglib | runtime interpreter | 7.56us (378.0x) | 252us (513.4x) | 2,117us (296.9x) | 16,497us (2839.4x) |
 
 ## Expressions
 
@@ -78,39 +78,40 @@ Tree nodes: 27 / 907 / 10,849 / 1,281.
 
 | Library | Output | Small (37 B) | Medium (1.2 KB) | Large (15 KB) | Deep (1.2 KB) |
 |---|---|---|---|---|---|
-| **zgram** | flat node array | **0.06us** | **2.52us** | **30.23us** | **7.56us** |
-| Spirit X3 | flat node array (custom directive, zgram's design) | 0.10us (1.7x) | 3.78us (1.5x) | 46.82us (1.5x) | 6.88us (0.9x) |
-| pest | token pair queue | 0.49us (8.2x) | 17.29us (6.9x) | 226us (7.5x) | 34.53us (4.6x) |
-| rust-peg | tree via actions | 0.41us (6.8x) | 22.19us (8.8x) | 298us (9.9x) | 31.10us (4.1x) |
-| lexy | built-in `parse_as_tree` (own shape, tokens included) | 0.41us (6.8x) | 35.55us (14.1x) | 429us (14.2x) | 43.31us (5.7x) |
-| PEGTL | built-in `parse_tree` | 1.24us (20.7x) | 52.98us (21.0x) | 896us (29.6x) | 106us (14.0x) |
+| **zgram** | flat node array | **0.06us** | **2.65us** | **32.05us** | **6.60us** |
+| Spirit X3 | flat node array (custom directive, zgram's design) | 0.11us (1.8x) | 3.95us (1.5x) | 48.36us (1.5x) | 6.89us (1.04x) |
+| pest | token pair queue | 0.53us (8.8x) | 18.24us (6.9x) | 229us (7.1x) | 35.73us (5.4x) |
+| rust-peg | tree via actions | 0.42us (7.0x) | 23.60us (8.9x) | 309us (9.6x) | 31.39us (4.8x) |
+| lexy | built-in `parse_as_tree` (own shape, tokens included) | 0.41us (6.8x) | 97.24us (36.7x) | 447us (14.0x) | 44.37us (6.7x) |
+| PEGTL | built-in `parse_tree` | 1.29us (21.5x) | 55.51us (20.9x) | 1,009us (31.5x) | 106us (16.1x) |
 
 ### Validation only
 
 | Library | Output | Small (37 B) | Medium (1.2 KB) | Large (15 KB) | Deep (1.2 KB) |
 |---|---|---|---|---|---|
-| **zgram** | `matches()` | **0.03us** | **1.13us** | **13.85us** | **3.36us** |
-| Spirit X3 | parse without attribute | 0.03us (1.0x) | 1.64us (1.5x) | 19.01us (1.4x) | 3.97us (1.2x) |
-| lexy | `expression_production` + `lexy::match` | 0.08us (2.7x) | 2.93us (2.6x) | 36.24us (2.6x) | 4.02us (1.2x) |
-| rust-peg | rules return `()` | 0.10us (3.3x) | 3.62us (3.2x) | 51.19us (3.7x) | 8.45us (2.5x) |
-| PEGTL | `parse` without actions | 0.15us (5.0x) | 5.31us (4.7x) | 65.09us (4.7x) | 7.33us (2.2x) |
+| **zgram** | `matches()` | **0.04us** | **1.20us** | **14.59us** | **3.56us** |
+| Spirit X3 | parse without attribute | 0.04us (1.0x) | 1.66us (1.4x) | 19.62us (1.3x) | 4.05us (1.1x) |
+| lexy | `expression_production` + `lexy::match` | 0.09us (2.3x) | 2.97us (2.5x) | 40.50us (2.8x) | 3.54us (1.0x) |
+| rust-peg | rules return `()` | 0.10us (2.5x) | 3.77us (3.1x) | 52.36us (3.6x) | 8.48us (2.4x) |
+| PEGTL | `parse` without actions | 0.15us (3.8x) | 5.31us (4.4x) | 62.59us (4.3x) | 7.16us (2.0x) |
 
 ## Analysis
 
-**zgram is the fastest in 15 of the 16 comparisons** (two grammars, four inputs, tree and validation); validating the smallest inputs, it ties Spirit X3 and lexy. The exception: building the deeply nested expression tree, Spirit X3 with a flat node array like zgram's is 9% faster.
+**zgram is the fastest or tied in all 16 comparisons** (two grammars, four inputs, tree and validation). It builds every tree fastest; validating, it ties Spirit X3 and lexy on the smallest inputs, and lexy on the deeply nested expressions (3.54us against 3.56us).
 
-**Building trees**, the closest competitor on both grammars is Spirit X3 building the same flat node array as zgram, through a directive written for this benchmark: zgram is 1.3-1.7x faster on the regular inputs and 5x faster on long strings. Built the way these libraries are normally used, trees cost much more: rust-peg with tree actions takes 3-4x longer than zgram on JSON and 4-10x on expressions; the X3 and lexy typed ASTs 4-6x on JSON; pest, PEGTL's and lexy's built-in trees 5-30x.
+**Building trees**, the closest competitor on both grammars is Spirit X3 building the same flat node array as zgram, through a directive written for this benchmark: zgram is 1.5-1.8x faster on the regular inputs, 4% faster on the deeply nested expressions and 5.8x faster on long strings. Built the way these libraries are normally used, trees cost much more: rust-peg with tree actions takes 3-6x longer than zgram on JSON and 5-10x on expressions; the X3 and lexy typed ASTs 4-6x on JSON; pest, PEGTL's and lexy's built-in trees 7-120x.
 
-**Validating**, zgram's `matches()` is 1.2-2.7x faster than Spirit X3 and lexy on the regular inputs, and 6-7x faster on long strings.
+**Validating**, zgram's `matches()` is 1.3-2.8x faster than Spirit X3 and lexy on the regular inputs, and 5-7x faster on long strings.
 
 **Why zgram is fast:**
 
 - The grammar is JIT-compiled with LLVM for the exact CPU it runs on.
 - Trees go into one flat, contiguous array (16 bytes per node), with no allocation per node. That's the main gap to rust-peg's tree actions and the typed ASTs, which allocate vectors, strings and maps per node.
 - Character classes are tested with a range compare or a few equality tests where possible, and loops over them test the first 8 bytes one at a time before switching to 16/32-byte SIMD. Most runs in real input are short (a space, a few digits); long ones, like the strings input, are where SIMD pays off.
+- An alternative that starts with a rule's call is tried only when the next byte can start it (`number` isn't called at a letter), and a rule called from one place is compiled into it: one call less per match.
 - The validator drops all tree and error bookkeeping and inlines everything except one rule per recursion cycle, as compile-time parser generators do (up to a size limit per function, which these grammars stay well under).
 
-**Compile time is not included.** zgram compiles a grammar at runtime: about 90 ms for these grammars (cached afterwards), plus about 0.1 s for the validator on first use of `matches()`. The other libraries compile ahead of time.
+**Compile time is not included.** zgram compiles a grammar at runtime: about 90 ms for these grammars, plus about 0.1 s for the validator on first use of `matches()`; the compiled code is kept on disk, so later processes load it in a few milliseconds. The other libraries compile ahead of time.
 
 **Compiler matters for the C++ libraries.** They are built with GCC, which is 1.6-3x faster than Clang for lexy and Spirit X3 here. zgram generates its code with LLVM.
 

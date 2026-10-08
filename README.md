@@ -42,7 +42,7 @@ Compared to other Python parser generators:
 | pyparsing | Combinator | 87.1us (727x) | 1,494us (1442x) | 25,041us (1554x) |
 | lark | Earley | 511us (4269x) | 12,696us (12253x) | 261,962us (16257x) |
 
-Against the fastest parsing libraries in C++ and Rust (Spirit X3, lexy, PEGTL, rust-peg, pest), zgram is the fastest in 15 of 16 benchmark comparisons across a JSON and an expression grammar, whether they build a parse tree or only validate: Spirit X3 building the same flat node array takes 1.3-1.7x longer on typical input, rust-peg with tree actions 3-10x, and for validation only (`matches()`) compile-time C++ takes 1.2-2.7x longer. The exception is a deeply nested expression tree, where Spirit X3 is 9% faster. See [BENCHMARK.md](https://github.com/dzonerzy/zgram/blob/main/BENCHMARK.md). String-heavy input is where zgram's SIMD code shines: a 75 KB JSON document of long strings parses in 10us (7.5 GB/s).
+Against the fastest parsing libraries in C++ and Rust (Spirit X3, lexy, PEGTL, rust-peg, pest), zgram is the fastest or tied in all 16 benchmark comparisons across a JSON and an expression grammar, whether they build a parse tree or only validate: Spirit X3 building the same flat node array takes 1.5-1.8x longer on typical input, rust-peg with tree actions 3-10x, and for validation only (`matches()`) compile-time C++ takes 1.3-2.8x longer (lexy ties it on deeply nested expressions). See [BENCHMARK.md](https://github.com/dzonerzy/zgram/blob/main/BENCHMARK.md). String-heavy input is where zgram's SIMD code shines: a 75 KB JSON document of long strings parses in 9.2us (8.1 GB/s).
 
 > `json.loads` does **more** work (parses + builds Python dicts/lists). zgram returns a zero-copy parse tree.
 

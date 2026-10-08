@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - **Alternatives look at the next byte before calling a rule.** `primary = number | call | ident` no longer calls `number` at a letter: an alternative starting with a rule's call is tried only when the next byte can start it (its first set). One skipped records the failure the call would have, so errors are unchanged. The parse tree of the JSON benchmark's large file: 12.1 µs, was 16.3.
-- **A rule called from one place is inlined there** (a tree parser's, unless it ends a recursion cycle, is memoized, or has a loop of its own while making a node): one call less a match. The deep expression benchmark: 6.6 µs, was 8.1; Spirit X3 takes 6.8, so zgram is now the fastest on every benchmark.
+- **A rule called from one place is inlined there** (a tree parser's, unless it ends a recursion cycle, is memoized, or has a loop of its own while making a node): one call less a match. The deep expression benchmark: 6.6 µs, was 8.1; Spirit X3 takes 6.9, so zgram now builds every benchmark's tree fastest.
 
 ### Fixed
 - **Recovery on real files.** One stray token could end recovery and make the rest of a large file an error node; measured over nmap's Lua library joined into one 3 MB file with errors injected (a stray `)` at the start of random lines), each error is now one error, the file's structure kept:
