@@ -5,7 +5,7 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-10-08
 
 ### Added
 - **Compiled grammars kept on disk.** A grammar's compiled code (each parser kind's: parsing, `matches()`, recovery) is kept in the platform's cache directory, and another process compiling the same grammar loads it: Lua's grammar compiles in 8 ms instead of 0.5 s once kept. The key is what zgram generates for the grammar, salted with the zgram and LLVM versions and the CPU; a damaged file is compiled again. Parsers run at the same speed either way (measured on the benchmarks). `zgram.configure(cache=True|False|dir, cache_size=bytes)` (256 MiB by default, the least recently used deleted past it); `zgram.clear_cache(disk=True)` empties it.
