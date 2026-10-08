@@ -130,6 +130,23 @@ const Writer = struct {
     }
 };
 
+/// A character class of up to 4 printable punctuation characters (`[,;]`):
+/// them, in `out`, and how many; else null.
+fn punctuation(expr: *const gp.Expr, out: *[4]u8) ?usize {
+    if (expr.tag != .char_class or expr.char_negated) return null;
+    var n: usize = 0;
+    for (expr.char_ranges orelse return null) |r| {
+        var c: u16 = r.start;
+        while (c <= r.end) : (c += 1) {
+            const ch: u8 = @intCast(c);
+            if (n == out.len or ch <= ' ' or ch >= 0x7f or std.ascii.isAlphanumeric(ch) or ch == '_') return null;
+            out[n] = ch;
+            n += 1;
+        }
+    }
+    return if (n == 0) null else n;
+}
+
 fn describe(expr: *const gp.Expr) Expected {
     var e = Expected{};
     // Leave room for the closing delimiter
@@ -196,6 +213,21 @@ const Interp = struct {
         }
         if (self.quiet != 0 or pos < self.result.pos) return;
         if (pos > self.result.pos) self.result = .{ .pos = pos };
+        // (a few punctuation characters, a separator's `[,;]`: each named as
+        // the literal it stands for, not left out as a class)
+        var chars: [4]u8 = undefined;
+        if (punctuation(expr, &chars)) |n| {
+            for (chars[0..n]) |ch| {
+                var e = Expected{ .is_literal = true };
+                var w = Writer{ .buf = &e.buf };
+                w.put("'");
+                w.putChar(ch, '\'');
+                w.put("'");
+                e.len = @intCast(w.len);
+                self.expect(e);
+            }
+            return;
+        }
         self.expect(describe(expr));
     }
 

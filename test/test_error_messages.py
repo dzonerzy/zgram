@@ -90,6 +90,15 @@ def test_several_classes():
     assert error(p, "x")[0] == "expected [0-9], [a-f] or any character"
 
 
+def test_a_class_of_punctuation_is_named_by_its_characters():
+    # (a separator written `[,;]`: its characters, as literals, with the rest)
+    p = zgram.compile("t = '{' w ([,;] w)* '}'\nw = [a-z]+")
+    assert error(p, "{a b}")[0] == "expected ',', ';' or '}'"
+    # (letters, or more than four characters: a class)
+    q = zgram.compile("t = 'x' [,;:.!]")
+    assert error(q, "xa")[0] == "expected [,;:.!]"
+
+
 def test_negated_class_and_escapes():
     p = zgram.compile("s = 'a' [^\\n\\]x] '\\t' 'it\\'s'")
     assert error(p, "a\n")[0] == "expected [^\\n\\]x]"
