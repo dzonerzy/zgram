@@ -44,7 +44,9 @@ def test_notes():
 
 
 def test_equality():
-    make = lambda msg="m": Diagnostic("error", "c", msg, (1, 2), 3, 4, [Diagnostic("note", "", "n", (0, 0))])
+    def make(msg="m"):
+        return Diagnostic("error", "c", msg, (1, 2), 3, 4, [Diagnostic("note", "", "n", (0, 0))])
+
     assert make() == make()
     assert make() != make("other")
     assert Diagnostic("error", "c", "m", (1, 2)) != Diagnostic("error", "c", "m", (1, 3))

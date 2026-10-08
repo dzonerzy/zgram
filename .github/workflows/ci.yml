@@ -8,6 +8,14 @@ on:
     workflow_dispatch:
 
 jobs:
+    # The suite's lint: Ruff, as pyproject.toml configures it
+    lint:
+        name: Lint
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: astral-sh/ruff-action@v3
+
     # One portable abi3 wheel per platform (cp310-abi3: CPython 3.10+). Both
     # are built on Linux: the Windows wheel is cross-compiled, which takes a
     # minute where a Windows runner took three and a half. The tests below

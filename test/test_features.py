@@ -8,7 +8,7 @@ import time
 
 import pytest
 import zgram
-from test.conftest import JSON_GRAMMAR, LIST_GRAMMAR
+from test.conftest import LIST_GRAMMAR
 
 
 class TestCompileCache:

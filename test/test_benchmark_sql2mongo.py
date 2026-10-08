@@ -12,7 +12,6 @@ import sys
 import time
 
 import pytest
-import zgram
 
 # Add examples to path so we can import sql2mongo
 sys.path.insert(

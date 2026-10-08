@@ -380,8 +380,9 @@ class TestParserReuse:
         p = zgram.compile("root = [a-z]+\n")
         r1 = p.parse("hello")
         r2 = p.parse("world")
-        # Second parse should work correctly
+        # Second parse should work correctly, the first tree untouched by it
         assert r2.text() == "world"
+        assert r1.text() == "hello"
         # First result may be invalid now (output reused), but shouldn't crash
         # (This tests that the parser reuses its output buffer correctly)
 

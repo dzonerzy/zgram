@@ -56,3 +56,12 @@ abi3 = true
 # manylinux_2_17_*). Set a manylinux tag to pick another glibc baseline, or a
 # linux_* tag for a native, non-portable build.
 # linux-platform-tag = "manylinux_2_28_x86_64"
+
+# The suite's lint (CI's lint job): pyflakes, pycodestyle, pyupgrade for 3.10+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = ["zig-pkg", "zig-out", "vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "UP"]
+ignore = ["E501"]

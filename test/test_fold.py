@@ -228,7 +228,7 @@ class TestLongChains:
     @pytest.mark.parametrize("fold", ["left", "right"])
     @pytest.mark.parametrize("n", [2, 100, 300, 5000])
     def test_depth_and_order(self, fold, n):
-        p = zgram.compile("@%s sum = left:num (op:plus right:num)*\nnum = [0-9]+\nplus = '+'" % fold)
+        p = zgram.compile(f"@{fold} sum = left:num (op:plus right:num)*\nnum = [0-9]+\nplus = '+'")
         node = p.parse("+".join(str(i) for i in range(n)))
         inner, leaf = ("left", "right") if fold == "left" else ("right", "left")
         seen = []
@@ -267,7 +267,9 @@ class TestAgainstPythonFold:
         items = [cls.fold(c, how, c.field()) for c in kids]
         if len(items) == 1:
             return items[0][:1] + (field,) + items[0][2:]
-        relabel = lambda t, f: t[:1] + (f,) + t[2:]
+        def relabel(t, f):
+            return t[:1] + (f,) + t[2:]
+
         if how == "left":
             acc = items[0]
             for i in range(1, len(items), 2):
