@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Compiled grammars kept on disk.** A grammar's compiled code (each parser kind's: parsing, `matches()`, recovery) is kept in the platform's cache directory, and another process compiling the same grammar loads it: Lua's grammar compiles in 8 ms instead of 0.5 s once kept. The key is what zgram generates for the grammar, salted with the zgram and LLVM versions and the CPU; a damaged file is compiled again. Parsers run at the same speed either way (measured on the benchmarks). `zgram.configure(cache=True|False|dir, cache_size=bytes)` (256 MiB by default, the least recently used deleted past it); `zgram.clear_cache(disk=True)` empties it.
+
 ### Fixed
 - **Recovery on real files.** One stray token could end recovery and make the rest of a large file an error node; measured over nmap's Lua library joined into one 3 MB file with errors injected (a stray `)` at the start of random lines), each error is now one error, the file's structure kept:
   - Brackets in comments and strings no longer count as the code's: a `(` in a comment made a later stray `)` look like the closing bracket of something, so recovery stopped there instead of skipping it. The recovering parser notes where it matched brackets as literals and counts those.

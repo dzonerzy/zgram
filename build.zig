@@ -178,6 +178,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core_mod.addIncludePath(llvm_include_path);
+    core_mod.addOptions("build_options", build_options);
     for (llvm_libs) |lib_name| {
         core_mod.addObjectFile(llvm_lib_path.path(b, b.fmt("lib{s}.a", .{lib_name})));
     }

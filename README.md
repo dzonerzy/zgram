@@ -21,7 +21,7 @@ Built with [PyOZ](https://github.com/pyozig/PyOZ)
 
 ## Performance
 
-zgram compiles PEG grammars into SIMD-accelerated native code via LLVM JIT at runtime. No subprocess, no disk cache, no `.so` files -- grammars compile in-process in milliseconds.
+zgram compiles PEG grammars into SIMD-accelerated native code via LLVM JIT at runtime. No subprocess, no `.so` files -- grammars compile in-process in milliseconds, and the compiled code is kept on disk: the next process loads it instead.
 
 On a JSON parsing benchmark (from Python, including call overhead):
 
@@ -286,7 +286,7 @@ A JSON grammar with `-> dict`, `-> list`, `-> float` and `-> unquote` converts t
 ```python
 zgram.compile(grammar: str, ast=None) -> GrammarParser
 ```
-Compile a PEG grammar string into a native parser via LLVM JIT. `ast` supplies the classes named by `-> Name` actions (see [Building an AST](#building-an-ast---name-and-parse_ast)). Compilation happens in-process -- no subprocess, no disk I/O -- and releases the GIL. The 16 most recently compiled grammars are cached, so compiling the same grammar again returns in microseconds.
+Compile a PEG grammar string into a native parser via LLVM JIT. `ast` supplies the classes named by `-> Name` actions (see [Building an AST](#building-an-ast---name-and-parse_ast)). Compilation happens in-process -- no subprocess -- and releases the GIL. The 16 most recently compiled grammars are cached, so compiling the same grammar again returns in microseconds. The compiled code is also kept on disk (see `configure()`): another process compiling the same grammar loads it (Lua's grammar: 8 ms instead of 0.5 s).
 
 ```python
 await zgram.compile_async(grammar: str, ast=None) -> GrammarParser
@@ -294,9 +294,14 @@ await zgram.compile_async(grammar: str, ast=None) -> GrammarParser
 Compile on a worker thread without blocking the event loop (a cold compile takes ~100 ms of LLVM work). `ast` is bound when the compile finishes, as in `compile()`; a missing class raises `ValueError` from the `await`. `grammar` is positional-only here.
 
 ```python
-zgram.clear_cache() -> None
+zgram.clear_cache(disk=False) -> None
 ```
-Drop the compiled-grammar cache. Existing parsers keep working.
+Drop the compiled-grammar cache. Existing parsers keep working. `disk=True` deletes the compiled code kept on disk too.
+
+```python
+zgram.configure(cache=None, cache_size=None) -> None
+```
+Where compiled grammars are kept between processes: `cache=True` (the default: `%LOCALAPPDATA%\zgram\Cache` on Windows, `~/Library/Caches/zgram` on macOS, `$XDG_CACHE_HOME/zgram` or `~/.cache/zgram` elsewhere), `False` (none: every process compiles), or a directory. `cache_size` is the most it takes, in bytes (256 MiB by default, 0 for no limit): past it, the code used least recently is deleted, down to 80% of the limit. Each parser kind (`parse`, `matches()`, recovery) is kept as its own object file, keyed by what zgram generated for the grammar and by the zgram version, LLVM version and CPU it was compiled for: a file made for another of these is never loaded, and a damaged one is compiled again. Settings not given stay.
 
 ```python
 zgram.dump_ir(grammar: str) -> str
@@ -605,7 +610,8 @@ Grammar string
 
 Key implementation details:
 
-- **LLVM JIT compilation**: Grammars compile to native x86-64 code in-process via LLVM's ORC LLJIT. No subprocess, no `.so` files, no disk cache. Each grammar gets its own ResourceTracker for independent cleanup.
+- **LLVM JIT compilation**: Grammars compile to native x86-64 code in-process via LLVM's ORC LLJIT. No subprocess, no `.so` files. Each grammar gets its own ResourceTracker for independent cleanup.
+- **Disk cache** (`src/disk_cache.zig`): each parser module's object file, keyed by the module's bitcode before optimizing (salted with the zgram and LLVM versions and the host CPU), loaded into the JIT instead of compiling. Optimizing and code generation are 93% of a compile.
 - **SIMD character scanning**: Character class repetitions (`[a-z]+`, `[^"\\]*`) test the first 8 bytes one at a time (most runs are a space or a few digits) and continue in an out-of-line 16-byte (SSE2) or 32-byte (AVX2) vector loop only for longer runs. Single ranges, small included sets and small excluded sets are vectorized, including through `@silent` rules and in loops like JSON's `(escape | plain)*`: when the other branches can't start with a byte of the class, runs of it are scanned in bulk and the other branches are tried only where a run stops.
 - **Inline node allocation**: Rule functions reserve nodes via an inlined fast path (compare + increment) with a slow path fallback to `zgram_ensure_capacity`. Node filling is also inlined -- no function call overhead per node.
 - **High-water mark errors**: Every rule failure updates `max_pos = max(max_pos, pos)`. On parse failure, the error is reported at the furthest position reached with `"expected <rule_name>"`.
@@ -632,6 +638,7 @@ src/
   grammar_parser.zig    # PEG grammar -> IR (with left-recursion detection)
   jit_codegen.zig       # IR -> LLVM IR (SIMD, inline alloc, HWM tracking)
   jit_compiler.zig      # LLVM ORC LLJIT compilation + ResourceTracker
+  disk_cache.zig        # Compiled grammars kept on disk between processes
   jit_helpers.zig       # Runtime helpers called by JIT code (node alloc, errors)
   llvm_builder.zig      # Ergonomic wrapper over LLVM C API
   parse_abi.zig         # FlatNode/ParseOutput C ABI structs (16 bytes per node)
@@ -640,6 +647,7 @@ test/
   conftest.py                  # Shared fixtures (JSON/list grammars)
   test_node_api.py             # Node/GrammarParser Python API tests
   test_features.py             # Compile cache, async, start rules, match, to_tuple, @memo, threads, SIMD loops
+  test_disk_cache.py           # Compiled grammars kept on disk between processes
   test_differential.py         # Random grammars/inputs checked against peg_reference.py
   peg_reference.py             # Reference PEG interpreter in Python (for differential tests)
   test_grammar_correctness.py  # Grammar pattern correctness

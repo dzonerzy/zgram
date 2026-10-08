@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const abi = @import("parse_abi.zig");
 const LB = @import("llvm_builder.zig");
+const disk_cache = @import("disk_cache.zig");
 
 // Use the same LLVM C bindings as llvm_builder to avoid opaque type mismatches
 const c = LB.llvm;
@@ -209,6 +210,10 @@ pub const JitResult = struct {
 /// Takes ownership of both the module and context (they are consumed by LLJIT).
 /// Returns a JitResult with the function pointer and a ResourceHandle that must
 /// be passed to `releaseGrammar()` when the grammar is no longer needed.
+///
+/// With the disk cache (disk_cache.zig): the module's object is loaded from
+/// it when there, else compiled to an object (optimized as below), kept
+/// there and loaded.
 pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!JitResult {
     // Ensure JIT (and the target registry the optimizer needs) is initialized
     const jit = blk: {
@@ -217,6 +222,28 @@ pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!JitRe
         try initJit();
         break :blk global_jit orelse return JitError.JitNotInitialized;
     };
+
+    if (disk_cache.dir() != null) {
+        if (keyOf(jit, module)) |key| {
+            defer {
+                c.LLVMDisposeModule(module);
+                c.LLVMContextDispose(ctx);
+            }
+            const a = std.heap.c_allocator;
+            if (shared(key)) |r| return r;
+            if (disk_cache.read(a, key)) |object| {
+                defer a.free(object);
+                if (loadObject(jit, key, object)) |r| return r;
+            }
+            try optimizeModule(jit, module);
+            const object = try emitObject(jit, module, key);
+            defer a.free(object);
+            const r = loadObject(jit, key, object) orelse return JitError.LLVMError;
+            // (kept once it's known to load)
+            disk_cache.write(key, object);
+            return r;
+        }
+    }
 
     // Run the O3 pipeline. The module and context belong to this call, so
     // concurrent compiles optimize in parallel.
@@ -278,11 +305,136 @@ pub fn jitCompile(module: c.LLVMModuleRef, ctx: c.LLVMContextRef) JitError!JitRe
     };
 }
 
+// ----------------------------------------------------------------------
+// Objects of the disk cache
+// ----------------------------------------------------------------------
+
+/// The LLVM zgram is built with
+pub const LLVM_VERSION = "21.1.8";
+
+/// A cached object loaded: its parsers share it (an object defines its
+/// entry by its key's name: loaded once per process)
+const Live = struct { key: disk_cache.Key, parse_fn: abi.ParseFn, rt: ResourceHandle, refs: u32 };
+/// (guarded by the JIT's lock)
+var live: std.ArrayListUnmanaged(Live) = .empty;
+
+/// The module's key: its bitcode, salted with what its object depends on
+/// besides (disk_cache.zig); null if the bitcode can't be had.
+fn keyOf(jit: c.LLVMOrcLLJITRef, module: c.LLVMModuleRef) ?disk_cache.Key {
+    const buf = c.LLVMWriteBitcodeToMemoryBuffer(module) orelse return null;
+    defer c.LLVMDisposeMemoryBuffer(buf);
+    const bitcode: [*]const u8 = @ptrCast(c.LLVMGetBufferStart(buf));
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for ([_][]const u8{ disk_cache.format, @import("build_options").version, LLVM_VERSION, std.mem.span(c.LLVMOrcLLJITGetTripleString(jit)) }) |s| {
+        h.update(s);
+        h.update("\x00");
+    }
+    const cpu = c.LLVMGetHostCPUName();
+    defer c.LLVMDisposeMessage(cpu);
+    const features = c.LLVMGetHostCPUFeatures();
+    defer c.LLVMDisposeMessage(features);
+    h.update(std.mem.span(cpu));
+    h.update("\x00");
+    h.update(std.mem.span(features));
+    h.update("\x00");
+    h.update(bitcode[0..c.LLVMGetBufferSize(buf)]);
+    var key: disk_cache.Key = undefined;
+    h.final(&key);
+    return key;
+}
+
+/// The name of the entry of the object of `key`.
+fn entryName(buf: *[40]u8, key: disk_cache.Key) [*:0]const u8 {
+    const hex = std.fmt.bytesToHex(key[0..12], .lower);
+    return std.fmt.bufPrintZ(buf, "zgram_parse_k{s}", .{&hex}) catch unreachable;
+}
+
+/// The object of `key`, if this process has it loaded: shared.
+fn shared(key: disk_cache.Key) ?JitResult {
+    lockJit();
+    defer unlockJit();
+    for (live.items) |*l| if (std.mem.eql(u8, &l.key, &key)) {
+        l.refs += 1;
+        return .{ .parse_fn = l.parse_fn, .resource = l.rt };
+    };
+    return null;
+}
+
+/// The object added to the JIT and its entry found (or this process's copy
+/// of it shared), or null: it doesn't load.
+fn loadObject(jit: c.LLVMOrcLLJITRef, key: disk_cache.Key, object: []const u8) ?JitResult {
+    lockJit();
+    defer unlockJit();
+    // (another thread loaded the same meanwhile)
+    for (live.items) |*l| if (std.mem.eql(u8, &l.key, &key)) {
+        l.refs += 1;
+        return .{ .parse_fn = l.parse_fn, .resource = l.rt };
+    };
+    live.ensureUnusedCapacity(std.heap.c_allocator, 1) catch return null;
+    const buf = c.LLVMCreateMemoryBufferWithMemoryRangeCopy(object.ptr, object.len, "zgram.grammar");
+    const dylib = c.LLVMOrcLLJITGetMainJITDylib(jit);
+    const rt = c.LLVMOrcJITDylibCreateResourceTracker(dylib);
+    if (c.LLVMOrcLLJITAddObjectFileWithRT(jit, rt, buf)) |e| {
+        c.LLVMConsumeError(e);
+        c.LLVMOrcReleaseResourceTracker(rt);
+        return null;
+    }
+    var name: [40]u8 = undefined;
+    var addr: c.LLVMOrcExecutorAddress = 0;
+    if (c.LLVMOrcLLJITLookup(jit, &addr, entryName(&name, key))) |e| c.LLVMConsumeError(e);
+    if (addr == 0) {
+        if (c.LLVMOrcResourceTrackerRemove(rt)) |e| c.LLVMConsumeError(e);
+        c.LLVMOrcReleaseResourceTracker(rt);
+        return null;
+    }
+    const r: JitResult = .{ .parse_fn = @ptrFromInt(addr), .resource = rt };
+    live.appendAssumeCapacity(.{ .key = key, .parse_fn = r.parse_fn, .rt = rt, .refs = 1 });
+    return r;
+}
+
+/// The optimized module's object for this host, its entry named for `key`
+/// (owned by the caller: c_allocator's).
+fn emitObject(jit: c.LLVMOrcLLJITRef, module: c.LLVMModuleRef, key: disk_cache.Key) JitError![]u8 {
+    var name: [40]u8 = undefined;
+    const entry = c.LLVMGetNamedFunction(module, "zgram_parse") orelse return JitError.SymbolNotFound;
+    c.LLVMSetValueName(entry, entryName(&name, key));
+
+    const triple = c.LLVMOrcLLJITGetTripleString(jit);
+    const cpu = c.LLVMGetHostCPUName();
+    defer c.LLVMDisposeMessage(cpu);
+    const features = c.LLVMGetHostCPUFeatures();
+    defer c.LLVMDisposeMessage(features);
+    var target: c.LLVMTargetRef = null;
+    var msg: [*c]u8 = null;
+    if (c.LLVMGetTargetFromTriple(triple, &target, &msg) != 0) {
+        if (msg) |m| c.LLVMDisposeMessage(m);
+        return JitError.LLVMError;
+    }
+    // (as LLJIT's own code generation: its level, PIC, the small model)
+    const tm = c.LLVMCreateTargetMachine(target, triple, cpu, features, c.LLVMCodeGenLevelDefault, c.LLVMRelocPIC, c.LLVMCodeModelSmall);
+    defer c.LLVMDisposeTargetMachine(tm);
+    var buf: c.LLVMMemoryBufferRef = null;
+    if (c.LLVMTargetMachineEmitToMemoryBuffer(tm, module, c.LLVMObjectFile, &msg, &buf) != 0) {
+        if (msg) |m| c.LLVMDisposeMessage(m);
+        return JitError.LLVMError;
+    }
+    defer c.LLVMDisposeMemoryBuffer(buf);
+    const start: [*]const u8 = @ptrCast(c.LLVMGetBufferStart(buf));
+    return std.heap.c_allocator.dupe(u8, start[0..c.LLVMGetBufferSize(buf)]) catch JitError.LLVMError;
+}
+
 /// Release all JIT-compiled code and resources associated with a grammar.
 /// After this call, the parse function pointer is invalid and must not be used.
+/// (A cached object's: when the last parser sharing it is released.)
 pub fn releaseGrammar(resource: ResourceHandle) void {
     lockJit();
     defer unlockJit();
+    for (live.items, 0..) |*l, i| if (l.rt == resource) {
+        l.refs -= 1;
+        if (l.refs > 0) return;
+        _ = live.swapRemove(i);
+        break;
+    };
     if (resource) |rt| {
         // Remove all JIT code tracked by this ResourceTracker
         const err = c.LLVMOrcResourceTrackerRemove(rt);

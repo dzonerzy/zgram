@@ -6,6 +6,7 @@ const abi = @import("parse_abi.zig");
 const grammar_parser = @import("grammar_parser.zig");
 const jit_codegen = @import("jit_codegen.zig");
 const jit_compiler = @import("jit_compiler.zig");
+const disk_cache = @import("disk_cache.zig");
 const llvm_capsule_mod = @import("llvm_capsule.zig");
 const jit_helpers = @import("jit_helpers.zig");
 const diagnose = @import("diagnose.zig");
@@ -2818,9 +2819,47 @@ fn compile(args: pyoz.Args(struct { grammar: []const u8, ast: ?*pyoz.PyObject = 
     return .{ .value = parser };
 }
 
-/// Drop cached compiled grammars (parsers already created keep working).
-fn clear_cache() void {
+/// Drop cached compiled grammars (parsers already created keep working);
+/// disk=True: the compiled grammars kept on disk too.
+fn clear_cache(args: pyoz.Args(struct { disk: bool = false })) void {
     cache.clear();
+    if (args.value.disk) disk_cache.trim(0);
+}
+
+/// zgram.configure(cache=None, cache_size=None): process-wide settings
+/// (those not given stay).
+fn configure(args: pyoz.Args(struct { cache: ?*pyoz.PyObject = null, cache_size: ?*pyoz.PyObject = null })) pyoz.Signature(?*pyoz.PyObject, "None") {
+    const v = args.value;
+    if (v.cache_size) |s| if (s != py.Py_None()) {
+        const n = py.c.PyLong_AsLongLong(s);
+        if (n == -1 and py.c.PyErr_Occurred() != null) {
+            py.c.PyErr_Clear();
+            py.PyErr_SetString(py.PyExc_TypeError(), "cache_size must be an int (bytes; 0: no limit)");
+            return .{ .value = null };
+        }
+        if (n < 0) {
+            py.PyErr_SetString(py.PyExc_ValueError(), "cache_size must be 0 (no limit) or more bytes");
+            return .{ .value = null };
+        }
+        disk_cache.limit = @intCast(n);
+    };
+    if (v.cache) |c| if (c != py.Py_None()) {
+        const s: disk_cache.Setting = if (c == py.Py_True()) .default else if (c == py.Py_False()) .off else blk: {
+            var len: py.c.Py_ssize_t = 0;
+            const p = py.c.PyUnicode_AsUTF8AndSize(c, &len) orelse {
+                py.c.PyErr_Clear();
+                py.PyErr_SetString(py.PyExc_TypeError(), "cache must be True, False or a directory (str)");
+                return .{ .value = null };
+            };
+            break :blk .{ .dir = p[0..@intCast(len)] };
+        };
+        disk_cache.set(s) catch {
+            _ = py.c.PyErr_NoMemory();
+            return .{ .value = null };
+        };
+    };
+    py.Py_IncRef(py.Py_None());
+    return .{ .value = py.Py_None() };
 }
 
 /// Dump the LLVM IR text for a grammar (useful for debugging/optimization).
@@ -2887,7 +2926,8 @@ pub const Module = pyoz.module(.{
     .funcs = &.{
         pyoz.func("compile", compile, "Compile a grammar string into a native parser. ast= supplies the classes named by `-> Class` actions."),
         pyoz.func("compile_async", pyoz.asyncThen(compileNative, bindAfterCompile), "Compile a grammar on a worker thread; returns an awaitable GrammarParser. ast= supplies the classes named by `-> Class` actions.").withParams("grammar, ast"),
-        pyoz.func("clear_cache", clear_cache, "Drop cached compiled grammars"),
+        pyoz.func("clear_cache", clear_cache, "clear_cache(disk=False): drop the compiled grammars cached in memory (parsers already made keep working); disk=True: those kept on disk too."),
+        pyoz.func("configure", configure, "configure(cache=None, cache_size=None): process-wide settings (those not given stay). cache: True (default: compiled grammars kept between processes in the platform's place for caches: %LOCALAPPDATA%\\zgram\\Cache on Windows, ~/Library/Caches/zgram on macOS, $XDG_CACHE_HOME/zgram or ~/.cache/zgram elsewhere), False (none: every process compiles), or a directory; cache_size: the most it takes, in bytes (default 256 MiB; 0: no limit): past it, the least recently used go, down to 80% of it."),
         pyoz.func("dump_ir", dump_ir, "Dump LLVM IR text for a grammar").withParams("grammar"),
         pyoz.func("version", version, "Return zgram version string"),
         pyoz.func("llvm_capsule", llvm_capsule, "The 'zgram.llvm.v1' capsule: zgram's LLVM for native code in other packages (LLVM's C API to build modules in memory; zgram's JIT to compile them, or an object file). See src/llvm_capsule.zig for its layout."),

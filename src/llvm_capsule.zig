@@ -61,7 +61,7 @@ pub const LlvmView = extern struct {
 };
 
 pub const view = LlvmView{
-    .llvm_version = "21.1.8",
+    .llvm_version = jc.LLVM_VERSION,
     .function = &function,
     .compile = &compile,
     .lookup = &lookup,

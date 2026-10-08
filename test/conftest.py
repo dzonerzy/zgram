@@ -5,6 +5,14 @@ import json
 import pytest
 import zgram
 
+
+@pytest.fixture(scope="session", autouse=True)
+def _disk_cache(tmp_path_factory):
+    """The tests' compiled grammars kept apart from the user's."""
+    zgram.configure(cache=str(tmp_path_factory.mktemp("zgram-cache")))
+    yield
+    zgram.configure(cache=True)
+
 # ── Common grammars ──
 
 JSON_GRAMMAR = (
