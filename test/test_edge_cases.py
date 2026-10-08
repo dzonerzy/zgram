@@ -1039,3 +1039,17 @@ class TestRuleLimits:
         grammar += "r79 = root 'y'\n"
         with pytest.raises(ValueError):
             zgram.compile(grammar)
+
+    def test_a_silent_rule_calling_itself_many_times(self):
+        """Compiles at once: what a silent rule's node holds is worked out
+        without following each of its calls of itself (it took 4^16 steps)."""
+        grammar = "r0 = [^c]\n@silent r1 = ((r0*) (r1?) r1) (r1 | . | (r1 | r0))\n"
+        try:
+            zgram.compile(grammar)
+        except ValueError:
+            pass
+        labelled = "top = x:r1\nr0 = [^c]\n@silent r1 = y:r0 (r1? r1 r1 | r1 r1 | 'a')\n"
+        try:
+            zgram.compile(labelled)
+        except ValueError:
+            pass

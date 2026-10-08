@@ -160,6 +160,17 @@ class TestInsertion:
         t = parser.parse_tree("a = 1;", recover=True)
         assert all(n.rule() != "let_stmt" for n in t.root)
 
+    def test_a_list_separator_class(self):
+        # Lua's `[,;]`: a missing separator is inserted (its first byte), the
+        # items after it kept
+        p = zgram.compile("list = '{' ws (item (ws [,;] ws item)*)? ws '}'\nitem = [a-z]+\n@silent ws = [ ]*\n")
+        t = p.parse_tree("{a b; c d}", recover=True)
+        assert [(n.rule(), n.text()) for n in t.root] == [("item", "a"), ("item", "b"), ("item", "c"), ("item", "d")]
+        assert len(t.errors) == 2
+        # (a class of letters isn't a separator: not inserted)
+        q = zgram.compile("list = '{' ws (item (ws [xy] ws item)*)? ws '}'\nitem = [0-9]+\n@silent ws = [ ]*\n")
+        assert all(n.rule() != "item" or n.text() != "2" for n in q.parse_tree("{1 2}", recover=True).root)
+
     def test_a_list_separator(self, parser):
         t = parser.parse_tree("let c = f(a 2);", recover=True)
         call = t.root[0].get("value")

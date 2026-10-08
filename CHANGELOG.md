@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Compiled grammars kept on disk.** A grammar's compiled code (each parser kind's: parsing, `matches()`, recovery) is kept in the platform's cache directory, and another process compiling the same grammar loads it: Lua's grammar compiles in 8 ms instead of 0.5 s once kept. The key is what zgram generates for the grammar, salted with the zgram and LLVM versions and the CPU; a damaged file is compiled again. Parsers run at the same speed either way (measured on the benchmarks). `zgram.configure(cache=True|False|dir, cache_size=bytes)` (256 MiB by default, the least recently used deleted past it); `zgram.clear_cache(disk=True)` empties it.
 
+### Performance
+- **Alternatives look at the next byte before calling a rule.** `primary = number | call | ident` no longer calls `number` at a letter: an alternative starting with a rule's call is tried only when the next byte can start it (its first set). One skipped records the failure the call would have, so errors are unchanged. The parse tree of the JSON benchmark's large file: 12.1 µs, was 16.3.
+- **A rule called from one place is inlined there** (a tree parser's, unless it ends a recursion cycle, is memoized, or has a loop of its own while making a node): one call less a match. The deep expression benchmark: 6.6 µs, was 8.1; Spirit X3 takes 6.8, so zgram is now the fastest on every benchmark.
+
 ### Fixed
 - **Recovery on real files.** One stray token could end recovery and make the rest of a large file an error node; measured over nmap's Lua library joined into one 3 MB file with errors injected (a stray `)` at the start of random lines), each error is now one error, the file's structure kept:
   - Brackets in comments and strings no longer count as the code's: a `(` in a comment made a later stray `)` look like the closing bracket of something, so recovery stopped there instead of skipping it. The recovering parser notes where it matched brackets as literals and counts those.
@@ -19,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Chains (operators, suffixes, arguments) recover from an error inside one of their elements only: one where their next element would begin is the next statement's (`f(x)` then a stray `)` on the next line no longer let the call's suffixes skip to the next `.`).
   - A missing closing literal (`end`, `)`, `}`) found later on its line is matched there, the broken text before it an error node (`)   end,` closes the function).
   - A list's first element in brackets (a table's first field) recovers as the others do (a stray `)` before it no longer closes the table).
+  - A missing separator written as a class of punctuation (Lua's `[,;]`) is inserted, as a literal one is: `{a = 1 b = 2}` keeps `b = 2` a field.
+- **Compiling a grammar with a silent rule that calls itself several times no longer hangs** (`@silent r = (r? r) (r | 'a')`): what its node can hold was worked out by following every call down to 16 levels, 4^16 steps; now each rule's once.
 
 ## [0.4.2] - 2026-10-07
 

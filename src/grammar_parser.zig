@@ -938,14 +938,22 @@ fn nodeCount(grammar: *const Grammar, expr: *const Expr, depth: u8) u8 {
             if (depth >= MAX_SILENT_DEPTH) return 2;
             return nodeCount(grammar, rule.expr, depth + 1);
         },
+        // (2 is the most: the rest isn't looked at once it's reached, or a
+        // silent rule calling itself several times takes exponential time)
         .sequence => {
             var n: u8 = 0;
-            for (expr.children orelse return 0) |child| n = @min(2, n + nodeCount(grammar, child, depth));
+            for (expr.children orelse return 0) |child| {
+                n = @min(2, n + nodeCount(grammar, child, depth));
+                if (n == 2) break;
+            }
             return n;
         },
         .alternative => {
             var n: u8 = 0;
-            for (expr.children orelse return 0) |child| n = @max(n, nodeCount(grammar, child, depth));
+            for (expr.children orelse return 0) |child| {
+                n = @max(n, nodeCount(grammar, child, depth));
+                if (n == 2) break;
+            }
             return n;
         },
         .repetition => {
@@ -959,37 +967,68 @@ fn nodeCount(grammar: *const Grammar, expr: *const Expr, depth: u8) u8 {
 /// @silent rules count for the rule that references them. `fold_rep` is the
 /// trailing repetition of a folded rule: each of its iterations is a node of
 /// its own, so it counts once.
-fn labelCounts(grammar: *const Grammar, expr: *const Expr, depth: u8, fold_rep: ?*const Expr, out: *Counts) void {
+fn labelCounts(grammar: *const Grammar, expr: *const Expr, depth: u8, fold_rep: ?*const Expr, out: *Counts, memo: *LabelMemo) void {
     switch (expr.tag) {
         .literal, .char_class, .any_char, .not_predicate, .and_predicate => {},
         .reference => {
-            const rule = findRule(grammar, expr.ref_name orelse return) orelse return;
+            const idx = findRuleIndex(grammar, expr.ref_name orelse return) orelse return;
+            const rule = grammar.rules[idx];
             if (expr.field_id != 0) {
                 const n: u8 = if (rule.silent) @max(1, nodeCount(grammar, rule.expr, depth + 1)) else 1;
                 out[expr.field_id] = @min(2, out[expr.field_id] + n);
             } else if (rule.silent and depth < MAX_SILENT_DEPTH) {
-                labelCounts(grammar, rule.expr, depth + 1, null, out);
+                const sub = silentLabels(grammar, idx, depth + 1, memo);
+                for (out, sub) |*o, c| o.* = @min(2, o.* + c);
             }
         },
         .sequence => {
-            for (expr.children orelse return) |child| labelCounts(grammar, child, depth, fold_rep, out);
+            for (expr.children orelse return) |child| labelCounts(grammar, child, depth, fold_rep, out, memo);
         },
         .alternative => {
             var most: Counts = @splat(0);
             for (expr.children orelse return) |child| {
                 var branch: Counts = @splat(0);
-                labelCounts(grammar, child, depth, null, &branch);
+                labelCounts(grammar, child, depth, null, &branch, memo);
                 for (&most, branch) |*m, c| m.* = @max(m.*, c);
             }
             for (out, most) |*o, m| o.* = @min(2, o.* + m);
         },
         .repetition => {
             var inner: Counts = @splat(0);
-            labelCounts(grammar, expr.rep_expr orelse return, depth, null, &inner);
+            labelCounts(grammar, expr.rep_expr orelse return, depth, null, &inner, memo);
             const once = expr.rep_kind == '?' or expr == fold_rep;
             for (out, inner) |*o, c| o.* = @min(2, o.* + if (once or c == 0) c else 2);
         },
     }
+}
+
+/// The label counts of a silent rule's body at a depth, each worked out
+/// once (by rule and depth: what they are depends on nothing else), or a
+/// silent rule calling itself several times takes exponential time.
+const LabelMemo = struct {
+    known: []bool,
+    counts: []Counts,
+
+    fn slot(idx: usize, depth: u8) usize {
+        return idx * (MAX_SILENT_DEPTH + 1) + depth;
+    }
+};
+
+fn silentLabels(grammar: *const Grammar, idx: usize, depth: u8, memo: *LabelMemo) Counts {
+    const s = LabelMemo.slot(idx, depth);
+    if (memo.known[s]) return memo.counts[s];
+    var c: Counts = @splat(0);
+    labelCounts(grammar, grammar.rules[idx].expr, depth, null, &c, memo);
+    memo.counts[s] = c;
+    memo.known[s] = true;
+    return c;
+}
+
+fn findRuleIndex(grammar: *const Grammar, name: []const u8) ?usize {
+    for (grammar.rules, 0..) |r, i| {
+        if (std.mem.eql(u8, r.name, name)) return i;
+    }
+    return null;
 }
 
 /// The labels a rule's node can have on its children, in field id order.
@@ -999,7 +1038,12 @@ pub fn ruleLabels(allocator: Allocator, grammar: *const Grammar, rule: *const Ru
         const seq = rule.expr.children.?;
         break :blk seq[seq.len - 1];
     } else null;
-    labelCounts(grammar, rule.expr, 0, fold_rep, &counts);
+    const slots = grammar.rules.len * (MAX_SILENT_DEPTH + 1);
+    var memo: LabelMemo = .{ .known = try allocator.alloc(bool, slots), .counts = try allocator.alloc(Counts, slots) };
+    defer allocator.free(memo.known);
+    defer allocator.free(memo.counts);
+    @memset(memo.known, false);
+    labelCounts(grammar, rule.expr, 0, fold_rep, &counts, &memo);
 
     var list: std.ArrayList(LabelUse) = .empty;
     errdefer list.deinit(allocator);

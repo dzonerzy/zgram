@@ -271,6 +271,19 @@ pub fn generateModule(allocator: Allocator, grammar: *const gp.Grammar, mode: Mo
             if (body_fns[i] != rule_fns[i]) b.addFnAttr(body_fns[i], "alwaysinline");
         }
     }
+    // A tree parser's rule called from one place only is inlined there
+    // whatever its size (no code copied; a call less for each match:
+    // `product` in `sum`, `call` in `primary`), unless it breaks a
+    // recursion cycle or is memoized.
+    if (mode == .tree) {
+        const refs = allocator.alloc(u32, grammar.rules.len) catch return CodegenError.OutOfMemory;
+        defer allocator.free(refs);
+        @memset(refs, 0);
+        for (grammar.rules) |r| countRefs(grammar, refs, r.expr);
+        for (grammar.rules, 0..) |_, i| {
+            if (refs[i] == 1 and !breakers[i] and body_fns[i] == rule_fns[i] and (silent_flags[i] or !hasLoop(grammar.rules[i].expr))) b.addFnAttr(rule_fns[i], "alwaysinline");
+        }
+    }
 
     // Recover mode: validator copies of the rules, for recovery's probes
     // ("could the repetition's element start here?"). No memo wrappers: the
@@ -1143,8 +1156,11 @@ fn emitItems(cg: *Codegen, expr: *const gp.Expr, guess: ?*const GuessSite, pos: 
         // that then needs its own closing one (`a 2)` read as a call `a (2)`)
         // And in an optional group, its first literal may be guessed (see
         // emitGuessing)
-        const insertable = child.tag == .literal and !opensBracket(child.literal_value orelse "") and
-            (started or (repeated and isPunctuation(child.literal_value orelse "")));
+        // (a separator may be a class of punctuation, Lua's `[,;]`: its
+        // first byte is what's inserted)
+        const insertable = (child.tag == .literal and !opensBracket(child.literal_value orelse "") and
+            (started or (repeated and isPunctuation(child.literal_value orelse "")))) or
+            (child.tag == .char_class and repeated and !started and separatorClass(child) != null);
         const guessed = guess != null and !started and child.tag == .literal and consumes(cg, child);
         if (cg.mode == .recover and guessed) {
             cur_pos = try emitInsertableLiteral(cg, child, cur_pos, fail_block, guess);
@@ -1220,6 +1236,27 @@ fn emitListHead(cg: *Codegen, item: *const gp.Expr, pos: LB.Value, fail_block: L
 }
 
 /// Is `lit` punctuation only (`,`, `;`, `|`), no word?
+/// Each byte as a one-byte string (what a separator class inserts)
+const single_bytes: [256]u8 = blk: {
+    var all: [256]u8 = undefined;
+    for (&all, 0..) |*c, i| c.* = @intCast(i);
+    break :blk all;
+};
+
+/// A character class that's a separator (`[,;]`: printable punctuation,
+/// no opening bracket), as the text inserted for it when it's missing (its
+/// first byte); null if it isn't one.
+fn separatorClass(expr: *const gp.Expr) ?[]const u8 {
+    if (expr.char_negated) return null;
+    const set = charClassSet(expr);
+    const first = set.findFirstSet() orelse return null;
+    var it = set.iterator(.{});
+    while (it.next()) |c| {
+        if (c <= ' ' or c >= 0x7f or !isPunctuation(single_bytes[c..][0..1]) or opensBracket(single_bytes[c..][0..1])) return null;
+    }
+    return single_bytes[first..][0..1];
+}
+
 fn isPunctuation(lit: []const u8) bool {
     if (lit.len == 0) return false;
     for (lit) |ch| {
@@ -1263,7 +1300,8 @@ fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail
     const missing = try b.newBlock("ins_missing");
     const inserted = try b.newBlock("ins_inserted");
     const merge = try b.newBlock("ins_merge");
-    const end = try emitLiteral(cg, expr, pos, missing);
+    // (a separator class matched as itself, its first byte inserted)
+    const end = if (expr.tag == .literal) try emitLiteral(cg, expr, pos, missing) else try emitExpr(cg, expr, pos, missing);
     const matched = b.getCurrentBlock();
     _ = b.br(merge);
 
@@ -1276,7 +1314,7 @@ fn emitInsertableLiteral(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail
     const further = b.icmp(.ugt, pos32, lit_cur, "ins_further");
     _ = b.store(b.select(further, pos32, lit_cur, "ins_lit_new"), lit_ptr, 4);
     // and which literal it was, for the message
-    const text = expr.literal_value orelse "";
+    const text = if (expr.tag == .literal) expr.literal_value orelse "" else separatorClass(expr) orelse "";
     const len_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_LIT_LEN)}, "ins_len_ptr");
     const text_ptr = b.gep(b.i8, cg.output_ptr, &.{b.constInt(b.i64, abi.OFF_LIT_TEXT)}, "ins_text_ptr");
     const len_cur = b.load(b.i32, len_ptr, 4, "ins_len_cur");
@@ -1450,6 +1488,7 @@ fn emitAlternative(cg: *Codegen, expr: *const gp.Expr, pos: LB.Value, fail_block
             restoreState(cg, node_count_ptr, saved_nc, saved_cc);
         }
 
+        try emitFirstGuard(cg, child, pos, child_fail);
         const result_pos = try emitExpr(cg, child, pos, child_fail);
 
         // Success: branch to merge
@@ -1951,6 +1990,109 @@ fn firstSet(cg: *const Codegen, expr: *const gp.Expr, depth: u8) ?ByteSet {
         },
         .not_predicate, .and_predicate => return null,
     }
+}
+
+/// The rule whose failure an expression records in the high-water mark
+/// when it fails on its first byte: the first rule it tries, innermost
+/// (rules record their failure, at their start, only past the mark: the
+/// first to fail there wins). `.none`: it records none; `.unknown`: can't
+/// tell (too deep).
+const FirstFail = union(enum) { none, unknown, rule: u16 };
+
+fn firstFailRule(cg: *const Codegen, expr: *const gp.Expr, depth: u8) FirstFail {
+    if (depth > 16) return .unknown;
+    switch (expr.tag) {
+        .literal, .char_class, .any_char => return .none,
+        .reference => {
+            const idx = ruleIndex(cg, expr.ref_name orelse return .unknown) orelse return .unknown;
+            return switch (firstFailRule(cg, cg.grammar.rules[idx].expr, depth + 1)) {
+                .none => .{ .rule = @intCast(idx) },
+                else => |r| r,
+            };
+        },
+        .sequence => {
+            const children = expr.children orelse return .unknown;
+            if (children.len == 0) return .unknown;
+            return firstFailRule(cg, children[0], depth + 1);
+        },
+        .alternative => {
+            for (expr.children orelse return .unknown) |child| switch (firstFailRule(cg, child, depth + 1)) {
+                .none => {},
+                else => |r| return r,
+            };
+            return .none;
+        },
+        .repetition => return firstFailRule(cg, expr.rep_expr orelse return .unknown, depth + 1),
+        .not_predicate, .and_predicate => return .unknown,
+    }
+}
+
+/// Before an alternative that starts with a rule's call: its first byte
+/// checked against the bytes it can start with, the call skipped when it
+/// can't match (`primary = number | call | ident`: `number` not called at
+/// a letter). A skipped alternative records the failure the call would
+/// have (firstFailRule), so errors are the same. Not when recovering (its
+/// attempts are what recovery works from).
+fn emitFirstGuard(cg: *Codegen, child: *const gp.Expr, pos: LB.Value, fail_block: LB.Block) CodegenError!void {
+    if (cg.mode == .recover or cg.probe_hwm) return;
+    // (a silent rule's call isn't guarded: LLVM inlines it, its own
+    // alternatives guarded, and a guard in front can keep it from inlining)
+    const head = if (child.tag == .sequence and child.children != null and child.children.?.len > 0) child.children.?[0] else child;
+    if (head.tag != .reference) return;
+    const idx = ruleIndex(cg, head.ref_name orelse return) orelse return;
+    if (cg.silent_flags[idx]) return;
+    const set = firstSet(cg, child, 0) orelse return;
+    if (set.count() == 256) return;
+    const rec = firstFailRule(cg, child, 0);
+    if (rec == .unknown) return;
+    const b = cg.b;
+    const check = try b.newBlock("first_check");
+    const skip = try b.newBlock("first_skip");
+    const go = try b.newBlock("first_go");
+    _ = b.condBr(b.icmp(.ult, pos, cg.input_len, "first_in"), check, skip);
+    b.positionAtEnd(check);
+    const ch = b.load(b.i8, b.gep(b.i8, cg.input_ptr, &.{pos}, "first_ptr"), 1, "first_ch");
+    _ = b.condBr(try emitSetMatch(cg, set, ch), go, skip);
+    b.positionAtEnd(skip);
+    if (rec == .rule) try emitHwmUpdate(cg, pos, rec.rule);
+    _ = b.br(fail_block);
+    b.positionAtEnd(go);
+}
+
+/// i1: is byte `ch` in `set`? A range compare for one range, equality tests
+/// for up to 4 bytes, a bitmap lookup otherwise.
+fn emitSetMatch(cg: *Codegen, set: ByteSet, ch: LB.Value) CodegenError!LB.Value {
+    const b = cg.b;
+    const n = set.count();
+    const lo = set.findFirstSet().?;
+    var hi: usize = lo;
+    var it = set.iterator(.{});
+    while (it.next()) |x| hi = x;
+    if (hi - lo + 1 == n) {
+        const off = b.sub(ch, b.constInt(b.i8, lo), "first_off");
+        return b.icmp(.ule, off, b.constInt(b.i8, hi - lo), "first_range");
+    }
+    if (n <= 4) {
+        var any: ?LB.Value = null;
+        var each = set.iterator(.{});
+        while (each.next()) |x| {
+            const eq = b.icmp(.eq, ch, b.constInt(b.i8, x), "first_eq");
+            any = if (any) |a| b.@"or"(a, eq, "first_or") else eq;
+        }
+        return any.?;
+    }
+    var bitmap_consts: [32]LB.Value = undefined;
+    for (0..32) |i| {
+        var byte: u8 = 0;
+        for (0..8) |bit| {
+            if (set.isSet(i * 8 + bit)) byte |= @as(u8, 1) << @intCast(bit);
+        }
+        bitmap_consts[i] = b.constInt(b.i8, byte);
+    }
+    const name = std.fmt.allocPrintSentinel(b.allocator, "first_bm_{d}", .{b.block_counter}, 0) catch return CodegenError.OutOfMemory;
+    defer b.allocator.free(name);
+    b.block_counter += 1;
+    return emitClassTest(cg, b.addGlobalConstant(name, b.arrayType(b.i8, 32), b.constArray(b.i8, &bitmap_consts)), ch);
 }
 
 /// `(a | cls | b)*` where exactly one branch is a SIMD-able character class
@@ -2991,6 +3133,34 @@ fn exprRefsAllocating(grammar: *const gp.Grammar, flags: []const bool, expr: *co
             return false;
         },
         .repetition => return exprRefsAllocating(grammar, flags, expr.rep_expr orelse return false),
+    }
+}
+
+/// Whether `expr` has a loop of its own (`*`, `+`; not the rules it calls).
+fn hasLoop(expr: *const gp.Expr) bool {
+    return switch (expr.tag) {
+        .literal, .char_class, .any_char, .reference => false,
+        .sequence, .alternative => for (expr.children orelse return false) |child| {
+            if (hasLoop(child)) break true;
+        } else false,
+        .repetition => expr.rep_kind != '?' or hasLoop(expr.rep_expr orelse return false),
+        .not_predicate, .and_predicate => hasLoop(expr.pred_expr orelse return false),
+    };
+}
+
+/// The references to each rule in `expr`, added to `refs`.
+fn countRefs(grammar: *const gp.Grammar, refs: []u32, expr: *const gp.Expr) void {
+    switch (expr.tag) {
+        .literal, .char_class, .any_char => {},
+        .reference => {
+            const name = expr.ref_name orelse return;
+            for (grammar.rules, 0..) |rule, i| {
+                if (std.mem.eql(u8, rule.name, name)) refs[i] += 1;
+            }
+        },
+        .sequence, .alternative => for (expr.children orelse return) |child| countRefs(grammar, refs, child),
+        .repetition => countRefs(grammar, refs, expr.rep_expr orelse return),
+        .not_predicate, .and_predicate => countRefs(grammar, refs, expr.pred_expr orelse return),
     }
 }
 
