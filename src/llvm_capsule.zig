@@ -110,7 +110,7 @@ pub const api_names = [_][]const u8{
     "LLVMConstInBoundsGEP2",             "LLVMConstIntGetSExtValue",        "LLVMConstIntGetZExtValue",
     "LLVMIsConstant",                    "LLVMIsAConstantInt",
     // Globals and values
-    "LLVMAddGlobal",                     "LLVMSetInitializer",              "LLVMSetGlobalConstant",
+    "LLVMAddGlobal",                     "LLVMAddAlias2",                   "LLVMSetInitializer",              "LLVMSetGlobalConstant",
     "LLVMSetLinkage",                    "LLVMSetUnnamedAddress",           "LLVMSetAlignment",
     "LLVMSetVisibility",                 "LLVMSetValueName2",               "LLVMGetValueName2",
     "LLVMReplaceAllUsesWith",            "LLVMInstructionEraseFromParent",
