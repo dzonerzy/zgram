@@ -140,8 +140,9 @@ rule_name = expression
 | Syntax | Meaning |
 |--------|---------|
 | `'literal'` | Match exact string |
-| `[a-z]` | Character class |
+| `[a-z]` | Character class (of bytes: `[\x80-\xff]` is any non-ASCII byte) |
 | `[^a-z]` | Negated character class |
+| `\n` `\t` `\r` `\0` `\xHH` | Escapes in literals and classes (`'\xe2\x80\x93'`: an en dash's UTF-8 bytes) |
 | `.` | Any character |
 | `a b` | Sequence (match a then b) |
 | `a / b` or `a \| b` | Ordered alternative |

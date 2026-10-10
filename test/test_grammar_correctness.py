@@ -264,3 +264,30 @@ class TestPredicateGrammar:
 
     def test_digit_prefix_rejected(self, parser):
         assert_fails(parser, "123")
+
+
+# ── Byte escapes: \xHH in classes and literals ──
+
+
+class TestByteEscapes:
+    @pytest.fixture(scope="class")
+    @classmethod
+    def parser(cls):
+        # (an en dash is e2 80 93 in UTF-8; [\x80-\xff]: any non-ASCII byte)
+        return zgram.compile(
+            "start = (dash | other | ascii)+\n"
+            "dash  = '-' | '\\xe2\\x80\\x93'\n"
+            "other = [\\x80-\\xff]+\n"
+            "ascii = [a-z\\x00]+\n"
+        )
+
+    def test_literal_bytes(self, parser):
+        tree = parser.parse("a–b")
+        assert [(n.rule(), n.text()) for n in tree] == [("ascii", "a"), ("dash", "–"), ("ascii", "b")]
+
+    def test_class_range(self, parser):
+        tree = parser.parse("aéb")
+        assert [n.rule() for n in tree] == ["ascii", "other", "ascii"]
+
+    def test_nul(self, parser):
+        assert_parses(parser, "a\x00b")

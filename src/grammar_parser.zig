@@ -660,15 +660,29 @@ const GrammarParserImpl = struct {
         if (self.pos >= self.text.len) return '\\';
         const c = self.peek();
         self.advance();
+        if (c == 'x') {
+            // \xHH: a byte (non-ASCII ranges in classes: [\x80-\xff])
+            if (hexByte(self.text[self.pos..])) |b| {
+                self.pos += 2;
+                return b;
+            }
+            return 'x';
+        }
         return switch (c) {
             'n' => '\n',
             'r' => '\r',
             't' => '\t',
+            '0' => 0,
             '\\' => '\\',
             '\'' => '\'',
             '"' => '"',
             else => c,
         };
+    }
+
+    fn hexByte(s: []const u8) ?u8 {
+        if (s.len < 2) return null;
+        return std.fmt.parseInt(u8, s[0..2], 16) catch null;
     }
 
     fn unescape(self: *GrammarParserImpl, s: []const u8) ParseErr![]const u8 {
@@ -679,10 +693,18 @@ const GrammarParserImpl = struct {
         while (i < s.len) {
             if (s[i] == '\\' and i + 1 < s.len) {
                 const next = s[i + 1];
+                if (next == 'x') {
+                    if (hexByte(s[i + 2 ..])) |b| {
+                        try result.append(self.allocator, b);
+                        i += 4;
+                        continue;
+                    }
+                }
                 const ch: u8 = switch (next) {
                     'n' => '\n',
                     'r' => '\r',
                     't' => '\t',
+                    '0' => 0,
                     '\\' => '\\',
                     '\'' => '\'',
                     '"' => '"',
