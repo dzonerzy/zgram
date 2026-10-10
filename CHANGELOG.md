@@ -5,7 +5,7 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.3] - 2026-10-11
 
 ### Added
 - **`\xHH` escapes in character classes and literals** (and `\0`): a byte, so grammars can match non-ASCII text exactly: `[\x80-\xff]` is any non-ASCII byte, `'\xe2\x80\x93'` an en dash (classes work on bytes; a multi-byte character is a literal of its UTF-8 bytes). Parsing is unchanged (measured on the benchmarks).
