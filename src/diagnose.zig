@@ -60,7 +60,8 @@ pub const Result = struct {
         var buf: [48]u8 = undefined;
         var w = Writer{ .buf = &buf };
         w.put("'");
-        for (lit) |ch| w.putChar(ch, '\'');
+        const utf8 = std.unicode.utf8ValidateSlice(lit);
+        for (lit) |ch| w.putChar(ch, '\'', utf8);
         w.put("'");
         for (self.expected[0..self.count]) |*e| {
             if (e.is_literal and std.mem.eql(u8, e.text(), w.buf[0..w.len])) return true;
@@ -93,7 +94,8 @@ pub const Result = struct {
 pub fn expectedLiteral(literal: []const u8, buf: []u8) []const u8 {
     var w = Writer{ .buf = buf };
     w.put("expected '");
-    for (literal) |ch| w.putChar(ch, '\'');
+    const utf8 = std.unicode.utf8ValidateSlice(literal);
+    for (literal) |ch| w.putChar(ch, '\'', utf8);
     w.put("'");
     return w.buf[0..w.len];
 }
@@ -109,8 +111,10 @@ const Writer = struct {
     }
 
     /// One byte of a literal or class, escaped so the result reads like
-    /// grammar source. `special` is the delimiter to escape (`'` or `]`).
-    fn putChar(self: *Writer, ch: u8, special: u8) void {
+    /// grammar source. `special` is the delimiter to escape (`'` or `]`);
+    /// `raw_high`: a byte >= 0x80 as it is (part of valid UTF-8), else \xHH
+    /// (the message must stay valid UTF-8).
+    fn putChar(self: *Writer, ch: u8, special: u8, raw_high: bool) void {
         switch (ch) {
             '\n' => self.put("\\n"),
             '\r' => self.put("\\r"),
@@ -119,7 +123,7 @@ const Writer = struct {
             else => {
                 if (ch == special) {
                     self.put(&.{ '\\', ch });
-                } else if (ch < 0x20 or ch == 0x7F) {
+                } else if (ch < 0x20 or ch == 0x7F or (ch >= 0x80 and !raw_high)) {
                     const hex = "0123456789abcdef";
                     self.put(&.{ '\\', 'x', hex[ch >> 4], hex[ch & 15] });
                 } else {
@@ -155,17 +159,21 @@ fn describe(expr: *const gp.Expr) Expected {
         .literal => {
             e.is_literal = true;
             w.put("'");
-            for (expr.literal_value orelse "") |ch| w.putChar(ch, '\'');
+            // (a literal of whole UTF-8 characters reads as they are: '–')
+            const lit = expr.literal_value orelse "";
+            const utf8 = std.unicode.utf8ValidateSlice(lit);
+            for (lit) |ch| w.putChar(ch, '\'', utf8);
             w.buf = &e.buf;
             w.put("'");
         },
         .char_class => {
             w.put(if (expr.char_negated) "[^" else "[");
+            // (a class is of bytes: one >= 0x80 as \xHH)
             for (expr.char_ranges orelse &.{}) |r| {
-                w.putChar(r.start, ']');
+                w.putChar(r.start, ']', false);
                 if (r.end != r.start) {
                     w.put("-");
-                    w.putChar(r.end, ']');
+                    w.putChar(r.end, ']', false);
                 }
             }
             w.buf = &e.buf;
@@ -221,7 +229,7 @@ const Interp = struct {
                 var e = Expected{ .is_literal = true };
                 var w = Writer{ .buf = &e.buf };
                 w.put("'");
-                w.putChar(ch, '\'');
+                w.putChar(ch, '\'', false);
                 w.put("'");
                 e.len = @intCast(w.len);
                 self.expect(e);

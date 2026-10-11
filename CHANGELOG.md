@@ -5,6 +5,11 @@ All notable changes to zgram are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Error messages with non-ASCII bytes**: a class of them (`[\x80-\xff]`) or a literal that isn't whole UTF-8 characters made the message invalid UTF-8, and Python got a `UnicodeDecodeError` instead of the `ParseError`. They're written `\xHH` now; a literal of whole characters still reads as it is (`expected '–'`).
+
 ## [0.5.3] - 2026-10-11
 
 ### Added

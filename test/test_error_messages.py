@@ -182,3 +182,12 @@ def test_display_name_of_the_start_rule():
 def test_display_name_too_long():
     with pytest.raises(ValueError):
         zgram.compile("r \"" + "x" * 65 + "\" = 'a'")
+
+
+def test_non_ascii_bytes_in_messages():
+    # (a class is of bytes: \xHH; a literal of whole UTF-8 characters reads
+    # as it is, a partial one as \xHH: the message stays valid UTF-8)
+    p = zgram.compile("s = 'a' [\\xc0-\\xdf]")
+    assert error(p, "ab")[0] == "expected [\\xc0-\\xdf]"
+    p = zgram.compile("s = 'a' ('\\xe2\\x80' [\\x93-\\x95] | '\\xe2\\x80\\x93')")
+    assert error(p, "ab")[0] == "expected '\\xe2\\x80' or '–'"
