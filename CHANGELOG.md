@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-10-11
+
 ### Fixed
 - **Error messages with non-ASCII bytes**: a class of them (`[\x80-\xff]`) or a literal that isn't whole UTF-8 characters made the message invalid UTF-8, and Python got a `UnicodeDecodeError` instead of the `ParseError`. They're written `\xHH` now; a literal of whole characters still reads as it is (`expected '–'`).
 

@@ -1,6 +1,6 @@
 .{
     .name = .zgram,
-    .version = "0.5.3",
+    .version = "0.5.4",
     .fingerprint = 0xcb213bf46558da2a,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
